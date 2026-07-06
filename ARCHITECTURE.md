@@ -15,36 +15,39 @@ single-entry tests, the result also exposes a copy of the entry `lang::Function`
 
 The source language is intentionally small:
 
-- Types are `i64`, `bool`, and monomorphic `pair`.
+- Types are `i64`, `bool`, opaque `pair`, and finite parametric `pair<T, U>`.
 - Top-level `let name: type = expression;` declarations introduce initialized locals.
 - Assignment supports locals and `pair` fields (`left` and `right`).
 - Expressions include i64/bool literals, variables, `+`, `<`, `pair(left, right)`, field
   access, and parentheses.
 - `if condition { ... } else { ... }` and `while condition { ... }` are statement forms.
-- Function declarations use `fn name(a: i64, b: pair) -> pair { ... }`. Function bodies
-  have the same shape as the top level: statements followed by a final expression.
+- Function declarations use `fn name(a: i64, b: pair<i64, pair>) -> pair<i64, bool> { ... }`.
+  Function bodies have the same shape as the top level: statements followed by a final
+  expression.
 - Calls are expressions and recursion is allowed.
 - A program ends with a final expression, which becomes the VM result.
 
 Minimal cuts: there are no nil literals, strings, expression-valued blocks, user-defined
-types, parametric pair types, first-class functions, or block-local `let` declarations.
-Pair is monomorphic at the local type level, but the type checker tracks pair field types
-flow-sensitively by allocation site. This keeps cycles expressible by initializing a field
-with any pair and later storing another pair into it, while still rejecting reads from a
-field whose possible allocation sites disagree on field kind. Pair values that cross a
-function boundary keep only the signature kind `pair`; field type information is not
-transported interprocedurally.
+types, named recursive types, first-class functions, or block-local `let` declarations.
+Bare `pair` is an opaque pair leaf type: it proves only "object" at function boundaries,
+so field reads through bare pair parameters/returns are rejected as unknown. Inside a
+function, the type checker still tracks pair field types flow-sensitively by allocation
+site, so old local pair-field reads and cyclic structure construction remain expressible.
+`pair<T, U>` carries field types in declarations and function signatures; construction,
+assignment, calls, and returns must conform structurally to those declared fields.
 
-Rejected alternative: expose a parametric `pair<T, U>` surface. That would make simple
-field reads obvious, but it would either reject useful cyclic structures outright or require
-recursive type syntax that is larger than this phase needs. The current allocation-site
-field lattice is closer to the bytecode verifier and keeps the agreement boundary small.
+Rejected alternative: add named recursive pair types. That would make self-referential
+shapes statically expressible, but it would require a larger type language and recursive
+subtyping rules. The current design keeps cyclic runtime structures expressible by storing
+through opaque `pair` leaves while giving signatures enough finite structure for safe
+interprocedural field reads.
 
 ## Runtime scaffold
 
 - `lang::Module` stores a designated entry function plus all callable `lang::Function`
-  bodies. Each function carries a `FunctionSignature` of parameter kinds and return kind,
-  bytecode, local count, and optional stack maps.
+  bodies. Each function carries a `FunctionSignature` of coarse parameter/return kinds,
+  optional detailed `SignatureValue` pair-field types, bytecode, local count, and optional
+  stack maps.
 - `lang::verify` is the bytecode safety gate. It runs a per-function worklist dataflow
   analysis over reachable bytecode, proving stack depth before every instruction,
   `LoadLocal` initialization over all incoming paths, branch target validity, call
@@ -60,6 +63,9 @@ field lattice is closer to the bytecode verifier and keeps the agreement boundar
   generation-tagged object IDs. The low bits identify the storage slot and the high bits
   identify that slot's current generation, so a swept or moved ID cannot alias a later
   object in the same slot.
+- Pair field types are verification-time metadata only. They do not change `Value`,
+  object layout, stack-map object/non-object bits, root tracing, write barriers,
+  forwarding, movement, or heap validation.
 - Pair field mutation is routed through `Heap::store_pair_field`. That method is the
   single hook point where the generational old-to-young write barrier runs before the new
   field value is published.
@@ -79,9 +85,11 @@ functions 1..N, and `Call` operands are direct callee indexes. Parameters occupy
 The verifier is modular at function boundaries: it does not import caller allocation-site
 state into the callee and does not export callee allocation-site state back to the caller.
 Only the module signature table crosses a call boundary. This is the soundness boundary:
-calls prove parameter count/kind compatibility and push the declared return kind. A pair
-returned from or passed into a function is therefore known as an object root, but its field
-types are unknown unless established by allocations inside the current function.
+calls prove parameter count/kind compatibility and, when present, detailed
+`pair<T, U>` field-kind compatibility. A typed pair parameter enters the callee as an
+object with signature-derived field facts; a typed pair return pushes an object with the
+callee's declared return field facts. A bare pair parameter/return remains opaque, so
+field reads still reject unless allocation-site facts are established inside the function.
 
 The VM uses per-frame operand stacks rather than a single shared stack segment. This keeps
 root rewriting direct: `trace_roots` walks every frame and visits each stack/local slot by
@@ -120,10 +128,11 @@ Compiler accommodations for verifier strictness:
   patched only to emitted instruction boundaries reachable through verifier dataflow.
 - Function boundaries: calls emit arguments left-to-right followed by `Call <callee>`.
   Function signatures initialize parameter locals in the verifier and VM, and `Return`
-  must match the declared return kind.
-- Pair fields: the type checker uses the same allocation-site join idea as the verifier.
-  A field can be read only when all possible pair sites agree on the field kind; field
-  assignment must preserve that kind.
+  must match the declared return kind plus any detailed pair field types.
+- Pair fields: the type checker uses the same allocation-site join idea as the verifier
+  and also attaches finite `pair<T, U>` details to function signatures. A field can be read
+  only when all possible allocation sites and signature facts agree on the field kind;
+  field assignment through typed pairs must preserve the declared field kind.
 
 ## Design bias
 
@@ -219,8 +228,11 @@ remembered-set entries.
   valid old-to-young field absent from the remembered set.
 - Signature safety: call sites are checked against the callee signature only; returns are
   checked against the current function signature. This keeps bytecode verification
-  modular and rejects out-of-range calls, wrong arity, wrong argument kind, and wrong
-  return kind.
+  modular and rejects out-of-range calls, wrong arity, wrong argument kind, wrong
+  pair-field kind, and wrong return kind.
+- GC neutrality: pair-field types never participate in runtime stack maps or heap layout.
+  Stack maps still record only object/non-object, and the VM/heap continue to trace,
+  barrier, forward, and validate by runtime `Value` tags.
 - Source agreement: `compile_program` does not return bytecode for rejected source, and
   every returned module has passed `verify_with_stack_maps` with generated stack maps.
 
@@ -230,14 +242,19 @@ remembered-set entries.
   stack-depth safety.
 - Stack value kinds are `Int64`, `Bool`, `Object`, `Nil`, and `Poison`.
 - Equal non-object kinds join to themselves; object kinds join to object with the union of
-  possible allocation sites.
+  possible allocation sites, an opaque-object bit, and optional signature-derived pair
+  fields.
 - Different kinds join to `Poison`, which cannot be consumed by any instruction or emitted
   into a stack map. This rejects ambiguous object/non-object roots instead of guessing.
 - Local initialization joins by intersection: a local initialized on only one incoming path
   becomes uninitialized at the merge, so later `LoadLocal` rejects.
-- Abstract pair fields join by allocation site and field kind. Mutating a field joins the
-  previous abstract field with the stored value because one allocation site may represent
-  multiple runtime objects.
+- Abstract pair fields join by allocation site and field kind. Mutating an allocation-site
+  field joins the previous abstract field with the stored value because one allocation site
+  may represent multiple runtime objects. Mutating through a typed signature object first
+  checks the stored value against the declared field kind.
+- Field reads merge signature-derived fields with allocation-site fields. If any possible
+  receiver is opaque, or if the merged field kind becomes poison, the read rejects rather
+  than guessing a root/non-root kind.
 - Rejected alternative: coercing differing kinds to a permissive `Any` value. That would let
   typed operations or stack maps treat maybe-object values imprecisely, violating type
   safety and future moving-collector root precision.
