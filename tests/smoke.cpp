@@ -2,6 +2,21 @@
 #include "lang/vm.hpp"
 
 #include <cassert>
+#include <vector>
+
+namespace {
+
+struct Roots final : lang::gc::RootProvider {
+    std::vector<lang::Value> values;
+
+    void trace_roots(lang::gc::RootVisitor& visitor) override {
+        for (auto& value : values) {
+            visitor.visit(value);
+        }
+    }
+};
+
+} // namespace
 
 int main() {
     lang::Function add;
@@ -19,7 +34,9 @@ int main() {
     lang::gc::Heap heap;
     auto live = heap.allocate_pair(lang::Value::int64(1), lang::Value::int64(2));
     heap.allocate_pair(lang::Value::int64(3), lang::Value::int64(4));
-    heap.collect({lang::Value::object(live)});
+    Roots roots;
+    roots.values.push_back(lang::Value::object(live));
+    heap.collect(roots);
     assert(heap.live_count() == 1);
     assert(heap.object(live).left.as_i64() == 1);
 

@@ -1,11 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace lang {
 
-using ObjectId = std::uint32_t;
+using ObjectId = std::uint64_t;
 
 class Value {
 public:
@@ -13,7 +14,12 @@ public:
 
     static Value int64(std::int64_t v) { return Value(Tag::Int64, v); }
     static Value boolean(bool v) { return Value(Tag::Bool, v ? 1 : 0); }
-    static Value object(ObjectId id) { return Value(Tag::Object, id); }
+    static Value object(ObjectId id) {
+        if (id > static_cast<ObjectId>(std::numeric_limits<std::int64_t>::max())) {
+            throw std::out_of_range("object id does not fit in Value payload");
+        }
+        return Value(Tag::Object, static_cast<std::int64_t>(id));
+    }
     static Value nil() { return Value(Tag::Nil, 0); }
 
     [[nodiscard]] Tag tag() const { return tag_; }

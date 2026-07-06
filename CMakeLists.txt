@@ -17,5 +17,9 @@ target_compile_options(lang_runtime PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(lang_smoke tests/smoke.cpp)
 target_link_libraries(lang_smoke PRIVATE lang_runtime)
 
+add_executable(lang_phase1_correctness tests/phase1_correctness.cpp)
+target_link_libraries(lang_phase1_correctness PRIVATE lang_runtime)
+
 include(CTest)
 add_test(NAME lang_smoke COMMAND lang_smoke)
+add_test(NAME lang_phase1_correctness COMMAND lang_phase1_correctness)
