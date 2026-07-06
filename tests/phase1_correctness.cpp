@@ -40,6 +40,8 @@ const char* op_name(lang::OpCode op) {
         return "JumpIfFalse";
     case lang::OpCode::Collect:
         return "Collect";
+    case lang::OpCode::Call:
+        return "Call";
     case lang::OpCode::Return:
         return "Return";
     }
@@ -176,6 +178,7 @@ void heap_traps_when_marking_stale_root() {
 
 lang::Function single_pair_program() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.code = {
         {lang::OpCode::ConstantI64, 1},
         {lang::OpCode::ConstantI64, 2},
@@ -187,6 +190,7 @@ lang::Function single_pair_program() {
 
 lang::Function nested_pair_program() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.code = {
         {lang::OpCode::ConstantI64, 1},
         {lang::OpCode::ConstantI64, 2},

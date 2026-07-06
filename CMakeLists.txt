@@ -32,6 +32,9 @@ target_link_libraries(lang_iteration4_generational PRIVATE lang_runtime)
 add_executable(lang_iteration5_fuzz tests/iteration5_fuzz.cpp)
 target_link_libraries(lang_iteration5_fuzz PRIVATE lang_runtime)
 
+add_executable(lang_iteration7_calls tests/iteration7_calls.cpp)
+target_link_libraries(lang_iteration7_calls PRIVATE lang_runtime)
+
 add_executable(lang_frontend_pipeline tests/frontend_pipeline.cpp)
 target_link_libraries(lang_frontend_pipeline PRIVATE lang_runtime)
 
@@ -42,4 +45,5 @@ add_test(NAME lang_iteration2_correctness COMMAND lang_iteration2_correctness)
 add_test(NAME lang_iteration3_movement COMMAND lang_iteration3_movement)
 add_test(NAME lang_iteration4_generational COMMAND lang_iteration4_generational)
 add_test(NAME lang_iteration5_fuzz COMMAND lang_iteration5_fuzz)
+add_test(NAME lang_iteration7_calls COMMAND lang_iteration7_calls)
 add_test(NAME lang_frontend_pipeline COMMAND lang_frontend_pipeline)

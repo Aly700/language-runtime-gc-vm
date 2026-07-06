@@ -6,6 +6,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace lang {
@@ -49,6 +50,26 @@ AbstractValue object_value(std::size_t site) {
     AbstractValue value;
     value.kind = AbstractKind::Object;
     value.object_sites.insert(site);
+    return value;
+}
+
+AbstractKind abstract_kind(ValueKind kind) {
+    switch (kind) {
+    case ValueKind::Int64:
+        return AbstractKind::Int64;
+    case ValueKind::Bool:
+        return AbstractKind::Bool;
+    case ValueKind::Object:
+        return AbstractKind::Object;
+    case ValueKind::Nil:
+        return AbstractKind::Nil;
+    }
+    return AbstractKind::Poison;
+}
+
+AbstractValue value_from_signature(ValueKind kind) {
+    AbstractValue value;
+    value.kind = abstract_kind(kind);
     return value;
 }
 
@@ -187,6 +208,11 @@ bool pop_expect(AbstractState& state, AbstractKind expected, AbstractValue* out 
     return true;
 }
 
+bool pop_expect_signature_kind(AbstractState& state, ValueKind expected,
+                               AbstractValue* out = nullptr) {
+    return pop_expect(state, abstract_kind(expected), out);
+}
+
 bool push_fallthrough(std::size_t pc, std::size_t code_size, const AbstractState& state,
                       std::vector<std::pair<std::size_t, AbstractState>>& successors) {
     const auto next_pc = pc + 1;
@@ -232,8 +258,10 @@ bool store_pair_field(AbstractState& state, const AbstractValue& receiver, bool 
     return true;
 }
 
-bool transfer_instruction(const Function& function, std::size_t pc, const AbstractState& in,
+bool transfer_instruction(const Module& module, std::size_t function_index, std::size_t pc,
+                          const AbstractState& in,
                           std::vector<std::pair<std::size_t, AbstractState>>& successors) {
+    const auto& function = module.functions[function_index];
     const auto& ins = function.code[pc];
     auto state = in;
 
@@ -328,20 +356,43 @@ bool transfer_instruction(const Function& function, std::size_t pc, const Abstra
         return push_fallthrough(pc, function.code.size(), state, successors);
     case OpCode::Collect:
         return push_fallthrough(pc, function.code.size(), state, successors);
-    case OpCode::Return:
-        return pop_any(state);
+    case OpCode::Call: {
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >= module.functions.size()) {
+            return false;
+        }
+        const auto& callee =
+            module.functions[static_cast<std::size_t>(ins.operand)].signature;
+        for (std::size_t i = callee.parameters.size(); i > 0; --i) {
+            if (!pop_expect_signature_kind(state, callee.parameters[i - 1])) {
+                return false;
+            }
+        }
+        state.stack.push_back(value_from_signature(callee.return_type));
+        return push_fallthrough(pc, function.code.size(), state, successors);
+    }
+    case OpCode::Return: {
+        AbstractValue returned;
+        return pop_any(state, &returned) &&
+               returned.kind == abstract_kind(function.signature.return_type);
+    }
     }
     return false;
 }
 
 } // namespace
 
-std::optional<VerificationResult> verify_with_stack_maps(const Function& function) {
+std::optional<VerificationResult> verify_function_with_stack_maps(const Module& module,
+                                                                  std::size_t function_index) {
+    const auto& function = module.functions[function_index];
     if (!function.stack_maps.empty() && function.stack_maps.size() != function.code.size()) {
         return std::nullopt;
     }
     if (function.code.empty()) {
-        return VerificationResult{};
+        return std::nullopt;
+    }
+    if (function.local_count < function.signature.parameters.size()) {
+        return std::nullopt;
     }
 
     std::vector<std::optional<AbstractState>> states(function.code.size());
@@ -349,6 +400,9 @@ std::optional<VerificationResult> verify_with_stack_maps(const Function& functio
 
     AbstractState initial;
     initial.locals.resize(function.local_count);
+    for (std::size_t i = 0; i < function.signature.parameters.size(); ++i) {
+        initial.locals[i] = value_from_signature(function.signature.parameters[i]);
+    }
     states[0] = initial;
     worklist.push_back(0);
 
@@ -357,7 +411,7 @@ std::optional<VerificationResult> verify_with_stack_maps(const Function& functio
         worklist.pop_front();
 
         std::vector<std::pair<std::size_t, AbstractState>> successors;
-        if (!transfer_instruction(function, pc, *states[pc], successors)) {
+        if (!transfer_instruction(module, function_index, pc, *states[pc], successors)) {
             return std::nullopt;
         }
 
@@ -398,8 +452,40 @@ std::optional<VerificationResult> verify_with_stack_maps(const Function& functio
     return result;
 }
 
+std::optional<VerificationResult> verify_with_stack_maps(const Function& function) {
+    Module module;
+    module.entry_function = 0;
+    module.functions.push_back(function);
+    auto result = verify_with_stack_maps(module);
+    if (!result.has_value() || result->functions.empty()) {
+        return std::nullopt;
+    }
+    return result->functions.front();
+}
+
+std::optional<ModuleVerificationResult> verify_with_stack_maps(const Module& module) {
+    if (module.functions.empty() || module.entry_function >= module.functions.size()) {
+        return std::nullopt;
+    }
+
+    ModuleVerificationResult result;
+    result.functions.reserve(module.functions.size());
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        auto function_result = verify_function_with_stack_maps(module, i);
+        if (!function_result.has_value()) {
+            return std::nullopt;
+        }
+        result.functions.push_back(std::move(*function_result));
+    }
+    return result;
+}
+
 bool verify(const Function& function) {
     return verify_with_stack_maps(function).has_value();
+}
+
+bool verify(const Module& module) {
+    return verify_with_stack_maps(module).has_value();
 }
 
 } // namespace lang

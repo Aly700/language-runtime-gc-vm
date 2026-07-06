@@ -38,6 +38,8 @@ const char* op_name(lang::OpCode op) {
         return "JumpIfFalse";
     case lang::OpCode::Collect:
         return "Collect";
+    case lang::OpCode::Call:
+        return "Call";
     case lang::OpCode::Return:
         return "Return";
     }
@@ -66,6 +68,7 @@ void require(bool condition, const std::string& message) {
 
 lang::Function linked_structure_loop_program() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.local_count = 2;
     function.code = {
         {lang::OpCode::ConstantI64, 0},  // 0: initial head.left
@@ -191,6 +194,7 @@ void verifier_accepts_loop_that_builds_linked_structure() {
 
 void field_load_reads_object_field_with_generated_stack_map() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.code = {
         {lang::OpCode::ConstantI64, 1},
         {lang::OpCode::ConstantI64, 2},
@@ -256,6 +260,7 @@ void gc_collects_unreachable_cycle_created_by_mutation() {
 
 void gc_instruction_stress_sweeps_replaced_object_after_it_becomes_unreachable() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.local_count = 2;
     function.code = {
         {lang::OpCode::ConstantI64, 0},
@@ -297,6 +302,7 @@ void gc_instruction_stress_sweeps_replaced_object_after_it_becomes_unreachable()
 
 void gc_self_referential_pair_survives_while_rooted() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.local_count = 1;
     function.code = {
         {lang::OpCode::ConstantI64, 0},

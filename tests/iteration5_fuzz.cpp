@@ -49,6 +49,8 @@ const char* op_name(lang::OpCode op) {
         return "JumpIfFalse";
     case lang::OpCode::Collect:
         return "Collect";
+    case lang::OpCode::Call:
+        return "Call";
     case lang::OpCode::Return:
         return "Return";
     }
@@ -105,6 +107,7 @@ class Builder {
 public:
     explicit Builder(std::uint32_t local_count) {
         function_.local_count = local_count;
+        function_.signature.return_type = lang::ValueKind::Object;
         locals_.resize(local_count);
     }
 

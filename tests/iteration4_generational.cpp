@@ -46,6 +46,8 @@ const char* op_name(lang::OpCode op) {
         return "JumpIfFalse";
     case lang::OpCode::Collect:
         return "Collect";
+    case lang::OpCode::Call:
+        return "Call";
     case lang::OpCode::Return:
         return "Return";
     }
@@ -306,6 +308,7 @@ void major_collection_rewrites_remembered_set_entries_before_pruning() {
 
 lang::Function old_mutation_loop_program() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.local_count = 2;
     function.code = {
         {lang::OpCode::ConstantI64, -1}, // 0 old.left

@@ -24,12 +24,13 @@ struct Diagnostic {
 };
 
 struct CompileResult {
+    std::optional<Module> module;
     std::optional<Function> function;
     Type result_type{Type::Invalid};
     std::vector<Diagnostic> diagnostics;
 
     [[nodiscard]] bool ok() const {
-        return function.has_value() && diagnostics.empty();
+        return module.has_value() && diagnostics.empty();
     }
 };
 
