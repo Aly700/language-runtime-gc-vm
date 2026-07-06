@@ -92,3 +92,53 @@ Replay a call-grammar finding with:
 ```bash
 ./build/lang_iteration5_fuzz --grammar calls --seed <uint64> --schedule <schedule-name>
 ```
+
+## Source-level differential fuzzing
+
+`lang_iteration10_source_fuzz` moves the same differential oracle up to the source
+pipeline. It generates well-typed source programs, sends each program through
+`lang::frontend::compile_program`, and treats any diagnostic from a positive seed as a
+generator bug. Because `compile_program` verifies emitted modules and attaches generated
+stack maps, the source fuzzer mechanically exercises the source/verifier agreement
+invariant before the VM ever runs.
+
+The source generator is deterministic and constructive. It uses the shared splitmix64-style
+PRNG and a small generator-side type environment while emitting:
+
+- `2..5` function declarations, always including a typed pair constructor and a bounded
+  recursive `rec(n + -1, ...)` helper.
+- typed parameters and returns such as `pair<i64, bool>` and `pair<pair, pair>`, including
+  typed pair values crossing call boundaries.
+- top-level `let` declarations, i64 addition/comparison, bools, direct and helper-mediated
+  typed pair field reads, and local assignments.
+- counted `while i < N` loops with `i = i + 1`, where `N` is `1..3`.
+- `if/else` statement blocks, pair construction, pair field writes, opaque bare-pair leaves,
+  and cyclic graphs formed by storing a typed anchor back into bare pair fields.
+
+The positive corpus runs seeds `1..48` across the same 10 schedules used by
+`lang_iteration5_fuzz`, for 480 executions per CTest run. The pinned source snapshot is
+seed `17`. The oracle is exactly the shared fuzzer oracle: scalar results compare by tag
+and value, object results compare the canonical left-before-right graph serialization, and
+any trap or post-execution GC validation failure is a finding.
+
+The negative corpus checks the frontend gate with deterministic mutations of generated
+sources. Seeds `1..12` are each mutated three ways:
+
+- flip the loop accumulation from `sum + ...` to `sum < ...`, producing a bool assigned to
+  `i64`.
+- rename the accumulation source to `missing_sum`, producing an undefined variable.
+- remove one argument from a recursive call, producing a call-arity diagnostic.
+
+Each mutant must reject with at least one diagnostic and must not crash the frontend.
+
+Replay a positive source finding with:
+
+```bash
+./build/lang_iteration10_source_fuzz --seed <uint64> --schedule <schedule-name>
+```
+
+Replay a negative mutant check with:
+
+```bash
+./build/lang_iteration10_source_fuzz --seed <uint64> --mutant <0..2>
+```
