@@ -6,7 +6,7 @@ A small statically typed language runtime whose hardest correctness boundary is 
 
 ## Stack
 
-C++20, CMake, small bytecode VM, mark-sweep GC baseline, moving/generational collector reserved for later phases.
+C++20, CMake, recursive-descent frontend, verified bytecode VM, precise stack maps, and deterministic moving/generational GC stress modes.
 
 ## Build and smoke test
 
@@ -16,9 +16,12 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on
 
 ## Phase map
 
-1. Lexer/parser/typed AST and type checker shell.
-2. Bytecode compiler and stack VM with bump allocation.
+1. Frontend surface: lexer/parser, typed AST, type checker, and bytecode compiler.
+2. Bytecode compiler and stack VM.
 3. Precise stack maps and root enumeration.
-4. Tracing mark-sweep GC with barrier-ready object model.
+4. Tracing and moving collection with barrier-ready object model.
 5. Generational moving collector plus fuzzed GC timing.
 
+## Start here
+
+Start with `INVARIANTS.md` and `ARCHITECTURE.md`. The frontend entry point is `lang::frontend::compile_program`; every returned function has already passed `verify_with_stack_maps`.

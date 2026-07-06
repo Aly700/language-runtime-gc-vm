@@ -3,12 +3,40 @@
 ## Pipeline
 
 ```text
-source -> lexer/parser -> typed AST -> bytecode -> verifier -> VM -> heap/GC
+source -> lexer -> parser -> AST -> type checker -> compiler -> verifier -> VM -> heap/GC
 ```
 
-## Current scaffold
+## Frontend surface
 
-- `lang::Function` stores bytecode and future stack maps.
+`lang::frontend::compile_program` is the narrow public entry point. It returns either a
+`lang::Function` with verifier-generated stack maps attached, or deterministic diagnostics
+with byte offsets plus 1-based line/column positions.
+
+The source language is intentionally small:
+
+- Types are `i64`, `bool`, and monomorphic `pair`.
+- Top-level `let name: type = expression;` declarations introduce initialized locals.
+- Assignment supports locals and `pair` fields (`left` and `right`).
+- Expressions include i64/bool literals, variables, `+`, `<`, `pair(left, right)`, field
+  access, and parentheses.
+- `if condition { ... } else { ... }` and `while condition { ... }` are statement forms.
+- A program ends with a final expression, which becomes the VM result.
+
+Minimal cuts: there are no functions, parameters, nil literals, strings, expression-valued
+blocks, user-defined types, parametric pair types, or block-local `let` declarations. Pair
+is monomorphic at the local type level, but the type checker tracks pair field types
+flow-sensitively by allocation site. This keeps cycles expressible by initializing a field
+with any pair and later storing another pair into it, while still rejecting reads from a
+field whose possible allocation sites disagree on field kind.
+
+Rejected alternative: expose a parametric `pair<T, U>` surface. That would make simple
+field reads obvious, but it would either reject useful cyclic structures outright or require
+recursive type syntax that is larger than this phase needs. The current allocation-site
+field lattice is closer to the bytecode verifier and keeps the agreement boundary small.
+
+## Runtime scaffold
+
+- `lang::Function` stores bytecode and optional stack maps.
 - `lang::verify` is the bytecode safety gate. It runs a worklist dataflow analysis over
   reachable bytecode, proving stack depth before every instruction, `LoadLocal`
   initialization over all incoming paths, branch target validity, and value kinds for
@@ -30,6 +58,32 @@ source -> lexer/parser -> typed AST -> bytecode -> verifier -> VM -> heap/GC
   instructions. Every stress collection runs the same post-collection reference validation
   as explicit collections. No stress trigger depends on wall-clock time, randomness,
   threads, or host addresses.
+
+## Source/Verifier agreement
+
+Well-typed source must compile to bytecode accepted by `verify_with_stack_maps`. A verifier
+rejection of type-checked compiler output is a compiler bug, not a user error.
+`compile_program` enforces this by running `verify_with_stack_maps` on every emitted
+function, asserting success, then attaching the generated maps and asserting the maps
+round-trip through the verifier.
+
+Compiler accommodations for verifier strictness:
+
+- Local initialization: every source `let` has an initializer and compiles to
+  `initializer; StoreLocal` before any `LoadLocal` for that local can be emitted.
+- Stack discipline: statements are stack-neutral. Field assignment emits receiver then
+  value then `SetLeft`/`SetRight`, which consumes both and pushes nothing.
+- Bool literals: the bytecode has no Bool constant opcode, so `true` and `false` compile to
+  constant i64 comparisons whose result kind is proven `Bool`.
+- Branches and loops: conditions must type-check as `bool` because `JumpIfFalse` consumes a
+  verifier-proven Bool. `if` emits an explicit jump over `else`; `while` emits a reachable
+  header, false exit, stack-neutral body, and backedge.
+- No fall-off-end: the final source expression is followed immediately by `Return`.
+- Reachability: the compiler emits no bytecode after `Return`, and branch targets are
+  patched only to emitted instruction boundaries reachable through verifier dataflow.
+- Pair fields: the type checker uses the same allocation-site join idea as the verifier.
+  A field can be read only when all possible pair sites agree on the field kind; field
+  assignment must preserve that kind.
 
 ## Design bias
 
@@ -119,6 +173,8 @@ remembered-set entries.
   minor collection traces young objects from mutator roots plus remembered old objects,
   remembered-set entries are rewritten/pruned after movement, and validation traps any
   valid old-to-young field absent from the remembered set.
+- Source agreement: `compile_program` does not return bytecode for rejected source, and
+  every returned function has passed `verify_with_stack_maps` with generated stack maps.
 
 ## Verifier join lattice
 

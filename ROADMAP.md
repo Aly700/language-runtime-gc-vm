@@ -1,10 +1,15 @@
 # Roadmap — Language Runtime: Bytecode VM + Precise Tracing GC
 
-1. Lexer/parser/typed AST and type checker shell.
-2. Bytecode compiler and stack VM with bump allocation.
+1. Lexer/parser/typed AST, type checker, and source-to-bytecode compiler.
+2. Bytecode compiler and stack VM.
 3. Precise stack maps and root enumeration.
-4. Tracing mark-sweep GC with barrier-ready object model.
+4. Tracing and moving collection with barrier-ready object model.
 5. Generational moving collector plus fuzzed GC timing.
+
+## Current correctness boundary
+
+Well-typed source must compile to bytecode that passes `verify_with_stack_maps`. A verifier
+rejection of type-checked compiler output is a compiler bug.
 
 ## Phase 1 first tasks
 
