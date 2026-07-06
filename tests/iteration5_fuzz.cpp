@@ -133,6 +133,14 @@ void require(bool condition, const std::string& message) {
     }
 }
 
+std::string diagnostics_listing(const std::vector<lang::VerifierDiagnostic>& diagnostics) {
+    std::ostringstream out;
+    for (const auto& diagnostic : diagnostics) {
+        out << "  " << lang::format_verifier_diagnostic(diagnostic) << "\n";
+    }
+    return out.str();
+}
+
 class SplitMix64 {
 public:
     explicit SplitMix64(std::uint64_t seed) : state_(seed) {}
@@ -484,9 +492,11 @@ lang::Function generate_program(std::uint64_t seed) {
     b.return_top();
 
     auto function = b.finish();
-    require(lang::verify(function),
+    const auto verification = lang::verify_with_diagnostics(function);
+    require(verification.result.has_value(),
             "generator emitted verifier-rejected function for seed " +
-                std::to_string(seed) + "\n" + describe(function));
+                std::to_string(seed) + "\nverifier diagnostics:\n" +
+                diagnostics_listing(verification.diagnostics) + describe(function));
     return function;
 }
 
@@ -841,9 +851,11 @@ lang::Module generate_call_module(std::uint64_t seed) {
         module.functions.push_back(generate_i64_helper(rng, signatures));
     }
 
-    require(lang::verify(module),
+    const auto verification = lang::verify_with_diagnostics(module);
+    require(verification.result.has_value(),
             "call generator emitted verifier-rejected module for seed " +
-                std::to_string(seed) + "\n" + describe(module));
+                std::to_string(seed) + "\nverifier diagnostics:\n" +
+                diagnostics_listing(verification.diagnostics) + describe(module));
     return module;
 }
 

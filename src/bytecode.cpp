@@ -7,6 +7,8 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -47,6 +49,89 @@ enum class JoinOutcome {
     Changed,
     Invalid,
 };
+
+const char* op_name(OpCode op) {
+    switch (op) {
+    case OpCode::ConstantI64:
+        return "ConstantI64";
+    case OpCode::AddI64:
+        return "AddI64";
+    case OpCode::LessI64:
+        return "LessI64";
+    case OpCode::AllocPair:
+        return "AllocPair";
+    case OpCode::GetLeft:
+        return "GetLeft";
+    case OpCode::GetRight:
+        return "GetRight";
+    case OpCode::SetLeft:
+        return "SetLeft";
+    case OpCode::SetRight:
+        return "SetRight";
+    case OpCode::LoadLocal:
+        return "LoadLocal";
+    case OpCode::StoreLocal:
+        return "StoreLocal";
+    case OpCode::Jump:
+        return "Jump";
+    case OpCode::JumpIfFalse:
+        return "JumpIfFalse";
+    case OpCode::Collect:
+        return "Collect";
+    case OpCode::Call:
+        return "Call";
+    case OpCode::Return:
+        return "Return";
+    }
+    return "<invalid>";
+}
+
+const char* value_kind_name(ValueKind kind) {
+    switch (kind) {
+    case ValueKind::Int64:
+        return "Int64";
+    case ValueKind::Bool:
+        return "Bool";
+    case ValueKind::Object:
+        return "Object";
+    case ValueKind::Nil:
+        return "Nil";
+    }
+    return "<invalid>";
+}
+
+const char* abstract_kind_name(AbstractKind kind) {
+    switch (kind) {
+    case AbstractKind::Int64:
+        return "Int64";
+    case AbstractKind::Bool:
+        return "Bool";
+    case AbstractKind::Object:
+        return "Object";
+    case AbstractKind::Nil:
+        return "Nil";
+    case AbstractKind::Poison:
+        return "Poison";
+    }
+    return "<invalid>";
+}
+
+bool reject(std::vector<VerifierDiagnostic>& diagnostics,
+            std::size_t function_index,
+            std::optional<std::size_t> pc,
+            VerifierReason reason,
+            std::string message) {
+    diagnostics.push_back(
+        VerifierDiagnostic{function_index, pc, reason, std::move(message)});
+    return false;
+}
+
+std::string instruction_message(const Function& function, std::size_t pc,
+                                const std::string& detail) {
+    std::ostringstream out;
+    out << op_name(function.code[pc].op) << " at pc " << pc << ": " << detail;
+    return out.str();
+}
 
 AbstractValue value_with_kind(AbstractKind kind) {
     AbstractValue value;
@@ -290,13 +375,24 @@ std::optional<StackMap> stack_map_from_state(const AbstractState& state) {
     return map;
 }
 
-bool pop_any(AbstractState& state, AbstractValue* out = nullptr) {
+bool pop_any_or_report(AbstractState& state,
+                       std::vector<VerifierDiagnostic>& diagnostics,
+                       const Function& function,
+                       std::size_t function_index,
+                       std::size_t pc,
+                       VerifierReason underflow_reason,
+                       const std::string& context,
+                       AbstractValue* out = nullptr) {
     if (state.stack.empty()) {
-        return false;
+        return reject(diagnostics, function_index, pc, underflow_reason,
+                      instruction_message(function, pc, context +
+                                                       " requires a stack value"));
     }
     const auto value = state.stack.back();
     if (is_poison(value)) {
-        return false;
+        return reject(diagnostics, function_index, pc, VerifierReason::PoisonUse,
+                      instruction_message(function, pc, context +
+                                                       " consumed a poison value"));
     }
     state.stack.pop_back();
     if (out != nullptr) {
@@ -305,13 +401,27 @@ bool pop_any(AbstractState& state, AbstractValue* out = nullptr) {
     return true;
 }
 
-bool pop_expect(AbstractState& state, AbstractKind expected, AbstractValue* out = nullptr) {
+bool pop_expect_or_report(AbstractState& state,
+                          std::vector<VerifierDiagnostic>& diagnostics,
+                          const Function& function,
+                          std::size_t function_index,
+                          std::size_t pc,
+                          AbstractKind expected,
+                          VerifierReason underflow_reason,
+                          VerifierReason mismatch_reason,
+                          const std::string& context,
+                          AbstractValue* out = nullptr) {
     AbstractValue actual;
-    if (!pop_any(state, &actual)) {
+    if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                           underflow_reason, context, &actual)) {
         return false;
     }
     if (actual.kind != expected) {
-        return false;
+        std::ostringstream message;
+        message << context << " expected " << abstract_kind_name(expected)
+                << " but found " << abstract_kind_name(actual.kind);
+        return reject(diagnostics, function_index, pc, mismatch_reason,
+                      instruction_message(function, pc, message.str()));
     }
     if (out != nullptr) {
         *out = actual;
@@ -319,16 +429,16 @@ bool pop_expect(AbstractState& state, AbstractKind expected, AbstractValue* out 
     return true;
 }
 
-bool pop_expect_signature_kind(AbstractState& state, ValueKind expected,
-                               AbstractValue* out = nullptr) {
-    return pop_expect(state, abstract_kind(expected), out);
-}
-
-bool push_fallthrough(std::size_t pc, std::size_t code_size, const AbstractState& state,
-                      std::vector<std::pair<std::size_t, AbstractState>>& successors) {
+bool push_fallthrough_or_report(
+    std::size_t pc, const Function& function, std::size_t function_index,
+    const AbstractState& state,
+    std::vector<std::pair<std::size_t, AbstractState>>& successors,
+    std::vector<VerifierDiagnostic>& diagnostics) {
     const auto next_pc = pc + 1;
-    if (next_pc >= code_size) {
-        return false;
+    if (next_pc >= function.code.size()) {
+        return reject(diagnostics, function_index, pc, VerifierReason::FallOffEnd,
+                      instruction_message(function, pc,
+                                          "instruction would fall through past function end"));
     }
     successors.push_back({next_pc, state});
     return true;
@@ -420,7 +530,8 @@ bool store_pair_field(AbstractState& state, const AbstractValue& receiver, bool 
 
 bool transfer_instruction(const Module& module, std::size_t function_index, std::size_t pc,
                           const AbstractState& in,
-                          std::vector<std::pair<std::size_t, AbstractState>>& successors) {
+                          std::vector<std::pair<std::size_t, AbstractState>>& successors,
+                          std::vector<VerifierDiagnostic>& diagnostics) {
     const auto& function = module.functions[function_index];
     const auto& ins = function.code[pc];
     auto state = in;
@@ -428,25 +539,39 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
     switch (ins.op) {
     case OpCode::ConstantI64:
         state.stack.push_back(int64_value());
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     case OpCode::AddI64:
-        if (!pop_expect(state, AbstractKind::Int64) ||
-            !pop_expect(state, AbstractKind::Int64)) {
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::TypeMismatch, "right operand") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::TypeMismatch, "left operand")) {
             return false;
         }
         state.stack.push_back(int64_value());
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     case OpCode::LessI64:
-        if (!pop_expect(state, AbstractKind::Int64) ||
-            !pop_expect(state, AbstractKind::Int64)) {
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::TypeMismatch, "right operand") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::TypeMismatch, "left operand")) {
             return false;
         }
         state.stack.push_back(bool_value());
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     case OpCode::AllocPair: {
         AbstractValue right;
         AbstractValue left;
-        if (!pop_any(state, &right) || !pop_any(state, &left)) {
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "right field", &right) ||
+            !pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "left field", &left)) {
             return false;
         }
         const PairFields allocated{left, right};
@@ -456,112 +581,225 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             (void)join_value_into(it->second.right, allocated.right);
         }
         state.stack.push_back(object_value(pc));
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     }
     case OpCode::GetLeft:
     case OpCode::GetRight: {
         AbstractValue receiver;
         AbstractValue loaded;
-        if (!pop_expect(state, AbstractKind::Object, &receiver) ||
-            !load_pair_field(state, receiver, ins.op == OpCode::GetLeft, loaded)) {
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Object, VerifierReason::StackUnderflow,
+                                  VerifierReason::TypeMismatch, "pair receiver",
+                                  &receiver)) {
             return false;
         }
+        if (!load_pair_field(state, receiver, ins.op == OpCode::GetLeft, loaded)) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadPairFieldRead,
+                          instruction_message(function, pc,
+                                              "pair field facts are unavailable or incompatible"));
+        }
+        if (is_poison(loaded)) {
+            return reject(diagnostics, function_index, pc, VerifierReason::PoisonUse,
+                          instruction_message(function, pc,
+                                              "pair field read produced a poison value"));
+        }
         state.stack.push_back(loaded);
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     }
     case OpCode::SetLeft:
     case OpCode::SetRight: {
         AbstractValue value;
         AbstractValue receiver;
-        if (!pop_any(state, &value) || !pop_expect(state, AbstractKind::Object, &receiver) ||
-            !store_pair_field(state, receiver, ins.op == OpCode::SetLeft, value)) {
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "stored field value",
+                               &value) ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Object, VerifierReason::StackUnderflow,
+                                  VerifierReason::TypeMismatch, "pair receiver",
+                                  &receiver)) {
             return false;
         }
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        if (!store_pair_field(state, receiver, ins.op == OpCode::SetLeft, value)) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadPairFieldWrite,
+                          instruction_message(function, pc,
+                                              "stored value does not satisfy pair field facts"));
+        }
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     }
     case OpCode::LoadLocal: {
         if (!is_valid_local_index(ins.operand, function.local_count)) {
-            return false;
+            std::ostringstream message;
+            message << "local operand " << ins.operand
+                    << " is outside local_count " << function.local_count;
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadLocalIndex,
+                          instruction_message(function, pc, message.str()));
         }
         const auto local_index = static_cast<std::size_t>(ins.operand);
         if (!state.locals[local_index].has_value() || is_poison(*state.locals[local_index])) {
-            return false;
+            if (!state.locals[local_index].has_value()) {
+                std::ostringstream message;
+                message << "local " << local_index
+                        << " is uninitialized on at least one incoming path";
+                return reject(diagnostics, function_index, pc,
+                              VerifierReason::UninitializedLocal,
+                              instruction_message(function, pc, message.str()));
+            }
+            std::ostringstream message;
+            message << "local " << local_index << " contains a poison value";
+            return reject(diagnostics, function_index, pc, VerifierReason::PoisonUse,
+                          instruction_message(function, pc, message.str()));
         }
         state.stack.push_back(*state.locals[local_index]);
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     }
     case OpCode::StoreLocal: {
         if (!is_valid_local_index(ins.operand, function.local_count)) {
-            return false;
+            std::ostringstream message;
+            message << "local operand " << ins.operand
+                    << " is outside local_count " << function.local_count;
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadLocalIndex,
+                          instruction_message(function, pc, message.str()));
         }
         AbstractValue stored;
-        if (!pop_any(state, &stored)) {
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "stored local value",
+                               &stored)) {
             return false;
         }
         state.locals[static_cast<std::size_t>(ins.operand)] = stored;
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     }
     case OpCode::Jump:
         if (!is_valid_target(ins.operand, function.code.size())) {
-            return false;
+            std::ostringstream message;
+            message << "target " << ins.operand << " is outside code size "
+                    << function.code.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadJumpTarget,
+                          instruction_message(function, pc, message.str()));
         }
         successors.push_back({static_cast<std::size_t>(ins.operand), state});
         return true;
     case OpCode::JumpIfFalse:
-        if (!is_valid_target(ins.operand, function.code.size()) ||
-            !pop_expect(state, AbstractKind::Bool)) {
+        if (!is_valid_target(ins.operand, function.code.size())) {
+            std::ostringstream message;
+            message << "target " << ins.operand << " is outside code size "
+                    << function.code.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadJumpTarget,
+                          instruction_message(function, pc, message.str()));
+        }
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Bool, VerifierReason::StackUnderflow,
+                                  VerifierReason::TypeMismatch, "branch condition")) {
             return false;
         }
         successors.push_back({static_cast<std::size_t>(ins.operand), state});
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     case OpCode::Collect:
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     case OpCode::Call: {
         if (ins.operand < 0 ||
             static_cast<std::uint64_t>(ins.operand) >= module.functions.size()) {
-            return false;
+            std::ostringstream message;
+            message << "callee " << ins.operand << " is outside function count "
+                    << module.functions.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadCallTarget,
+                          instruction_message(function, pc, message.str()));
         }
         const auto& callee =
             module.functions[static_cast<std::size_t>(ins.operand)].signature;
         for (std::size_t i = callee.parameters.size(); i > 0; --i) {
             AbstractValue argument;
             const auto parameter_index = i - 1;
-            if (!pop_expect_signature_kind(state, callee.parameters[parameter_index],
-                                           &argument) ||
-                !value_conforms_to_signature(state, argument,
+            std::ostringstream context;
+            context << "argument " << parameter_index;
+            if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                      abstract_kind(callee.parameters[parameter_index]),
+                                      VerifierReason::BadCallArity,
+                                      VerifierReason::BadCallArgKind,
+                                      context.str(), &argument)) {
+                return false;
+            }
+            if (!value_conforms_to_signature(state, argument,
                                              parameter_signature(callee,
                                                                  parameter_index))) {
-                return false;
+                std::ostringstream message;
+                message << "argument " << parameter_index
+                        << " does not conform to callee parameter "
+                        << value_kind_name(callee.parameters[parameter_index]);
+                return reject(diagnostics, function_index, pc,
+                              VerifierReason::BadCallArgKind,
+                              instruction_message(function, pc, message.str()));
             }
         }
         state.stack.push_back(value_from_signature(return_signature(callee)));
-        return push_fallthrough(pc, function.code.size(), state, successors);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
     }
     case OpCode::Return: {
         AbstractValue returned;
-        return pop_any(state, &returned) &&
-               value_conforms_to_signature(state, returned,
-                                           return_signature(function.signature));
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "return value",
+                               &returned)) {
+            return false;
+        }
+        if (!value_conforms_to_signature(state, returned,
+                                         return_signature(function.signature))) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadReturnKind,
+                          instruction_message(function, pc,
+                                              "return value does not conform to function signature"));
+        }
+        return true;
     }
     }
-    return false;
+    return reject(diagnostics, function_index, pc, VerifierReason::InvalidOpcode,
+                  instruction_message(function, pc, "unknown opcode"));
 }
 
-} // namespace
-
-std::optional<VerificationResult> verify_function_with_stack_maps(const Module& module,
-                                                                  std::size_t function_index) {
+std::optional<VerificationResult> verify_function_with_stack_maps(
+    const Module& module, std::size_t function_index,
+    std::vector<VerifierDiagnostic>& diagnostics) {
     const auto& function = module.functions[function_index];
     if (!function.stack_maps.empty() && function.stack_maps.size() != function.code.size()) {
+        std::ostringstream message;
+        message << "stack_maps size " << function.stack_maps.size()
+                << " does not match code size " << function.code.size();
+        reject(diagnostics, function_index, std::nullopt, VerifierReason::BadStackMap,
+               message.str());
         return std::nullopt;
     }
     if (function.code.empty()) {
+        reject(diagnostics, function_index, std::nullopt, VerifierReason::EmptyFunction,
+               "function has no bytecode");
         return std::nullopt;
     }
     if (!signature_is_well_formed(function.signature)) {
+        reject(diagnostics, function_index, std::nullopt,
+               VerifierReason::SignatureShapeMismatch,
+               "function signature detail shape does not match coarse kinds");
         return std::nullopt;
     }
     if (function.local_count < function.signature.parameters.size()) {
+        std::ostringstream message;
+        message << "local_count " << function.local_count
+                << " is smaller than parameter count "
+                << function.signature.parameters.size();
+        reject(diagnostics, function_index, std::nullopt,
+               VerifierReason::LocalCountMismatch, message.str());
         return std::nullopt;
     }
 
@@ -581,7 +819,8 @@ std::optional<VerificationResult> verify_function_with_stack_maps(const Module& 
         worklist.pop_front();
 
         std::vector<std::pair<std::size_t, AbstractState>> successors;
-        if (!transfer_instruction(module, function_index, pc, *states[pc], successors)) {
+        if (!transfer_instruction(module, function_index, pc, *states[pc], successors,
+                                  diagnostics)) {
             return std::nullopt;
         }
 
@@ -592,8 +831,29 @@ std::optional<VerificationResult> verify_function_with_stack_maps(const Module& 
                 continue;
             }
 
+            if (states[target]->stack.size() != state.stack.size()) {
+                std::ostringstream message;
+                message << "target pc " << target << " has incoming stack height "
+                        << state.stack.size() << " but existing height is "
+                        << states[target]->stack.size();
+                reject(diagnostics, function_index, target,
+                       VerifierReason::StackHeightMergeMismatch, message.str());
+                return std::nullopt;
+            }
+            if (states[target]->locals.size() != state.locals.size()) {
+                std::ostringstream message;
+                message << "target pc " << target << " has incoming local count "
+                        << state.locals.size() << " but existing count is "
+                        << states[target]->locals.size();
+                reject(diagnostics, function_index, target,
+                       VerifierReason::LocalCountMismatch, message.str());
+                return std::nullopt;
+            }
             const auto outcome = join_state_into(*states[target], state);
             if (outcome == JoinOutcome::Invalid) {
+                reject(diagnostics, function_index, target,
+                       VerifierReason::StackHeightMergeMismatch,
+                       "control-flow merge has incompatible state shape");
                 return std::nullopt;
             }
             if (outcome == JoinOutcome::Changed) {
@@ -606,14 +866,20 @@ std::optional<VerificationResult> verify_function_with_stack_maps(const Module& 
     result.stack_maps.resize(function.code.size());
     for (std::size_t pc = 0; pc < function.code.size(); ++pc) {
         if (!states[pc].has_value()) {
+            reject(diagnostics, function_index, pc, VerifierReason::UnreachableCode,
+                   "bytecode pc is unreachable from function entry");
             return std::nullopt;
         }
         auto map = stack_map_from_state(*states[pc]);
         if (!map.has_value()) {
+            reject(diagnostics, function_index, pc, VerifierReason::PoisonUse,
+                   "cannot generate stack map for poison stack value");
             return std::nullopt;
         }
         if (!function.stack_maps.empty() &&
             !stack_map_matches(function.stack_maps[pc], states[pc]->stack)) {
+            reject(diagnostics, function_index, pc, VerifierReason::BadStackMap,
+                   "supplied stack map does not match verifier state");
             return std::nullopt;
         }
         result.stack_maps[pc] = *map;
@@ -622,32 +888,130 @@ std::optional<VerificationResult> verify_function_with_stack_maps(const Module& 
     return result;
 }
 
-std::optional<VerificationResult> verify_with_stack_maps(const Function& function) {
+} // namespace
+
+const char* verifier_reason_name(VerifierReason reason) {
+    switch (reason) {
+    case VerifierReason::ModuleShapeMismatch:
+        return "ModuleShapeMismatch";
+    case VerifierReason::EmptyFunction:
+        return "EmptyFunction";
+    case VerifierReason::SignatureShapeMismatch:
+        return "SignatureShapeMismatch";
+    case VerifierReason::LocalCountMismatch:
+        return "LocalCountMismatch";
+    case VerifierReason::BadStackMap:
+        return "BadStackMap";
+    case VerifierReason::StackUnderflow:
+        return "StackUnderflow";
+    case VerifierReason::TypeMismatch:
+        return "TypeMismatch";
+    case VerifierReason::PoisonUse:
+        return "PoisonUse";
+    case VerifierReason::UninitializedLocal:
+        return "UninitializedLocal";
+    case VerifierReason::BadLocalIndex:
+        return "BadLocalIndex";
+    case VerifierReason::BadJumpTarget:
+        return "BadJumpTarget";
+    case VerifierReason::FallOffEnd:
+        return "FallOffEnd";
+    case VerifierReason::StackHeightMergeMismatch:
+        return "StackHeightMergeMismatch";
+    case VerifierReason::UnreachableCode:
+        return "UnreachableCode";
+    case VerifierReason::BadPairFieldRead:
+        return "BadPairFieldRead";
+    case VerifierReason::BadPairFieldWrite:
+        return "BadPairFieldWrite";
+    case VerifierReason::BadCallTarget:
+        return "BadCallTarget";
+    case VerifierReason::BadCallArity:
+        return "BadCallArity";
+    case VerifierReason::BadCallArgKind:
+        return "BadCallArgKind";
+    case VerifierReason::BadReturnKind:
+        return "BadReturnKind";
+    case VerifierReason::InvalidOpcode:
+        return "InvalidOpcode";
+    }
+    return "<unknown>";
+}
+
+std::string format_verifier_diagnostic(const VerifierDiagnostic& diagnostic) {
+    std::ostringstream out;
+    out << "function=" << diagnostic.function_index << " ";
+    if (diagnostic.pc.has_value()) {
+        out << "pc=" << *diagnostic.pc;
+    } else {
+        out << "pc=<none>";
+    }
+    out << " reason=" << verifier_reason_name(diagnostic.reason);
+    if (!diagnostic.message.empty()) {
+        out << ": " << diagnostic.message;
+    }
+    return out.str();
+}
+
+FunctionVerifierReport verify_with_diagnostics(const Function& function) {
     Module module;
     module.entry_function = 0;
     module.functions.push_back(function);
-    auto result = verify_with_stack_maps(module);
-    if (!result.has_value() || result->functions.empty()) {
-        return std::nullopt;
+
+    auto module_report = verify_with_diagnostics(module);
+    FunctionVerifierReport report;
+    if (module_report.result.has_value() && !module_report.result->functions.empty()) {
+        report.result = module_report.result->functions.front();
     }
-    return result->functions.front();
+    report.diagnostics = std::move(module_report.diagnostics);
+    return report;
 }
 
-std::optional<ModuleVerificationResult> verify_with_stack_maps(const Module& module) {
-    if (module.functions.empty() || module.entry_function >= module.functions.size()) {
-        return std::nullopt;
+ModuleVerifierReport verify_with_diagnostics(const Module& module) {
+    ModuleVerifierReport report;
+    if (module.functions.empty()) {
+        reject(report.diagnostics, 0, std::nullopt,
+               VerifierReason::ModuleShapeMismatch,
+               "module has no functions");
+        return report;
+    }
+    if (module.entry_function >= module.functions.size()) {
+        std::ostringstream message;
+        message << "entry function " << module.entry_function
+                << " is outside function count " << module.functions.size();
+        reject(report.diagnostics, module.entry_function, std::nullopt,
+               VerifierReason::ModuleShapeMismatch, message.str());
+        return report;
     }
 
     ModuleVerificationResult result;
     result.functions.reserve(module.functions.size());
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
-        auto function_result = verify_function_with_stack_maps(module, i);
+        auto function_result = verify_function_with_stack_maps(module, i,
+                                                               report.diagnostics);
         if (!function_result.has_value()) {
-            return std::nullopt;
+            return report;
         }
         result.functions.push_back(std::move(*function_result));
     }
-    return result;
+    report.result = std::move(result);
+    return report;
+}
+
+std::optional<VerificationResult> verify_with_stack_maps(const Function& function) {
+    auto report = verify_with_diagnostics(function);
+    if (!report.result.has_value()) {
+        return std::nullopt;
+    }
+    return std::move(report.result);
+}
+
+std::optional<ModuleVerificationResult> verify_with_stack_maps(const Module& module) {
+    auto report = verify_with_diagnostics(module);
+    if (!report.result.has_value()) {
+        return std::nullopt;
+    }
+    return std::move(report.result);
 }
 
 bool verify(const Function& function) {

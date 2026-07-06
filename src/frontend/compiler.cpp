@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -222,20 +223,34 @@ CompileModuleResult compile_checked_program(const Program& program,
             function_compiler.compile(declaration.statements, *declaration.result));
     }
 
-    auto verification = verify_with_stack_maps(module);
-    assert(verification.has_value() &&
+    auto verification_report = verify_with_diagnostics(module);
+    if (!verification_report.result.has_value()) {
+        for (const auto& diagnostic : verification_report.diagnostics) {
+            std::cerr << "compiler verifier diagnostic: "
+                      << format_verifier_diagnostic(diagnostic) << "\n";
+        }
+    }
+    assert(verification_report.result.has_value() &&
            "compiler bug: type-checked source emitted verifier-rejected module");
-    if (!verification.has_value()) {
+    if (!verification_report.result.has_value()) {
         CompileModuleResult result;
         result.diagnostics = {
             Diagnostic{SourcePosition{}, "compiler emitted verifier-rejected module"}};
         return result;
     }
+    auto verification = std::move(*verification_report.result);
 
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
-        module.functions[i].stack_maps = verification->functions[i].stack_maps;
+        module.functions[i].stack_maps = verification.functions[i].stack_maps;
     }
-    assert(verify_with_stack_maps(module).has_value() &&
+    auto roundtrip = verify_with_diagnostics(module);
+    if (!roundtrip.result.has_value()) {
+        for (const auto& diagnostic : roundtrip.diagnostics) {
+            std::cerr << "compiler stack-map round-trip diagnostic: "
+                      << format_verifier_diagnostic(diagnostic) << "\n";
+        }
+    }
+    assert(roundtrip.result.has_value() &&
            "compiler bug: verifier-generated stack maps did not round-trip");
 
     CompileModuleResult result;

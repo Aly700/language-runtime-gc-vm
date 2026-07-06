@@ -62,6 +62,13 @@ interprocedural field reads.
   current function signature, and value kinds for generated stack maps. This protects the
   VM invariants for stack depth, initialized local reads, and function boundaries across
   loops and merge points.
+- Verifier rejection is structured. The compatibility APIs `verify` and
+  `verify_with_stack_maps` still return only bool/optional results, while
+  `verify_with_diagnostics` returns the same stack-map result plus deterministic
+  `VerifierDiagnostic` entries carrying function index, optional pc, stable
+  `VerifierReason`, and message text. The reason-code catalog is documented next to
+  `VerifierReason` in `include/lang/bytecode.hpp`; consumers print the first diagnostic
+  before throwing or asserting.
 - `lang::VM` owns a vector of call frames and registers itself as a `lang::gc::RootProvider`.
   Each frame owns its own operand stack and locals. Root tracing visits mutable `Value`
   slots in every live frame, not copied root values, so moving collection can update
