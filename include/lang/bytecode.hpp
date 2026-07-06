@@ -21,7 +21,8 @@ struct Instruction {
 };
 
 struct StackMap {
-    // For phase 3: bit i says stack slot i is an object reference at this pc.
+    // Stack maps describe the abstract stack before executing the instruction at the same pc.
+    // Bit i is true only when stack slot i is proven to contain an object reference.
     std::vector<bool> object_slots;
 };
 
