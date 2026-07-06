@@ -1,9 +1,13 @@
 #include "lang/gc/heap.hpp"
 
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace lang::gc {
 
@@ -37,12 +41,36 @@ std::uint32_t next_generation(std::uint32_t generation) {
 
 class Heap::MarkingVisitor final : public RootVisitor {
 public:
-    explicit MarkingVisitor(Heap& heap) : heap_(heap) {}
+    MarkingVisitor(Heap& heap, std::vector<ObjectId>& worklist)
+        : heap_(heap), worklist_(worklist) {}
 
-    void visit(Value& root) override { heap_.mark_value(root); }
+    void visit(Value& root) override { heap_.enqueue_mark_value(root, worklist_); }
 
 private:
     Heap& heap_;
+    std::vector<ObjectId>& worklist_;
+};
+
+class Heap::ForwardingVisitor final : public RootVisitor {
+public:
+    ForwardingVisitor(const Heap& heap, const ForwardingTable& forwarding)
+        : heap_(heap), forwarding_(forwarding) {}
+
+    void visit(Value& root) override { heap_.rewrite_value(root, forwarding_); }
+
+private:
+    const Heap& heap_;
+    const ForwardingTable& forwarding_;
+};
+
+class Heap::ValidatingVisitor final : public RootVisitor {
+public:
+    explicit ValidatingVisitor(const Heap& heap) : heap_(heap) {}
+
+    void visit(Value& root) override { heap_.validate_value(root); }
+
+private:
+    const Heap& heap_;
 };
 
 ObjectId Heap::allocate_pair(Value left, Value right) {
@@ -126,59 +154,151 @@ void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     }
 }
 
-void Heap::mark_value(Value value) {
+void Heap::enqueue_mark_value(Value value, std::vector<ObjectId>& worklist) {
     if (value.is_object()) {
-        mark_object(value.as_object());
+        const auto slot = checked_slot(value.as_object());
+        if (!objects_[slot]->marked) {
+            worklist.push_back(value.as_object());
+        }
     }
 }
 
-void Heap::mark_object(ObjectId id) {
-    auto& obj = *objects_[checked_slot(id)];
-    if (obj.marked) {
-        return;
+void Heap::drain_mark_worklist(std::vector<ObjectId>& worklist) {
+    while (!worklist.empty()) {
+        const auto id = worklist.back();
+        worklist.pop_back();
+
+        auto& obj = *objects_[checked_slot(id)];
+        if (obj.marked) {
+            continue;
+        }
+        obj.marked = true;
+
+        // Push right first so the LIFO worklist processes left before right.
+        enqueue_mark_value(obj.right, worklist);
+        enqueue_mark_value(obj.left, worklist);
     }
-    obj.marked = true;
-    mark_value(obj.left);
-    mark_value(obj.right);
 }
 
 void Heap::collect() {
-    collect_with_extra_roots({});
+    collect_impl(nullptr, {});
 }
 
 void Heap::collect(RootProvider& roots) {
-    MarkingVisitor visitor(*this);
-    if (root_provider_ != nullptr && root_provider_ != &roots) {
-        root_provider_->trace_roots(visitor);
-    }
-    roots.trace_roots(visitor);
-    sweep();
+    collect_impl(&roots, {});
 }
 
 void Heap::collect_with_extra_roots(std::span<Value*> extra_roots) {
-    MarkingVisitor visitor(*this);
-    if (root_provider_ != nullptr) {
+    collect_impl(nullptr, extra_roots);
+}
+
+void Heap::collect_impl(RootProvider* roots, std::span<Value*> extra_roots) {
+    std::vector<ObjectId> worklist;
+    MarkingVisitor marker(*this, worklist);
+    trace_collection_roots(marker, roots, extra_roots);
+    drain_mark_worklist(worklist);
+
+    auto compacted = compact_marked_objects();
+    rewrite_references(compacted.forwarding, compacted.objects, roots, extra_roots);
+
+    objects_ = std::move(compacted.objects);
+    generations_ = std::move(compacted.generations);
+    validate_after_collection(roots, extra_roots);
+}
+
+void Heap::trace_collection_roots(RootVisitor& visitor, RootProvider* roots,
+                                  std::span<Value*> extra_roots) const {
+    if (root_provider_ != nullptr && root_provider_ != roots) {
         root_provider_->trace_roots(visitor);
+    }
+    if (roots != nullptr) {
+        roots->trace_roots(visitor);
     }
     for (auto* root : extra_roots) {
         if (root != nullptr) {
             visitor.visit(*root);
         }
     }
-    sweep();
 }
 
-void Heap::sweep() {
-    for (auto& slot : objects_) {
+Heap::CompactionResult Heap::compact_marked_objects() const {
+    CompactionResult result;
+    result.forwarding.resize(objects_.size());
+    result.objects.resize(objects_.size());
+    result.generations = generations_;
+
+    std::size_t next_live_slot = 0;
+    for (std::size_t old_slot = 0; old_slot < objects_.size(); ++old_slot) {
+        const auto& slot = objects_[old_slot];
+        if (!slot.has_value() || !slot->marked) {
+            continue;
+        }
+
+        auto moved = *slot;
+        moved.marked = false;
+        if (old_slot != next_live_slot) {
+            result.generations[next_live_slot] = next_generation(result.generations[next_live_slot]);
+        }
+
+        const auto new_id =
+            make_object_id(static_cast<std::uint32_t>(next_live_slot),
+                           result.generations[next_live_slot]);
+        result.forwarding[old_slot] = new_id;
+        result.objects[next_live_slot] = moved;
+        ++next_live_slot;
+    }
+
+    return result;
+}
+
+void Heap::rewrite_references(const ForwardingTable& forwarding,
+                              std::vector<std::optional<Object>>& compacted_objects,
+                              RootProvider* roots, std::span<Value*> extra_roots) const {
+    ForwardingVisitor visitor(*this, forwarding);
+    trace_collection_roots(visitor, roots, extra_roots);
+
+    for (auto& slot : compacted_objects) {
         if (!slot.has_value()) {
             continue;
         }
-        if (slot->marked) {
-            slot->marked = false;
-        } else {
-            slot.reset();
-        }
+        rewrite_value(slot->left, forwarding);
+        rewrite_value(slot->right, forwarding);
     }
+}
+
+void Heap::rewrite_value(Value& value, const ForwardingTable& forwarding) const {
+    if (!value.is_object()) {
+        return;
+    }
+
+    const auto old_slot = checked_slot(value.as_object());
+    if (old_slot >= forwarding.size() || !forwarding[old_slot].has_value()) {
+        throw std::logic_error("live object reference missing compaction forwarding entry");
+    }
+    value = Value::object(*forwarding[old_slot]);
+}
+
+void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const {
+    ValidatingVisitor visitor(*this);
+    trace_collection_roots(visitor, roots, extra_roots);
+
+    for (const auto& slot : objects_) {
+        if (!slot.has_value()) {
+            continue;
+        }
+        assert(!slot->marked && "collector invariant violated: mark bit survived collection");
+        validate_value(slot->left);
+        validate_value(slot->right);
+    }
+}
+
+void Heap::validate_value(Value value) const {
+    if (!value.is_object()) {
+        return;
+    }
+    const auto slot = checked_slot(value.as_object());
+    assert(objects_[slot].has_value() &&
+           "collector invariant violated: reference points outside current heap objects");
 }
 
 std::size_t Heap::live_count() const {
