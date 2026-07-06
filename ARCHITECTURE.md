@@ -17,17 +17,19 @@ source -> lexer/parser -> typed AST -> bytecode -> verifier -> VM -> heap/GC
 - `lang::VM` owns stack/locals and registers itself as a `lang::gc::RootProvider`.
   Root tracing visits mutable `Value` slots, not copied root values, so a future moving
   collector can update roots before mutator execution resumes.
-- `lang::gc::Heap` implements a deterministic mark-compact collector over
+- `lang::gc::Heap` implements deterministic major and minor mark-compact collection over
   generation-tagged object IDs. The low bits identify the storage slot and the high bits
   identify that slot's current generation, so a swept or moved ID cannot alias a later
   object in the same slot.
 - Pair field mutation is routed through `Heap::store_pair_field`. That method is the
-  single hook point where a future generational write barrier must run before the new
+  single hook point where the generational old-to-young write barrier runs before the new
   field value is published.
 - Deterministic GC stress is configured with explicit counters: before every allocation,
-  after every allocation, and every N bytecode instructions. Every stress collection runs
-  the same post-collection reference validation as explicit collections. No stress trigger
-  depends on wall-clock time, randomness, threads, or host addresses.
+  after every allocation, after every barrier-triggering old-to-young store, every N
+  major-collection bytecode instructions, and every N minor-collection bytecode
+  instructions. Every stress collection runs the same post-collection reference validation
+  as explicit collections. No stress trigger depends on wall-clock time, randomness,
+  threads, or host addresses.
 
 ## Design bias
 
@@ -62,10 +64,39 @@ That would preserve external numeric handles, but it would not exercise the root
 field rewriting invariant this phase is meant to protect. The current forwarding design
 makes missed updates fail as stale IDs.
 
-When generations arrive, this compactor is the structural basis for a copying young
-generation: the forwarding table becomes from-space to to-space metadata, the rewrite pass
-updates roots and remembered old-to-young fields, and `Heap::store_pair_field` remains the
-barrier hook that records old-to-young stores before publishing them.
+## Generational collection
+
+The heap has two logical object generations on top of the same slot vector:
+
+- New pair allocations are young.
+- Any young object that survives one collection is promoted to old. This one-survival
+  policy keeps the phase deterministic and makes promotion independent of wall-clock age or
+  allocation rate.
+- `Heap::collect()` is the major collector. It traces all objects reachable from mutator
+  roots, compacts the whole heap, promotes young survivors, sweeps unreachable old and young
+  objects, rewrites all roots and heap fields through the forwarding table, then validates.
+- `Heap::collect_minor()` is the minor collector. It traces only young objects, with roots =
+  mutator roots plus the deterministic remembered set of old objects that may reference
+  young objects. Old objects are retained conservatively until the next major collection,
+  but all roots and all retained heap fields are still rewritten through the forwarding
+  table before mutator execution resumes.
+- The remembered set is a `std::vector<ObjectId>`, not an unordered container. Barrier
+  insertion is stable and duplicate-free by linear scan; collection-time pruning rebuilds it
+  in slot order by keeping only valid old objects that still contain a young field.
+- A dead old object in the remembered set can conservatively keep a young referent alive
+  during a minor collection, but never forever: major collection traces only mutator roots,
+  so the dead old graph is swept and remembered-set pruning drops the entry.
+- `Heap::store_pair_field` is the only mutation hook exposed to bytecode. On every store of
+  a young object into an old pair field it records the old object before publishing the
+  value. The public heap API does not expose mutable pair fields directly, protecting the
+  barrier-completeness invariant.
+
+Rejected alternative: keep old objects fixed during minor collection and compact only young
+slots. That would reduce forwarding work, but it would leave minor collection unable to
+exercise the same root/heap-field rewrite discipline as major collection when young
+survivors slide across holes. The current minor collector preserves old objects
+conservatively but still uses one forwarding-table rewrite path for roots, heap fields, and
+remembered-set entries.
 
 ## Protected Invariants
 
@@ -84,6 +115,10 @@ barrier hook that records old-to-young stores before publishing them.
   allocation stress treats allocation operands and the new object as temporary roots, the
   forwarding pass rewrites all roots and live heap fields before mutator execution resumes,
   and VM collection points assert generated stack maps both before and after collection.
+- Generational barrier safety: old-to-young stores are recorded in `Heap::store_pair_field`,
+  minor collection traces young objects from mutator roots plus remembered old objects,
+  remembered-set entries are rewritten/pruned after movement, and validation traps any
+  valid old-to-young field absent from the remembered set.
 
 ## Verifier join lattice
 
