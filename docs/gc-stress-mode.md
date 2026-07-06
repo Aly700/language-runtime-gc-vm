@@ -115,21 +115,51 @@ PRNG and a small generator-side type environment while emitting:
 - `if/else` statement blocks, pair construction, pair field writes, opaque bare-pair leaves,
   and cyclic graphs formed by storing a typed anchor back into bare pair fields.
 
-The positive corpus runs seeds `1..48` across the same 10 schedules used by
-`lang_iteration5_fuzz`, for 480 executions per CTest run. The pinned source snapshot is
-seed `17`. The oracle is exactly the shared fuzzer oracle: scalar results compare by tag
-and value, object results compare the canonical left-before-right graph serialization, and
-any trap or post-execution GC validation failure is a finding.
+The legacy positive corpus runs seeds `1..48` across the same 10 schedules used by
+`lang_iteration5_fuzz`, for 480 executions per CTest run. Its pinned source snapshot is
+seed `17` and remains byte-for-byte stable. The oracle is exactly the shared fuzzer
+oracle: scalar results compare by tag and value, `nil` results compare as the canonical
+`nil` observable, object results compare the canonical left-before-right graph
+serialization, and any trap or post-execution GC validation failure is a finding.
+
+Iteration 15 adds a second source grammar, selected in replay as `recursive`, that covers
+the newest recursive-type surface without perturbing the legacy corpus. It emits
+deterministic programs with:
+
+- `type List = pair<i64, List>` plus mutually recursive `Node`/`Links` declarations.
+- a typed `empty_list() -> List` helper so `nil` return observables are exercised with a
+  named-pair context.
+- bounded nil-terminated list construction in `while` loops and recursive consumers that
+  read named-pair fields only after `is_nil` refinement.
+- named-type field writes such as list tail mutation and `Node.right = Links`.
+- nested typed-pair chains such as `box.right.left`, with named-pair values crossing
+  function calls.
+- mixed programs combining recursive calls, mutation, typed pair reads, object returns,
+  scalar returns, and typed nil returns.
+
+The recursive positive corpus also runs seeds `1..48` across all 10 schedules, adding
+480 executions per CTest run. It has its own pinned seed-`17` snapshot; legacy and
+recursive corpus dumps are deterministic and can be byte-compared independently.
 
 The negative corpus checks the frontend gate with deterministic mutations of generated
-sources. Seeds `1..12` are each mutated three ways:
+legacy sources. Seeds `1..12` are each mutated three ways:
 
 - flip the loop accumulation from `sum + ...` to `sum < ...`, producing a bool assigned to
   `i64`.
 - rename the accumulation source to `missing_sum`, producing an undefined variable.
 - remove one argument from a recursive call, producing a call-arity diagnostic.
 
-Each mutant must reject with at least one diagnostic and must not crash the frontend.
+The recursive grammar adds four more mutation operators over seeds `1..12`:
+
+- remove the `is_nil` refinement before reading a `List` field in the recursive `sum`
+  function.
+- initialize a non-nullable `pair<i64, bool>` payload with `nil`.
+- prepend `type X = X;` before an otherwise-valid program.
+- assign a typed payload pair into a named `Node.right: Links` field.
+
+Each mutant must reject with at least one diagnostic and must not crash the frontend. The
+combined source-level CTest run now covers 960 positive executions and 84 negative
+frontend-rejection checks.
 
 Replay a positive source finding with:
 
@@ -137,8 +167,27 @@ Replay a positive source finding with:
 ./build/lang_iteration10_source_fuzz --seed <uint64> --schedule <schedule-name>
 ```
 
+Replay a positive recursive-source finding with:
+
+```bash
+./build/lang_iteration10_source_fuzz --grammar recursive --seed <uint64> --schedule <schedule-name>
+```
+
 Replay a negative mutant check with:
 
 ```bash
 ./build/lang_iteration10_source_fuzz --seed <uint64> --mutant <0..2>
+```
+
+Replay a recursive negative mutant check with:
+
+```bash
+./build/lang_iteration10_source_fuzz --grammar recursive --seed <uint64> --mutant <0..3>
+```
+
+Dump either source corpus for byte-identity checks with:
+
+```bash
+./build/lang_iteration10_source_fuzz --dump-corpus legacy
+./build/lang_iteration10_source_fuzz --dump-corpus recursive
 ```
