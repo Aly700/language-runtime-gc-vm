@@ -148,7 +148,37 @@ reference rewriting instead of host pointer patching. An `ObjectId` is a move-se
 capability to the current storage location, not stable numeric identity. Language-level
 object identity survives movement because the collector rewrites every mutator-visible
 reference to the survivor's new `ObjectId` before bytecode execution resumes; stale copied
-IDs outside the traced root set remain invalid and trap loudly.
+IDs outside the traced root set remain invalid and trap loudly. External C++ code that
+needs to keep a heap reference across collection must hold a `lang::gc::Handle`; raw
+`ObjectId` or `Value` copies outside a root slot are intentionally not movement-safe.
+
+## Embedder root handles
+
+`lang::gc::Handle` is the narrow C++ embedder API for holding a heap reference across
+moving collection. A handle is created only by `Heap::make_handle(Value)` or
+`Heap::make_handle(ObjectId)`, validates object IDs before registration, owns one mutable
+`Value` slot, and registers that slot in a heap-owned `std::vector<Value*>`. The vector is
+traced in registration order after VM/explicit `RootProvider` roots and before temporary
+allocation roots, so marking, forwarding, and validation remain deterministic without
+pointer-keyed hash containers.
+
+Handles are move-only. Move construction and move assignment transfer the existing root
+registration to the destination slot and leave the source handle unusable, so copying
+cannot accidentally duplicate a long-lived root. Destruction deregisters the slot; a
+destroyed handle is not traced by later collections. `Handle::value()` returns the current
+rewritten `Value`, and `Handle::object()` returns the current rewritten `ObjectId`.
+
+The lifetime rule is explicit: a `Heap` must outlive all of its handles. The heap carries a
+shared lifetime token for use-after-move/teardown diagnostics, and `Heap::~Heap` aborts if
+any handle root slots are still registered. This makes lifetime violations deterministic
+under asserts instead of leaving a dangling registration that a later collection could
+trace. Handles are roots only; they are not old objects and never participate in the
+remembered set.
+
+Rejected alternative: copyable handles with shared ownership of a root table entry. That
+would make `Handle h2 = h1` cheap, but it hides whether a copy is meant to extend object
+lifetime and makes deregistration depend on reference counts rather than lexical root
+ownership. Move-only handles keep C++ root lifetimes visible.
 
 ## Moving collection
 
@@ -164,9 +194,9 @@ Collection is mark, forward, rewrite, install, validate:
    old stale ID for the destination slot cannot alias the moved object. The old source slot
    is emptied, so the pre-move ID also traps.
 4. Before installing the compacted slot vector, the collector rewrites all roots
-   (`RootProvider` roots from every VM frame plus allocation extra roots) and every copied
-   live pair field through the forwarding table while the old layout can still validate old
-   IDs.
+   (`RootProvider` roots from every VM frame, heap handle slots, plus allocation extra
+   roots) and every copied live pair field through the forwarding table while the old
+   layout can still validate old IDs.
 5. After installation, validation walks all roots and all live-object fields and checks that
    every object reference resolves through the current generation table.
 
@@ -226,9 +256,14 @@ remembered-set entries.
   `ObjectId` throws, exposing root-precision and missed-forwarding bugs instead of silently
   ignoring or aliasing them.
 - Moving-collector safety: `RootProvider`/`RootVisitor` traces mutable root slots,
-  allocation stress treats allocation operands and the new object as temporary roots, the
-  forwarding pass rewrites all roots and live heap fields before mutator execution resumes,
-  and VM collection points assert generated stack maps both before and after collection.
+  heap handles expose mutable embedder root slots, allocation stress treats allocation
+  operands and the new object as temporary roots, the forwarding pass rewrites all roots
+  and live heap fields before mutator execution resumes, and VM collection points assert
+  generated stack maps both before and after collection.
+- Handle-root safety: every live `lang::gc::Handle` is a deterministic heap root slot
+  traced and rewritten by major collection, minor collection, stress collection, and
+  post-collection validation; destroying or moving a handle removes or transfers exactly
+  that slot registration.
 - Generational barrier safety: old-to-young stores are recorded in `Heap::store_pair_field`,
   minor collection traces young objects from mutator roots plus remembered old objects,
   remembered-set entries are rewritten/pruned after movement, and validation traps any

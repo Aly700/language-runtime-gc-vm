@@ -3,6 +3,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -10,6 +11,10 @@
 #include <vector>
 
 namespace lang::gc {
+
+struct HeapLifetime {
+    bool alive{true};
+};
 
 namespace {
 
@@ -38,6 +43,85 @@ std::uint32_t next_generation(std::uint32_t generation) {
 }
 
 } // namespace
+
+void Handle::ensure_usable() const {
+    if (heap_ == nullptr) {
+        throw std::logic_error("GC handle used after move");
+    }
+    if (!lifetime_ || !lifetime_->alive) {
+        assert(false && "GC handle used after its heap was destroyed");
+        throw std::logic_error("GC handle used after its heap was destroyed");
+    }
+}
+
+Handle::Handle(Heap& heap, Value value)
+    : heap_(&heap), lifetime_(heap.lifetime_), slot_(value) {
+    heap.register_handle_root(&slot_);
+}
+
+Handle::~Handle() {
+    release();
+}
+
+Handle::Handle(Handle&& other) noexcept
+    : heap_(other.heap_), lifetime_(std::move(other.lifetime_)), slot_(other.slot_) {
+    if (heap_ != nullptr) {
+        if (!lifetime_ || !lifetime_->alive) {
+            assert(false && "moving a GC handle after its heap was destroyed");
+            std::abort();
+        }
+        heap_->move_handle_root(&other.slot_, &slot_);
+    }
+    other.heap_ = nullptr;
+    other.slot_ = Value::nil();
+}
+
+Handle& Handle::operator=(Handle&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    release();
+
+    heap_ = other.heap_;
+    lifetime_ = std::move(other.lifetime_);
+    slot_ = other.slot_;
+    if (heap_ != nullptr) {
+        if (!lifetime_ || !lifetime_->alive) {
+            assert(false && "move-assigning a GC handle after its heap was destroyed");
+            std::abort();
+        }
+        heap_->move_handle_root(&other.slot_, &slot_);
+    }
+    other.heap_ = nullptr;
+    other.slot_ = Value::nil();
+    return *this;
+}
+
+Value Handle::value() const {
+    ensure_usable();
+    return slot_;
+}
+
+ObjectId Handle::object() const {
+    return value().as_object();
+}
+
+void Handle::release() noexcept {
+    if (heap_ == nullptr) {
+        return;
+    }
+
+    if (!lifetime_ || !lifetime_->alive) {
+        assert(false && "destroying a GC handle after its heap was destroyed");
+        std::abort();
+    }
+
+    heap_->deregister_handle_root(&slot_);
+    heap_ = nullptr;
+    lifetime_.reset();
+    slot_ = Value::nil();
+}
 
 class Heap::MarkingVisitor final : public RootVisitor {
 public:
@@ -74,6 +158,18 @@ private:
     const Heap& heap_;
 };
 
+Heap::Heap() : lifetime_(std::make_shared<HeapLifetime>()) {}
+
+Heap::~Heap() noexcept {
+    if (lifetime_) {
+        lifetime_->alive = false;
+    }
+    if (!handle_roots_.empty()) {
+        assert(false && "Heap destroyed while GC handles are still live");
+        std::abort();
+    }
+}
+
 ObjectId Heap::allocate_pair(Value left, Value right) {
     if (stress_config_.collect_before_every_allocation) {
         std::array<Value*, 2> operand_roots{&left, &right};
@@ -90,6 +186,18 @@ ObjectId Heap::allocate_pair(Value left, Value right) {
     }
 
     return id;
+}
+
+Handle Heap::make_handle(Value value) {
+    if (value.is_object()) {
+        (void)checked_slot(value.as_object());
+    }
+    return Handle(*this, value);
+}
+
+Handle Heap::make_handle(ObjectId id) {
+    (void)checked_slot(id);
+    return Handle(*this, Value::object(id));
 }
 
 ObjectId Heap::allocate_slot(Value left, Value right) {
@@ -125,6 +233,41 @@ const Object& Heap::object(ObjectId id) const {
 
 Object& Heap::mutable_object(ObjectId id) {
     return *objects_[checked_slot(id)];
+}
+
+void Heap::register_handle_root(Value* slot) {
+    assert(slot != nullptr && "cannot register a null GC handle root slot");
+    handle_roots_.push_back(slot);
+}
+
+void Heap::deregister_handle_root(Value* slot) noexcept {
+    for (auto it = handle_roots_.begin(); it != handle_roots_.end(); ++it) {
+        if (*it == slot) {
+            handle_roots_.erase(it);
+            return;
+        }
+    }
+    assert(false && "GC handle root slot was not registered");
+    std::abort();
+}
+
+void Heap::move_handle_root(Value* from, Value* to) noexcept {
+    assert(to != nullptr && "cannot move a GC handle root to a null slot");
+    for (auto& root : handle_roots_) {
+        if (root == from) {
+            root = to;
+            return;
+        }
+    }
+    assert(false && "moved GC handle root slot was not registered");
+    std::abort();
+}
+
+void Heap::trace_handle_roots(RootVisitor& visitor) const {
+    for (auto* root : handle_roots_) {
+        assert(root != nullptr && "registered GC handle root slot is null");
+        visitor.visit(*root);
+    }
 }
 
 Value Heap::left(ObjectId id) const {
@@ -314,6 +457,7 @@ void Heap::trace_collection_roots(RootVisitor& visitor, RootProvider* roots,
     if (roots != nullptr) {
         roots->trace_roots(visitor);
     }
+    trace_handle_roots(visitor);
     for (auto* root : extra_roots) {
         if (root != nullptr) {
             visitor.visit(*root);

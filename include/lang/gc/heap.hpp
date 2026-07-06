@@ -3,11 +3,16 @@
 #include "lang/value.hpp"
 
 #include <cstdint>
+#include <cstddef>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace lang::gc {
+
+class Heap;
+struct HeapLifetime;
 
 class RootVisitor {
 public:
@@ -43,9 +48,44 @@ struct Object {
     Value right{Value::nil()};
 };
 
+class Handle {
+public:
+    ~Handle();
+
+    Handle(const Handle&) = delete;
+    Handle& operator=(const Handle&) = delete;
+    Handle(Handle&& other) noexcept;
+    Handle& operator=(Handle&& other) noexcept;
+
+    [[nodiscard]] Value value() const;
+    [[nodiscard]] ObjectId object() const;
+
+private:
+    friend class Heap;
+
+    Handle(Heap& heap, Value value);
+
+    void release() noexcept;
+    void ensure_usable() const;
+
+    Heap* heap_{nullptr};
+    std::shared_ptr<HeapLifetime> lifetime_;
+    Value slot_{Value::nil()};
+};
+
 class Heap {
 public:
+    Heap();
+    ~Heap() noexcept;
+
+    Heap(const Heap&) = delete;
+    Heap& operator=(const Heap&) = delete;
+    Heap(Heap&&) = delete;
+    Heap& operator=(Heap&&) = delete;
+
     ObjectId allocate_pair(Value left, Value right);
+    [[nodiscard]] Handle make_handle(Value value);
+    [[nodiscard]] Handle make_handle(ObjectId id);
     void set_root_provider(RootProvider* provider) { root_provider_ = provider; }
     void collect();
     void collect(RootProvider& roots);
@@ -70,10 +110,15 @@ public:
     [[nodiscard]] std::uint64_t TEST_ONLY_validation_count() const {
         return TEST_ONLY_validation_count_;
     }
+    [[nodiscard]] std::size_t TEST_ONLY_handle_root_count() const {
+        return handle_roots_.size();
+    }
     void TEST_ONLY_skip_next_write_barrier_for_barrier_validator();
     void TEST_ONLY_validate_gc_invariants() const;
 
 private:
+    friend class Handle;
+
     class MarkingVisitor;
     class ForwardingVisitor;
     class ValidatingVisitor;
@@ -90,6 +135,10 @@ private:
     ObjectId allocate_slot(Value left, Value right);
     [[nodiscard]] std::size_t checked_slot(ObjectId id) const;
     [[nodiscard]] Object& mutable_object(ObjectId id);
+    void register_handle_root(Value* slot);
+    void deregister_handle_root(Value* slot) noexcept;
+    void move_handle_root(Value* from, Value* to) noexcept;
+    void trace_handle_roots(RootVisitor& visitor) const;
     void collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots);
     void collect_with_extra_roots(std::span<Value*> extra_roots);
     void trace_collection_roots(RootVisitor& visitor, RootProvider* roots,
@@ -116,10 +165,12 @@ private:
     void validate_value(Value value) const;
 
     RootProvider* root_provider_{nullptr};
+    std::shared_ptr<HeapLifetime> lifetime_;
     StressConfig stress_config_{};
     std::vector<std::optional<Object>> objects_;
     std::vector<std::uint32_t> generations_;
     std::vector<ObjectId> remembered_set_;
+    std::vector<Value*> handle_roots_;
     bool TEST_ONLY_skip_next_write_barrier_{false};
     mutable std::uint64_t TEST_ONLY_validation_count_{0};
 };

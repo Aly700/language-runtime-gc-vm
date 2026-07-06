@@ -21,6 +21,7 @@
 - The collector must never treat non-reference values as references.
 - No object may be swept while reachable.
 - If a moving collector is introduced, every root and heap reference must be updated before mutator execution resumes.
+- Every live embedder handle is a precise mutable root slot; handle destruction removes that slot before the next collection, and the heap must outlive all handles.
 - Write barriers must run on every old-to-young reference store once generations exist.
 
 ## Testing

@@ -181,11 +181,10 @@ void heap_stale_pre_compaction_id_traps_after_move() {
     const auto dead = heap.allocate_pair(lang::Value::int64(10), lang::Value::int64(11));
     const auto survivor = heap.allocate_pair(lang::Value::int64(20), lang::Value::int64(21));
 
-    VectorRoots roots;
-    roots.roots.push_back(lang::Value::object(survivor));
-    heap.collect(roots);
+    auto handle = heap.make_handle(survivor);
+    heap.collect();
 
-    const auto moved = roots.roots.at(0).as_object();
+    const auto moved = handle.object();
     require(moved != survivor && slot_of(moved) == 0,
             "test setup did not move the survivor out of its original slot\n" +
                 describe_heap(heap, {{"dead", dead}, {"survivor", survivor}, {"moved", moved}}));
