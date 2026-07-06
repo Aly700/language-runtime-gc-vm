@@ -13,6 +13,13 @@ source -> lexer -> parser -> AST -> type checker -> compiler -> verifier -> VM -
 diagnostics with byte offsets plus 1-based line/column positions. For compatibility with
 single-entry tests, the result also exposes a copy of the entry `lang::Function`.
 
+Frontend implementation files are split by pipeline stage while keeping
+`include/lang/frontend/type_checker.hpp` as the only public frontend API:
+`src/frontend/lexer.*` owns tokenization, `parser.*` owns AST definitions and parsing,
+`type_checker_internal.*` owns flow-sensitive typing and diagnostics,
+`compiler.*` owns bytecode emission plus the verifier-agreement assertion, and the thin
+`type_checker.cpp` wires those stages into `compile_program`.
+
 The source language is intentionally small:
 
 - Types are `i64`, `bool`, opaque `pair`, and finite parametric `pair<T, U>`.

@@ -1,0 +1,533 @@
+#include "parser.hpp"
+
+#include "diagnostics.hpp"
+
+#include <memory>
+#include <optional>
+#include <utility>
+#include <vector>
+
+namespace lang::frontend::detail {
+
+TypeSpec int64_type() { return TypeSpec{TypeSpec::Kind::Int64, nullptr, nullptr}; }
+TypeSpec bool_type() { return TypeSpec{TypeSpec::Kind::Bool, nullptr, nullptr}; }
+TypeSpec pair_type() { return TypeSpec{TypeSpec::Kind::Pair, nullptr, nullptr}; }
+TypeSpec invalid_type() { return TypeSpec{TypeSpec::Kind::Invalid, nullptr, nullptr}; }
+
+TypeSpec pair_type(TypeSpec left, TypeSpec right) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Pair;
+    type.left = std::make_shared<TypeSpec>(std::move(left));
+    type.right = std::make_shared<TypeSpec>(std::move(right));
+    return type;
+}
+
+bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
+    if (lhs.kind != rhs.kind) {
+        return false;
+    }
+    if (!lhs.has_pair_fields() && !rhs.has_pair_fields()) {
+        return true;
+    }
+    if (lhs.has_pair_fields() != rhs.has_pair_fields()) {
+        return false;
+    }
+    return *lhs.left == *rhs.left && *lhs.right == *rhs.right;
+}
+
+bool operator!=(const TypeSpec& lhs, const TypeSpec& rhs) {
+    return !(lhs == rhs);
+}
+
+bool is_invalid(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Invalid;
+}
+
+bool is_pair(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Pair;
+}
+
+Type public_type(const TypeSpec& type) {
+    switch (type.kind) {
+    case TypeSpec::Kind::Int64:
+        return Type::Int64;
+    case TypeSpec::Kind::Bool:
+        return Type::Bool;
+    case TypeSpec::Kind::Pair:
+        return Type::Pair;
+    case TypeSpec::Kind::Invalid:
+        return Type::Invalid;
+    }
+    return Type::Invalid;
+}
+
+std::string type_name(const TypeSpec& type) {
+    switch (type.kind) {
+    case TypeSpec::Kind::Int64:
+        return "i64";
+    case TypeSpec::Kind::Bool:
+        return "bool";
+    case TypeSpec::Kind::Pair:
+        if (type.has_pair_fields()) {
+            return "pair<" + type_name(*type.left) + ", " + type_name(*type.right) + ">";
+        }
+        return "pair";
+    case TypeSpec::Kind::Invalid:
+        return "invalid";
+    }
+    return "invalid";
+}
+
+TypeSpec join_types(const TypeSpec& lhs, const TypeSpec& rhs) {
+    if (is_invalid(lhs)) {
+        return rhs;
+    }
+    if (is_invalid(rhs)) {
+        return lhs;
+    }
+    if (lhs == rhs) {
+        return lhs;
+    }
+    if (is_pair(lhs) && is_pair(rhs)) {
+        return pair_type();
+    }
+    return invalid_type();
+}
+
+namespace {
+
+class Parser {
+public:
+    explicit Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
+
+    std::optional<Program> parse() {
+        Program program;
+        while (match(TokenKind::Fn)) {
+            auto declaration = parse_function(previous());
+            if (declaration.has_value()) {
+                program.functions.push_back(std::move(*declaration));
+            } else {
+                synchronize();
+            }
+        }
+
+        while (!check(TokenKind::End)) {
+            if (starts_statement()) {
+                auto statement = parse_statement();
+                if (statement.has_value()) {
+                    program.statements.push_back(std::move(*statement));
+                } else {
+                    synchronize();
+                }
+                continue;
+            }
+
+            auto result = parse_expression();
+            if (!result) {
+                synchronize();
+                break;
+            }
+            program.result = std::move(result);
+            break;
+        }
+
+        if (!program.result && diagnostics_.empty()) {
+            add_diagnostic(diagnostics_, peek().position, "program must end with an expression");
+        }
+        if (program.result) {
+            expect(TokenKind::End, "expected end of input after final expression");
+        }
+        program.pair_site_count = next_pair_site_;
+        if (!diagnostics_.empty()) {
+            return std::nullopt;
+        }
+        return program;
+    }
+
+    [[nodiscard]] const std::vector<Diagnostic>& diagnostics() const {
+        return diagnostics_;
+    }
+
+private:
+    [[nodiscard]] const Token& peek() const { return tokens_[current_]; }
+    [[nodiscard]] const Token& previous() const { return tokens_[current_ - 1]; }
+    [[nodiscard]] bool check(TokenKind kind) const { return peek().kind == kind; }
+    [[nodiscard]] bool at_end() const { return check(TokenKind::End); }
+
+    bool match(TokenKind kind) {
+        if (!check(kind)) {
+            return false;
+        }
+        ++current_;
+        return true;
+    }
+
+    std::optional<Token> expect(TokenKind kind, const std::string& message) {
+        if (match(kind)) {
+            return previous();
+        }
+        add_diagnostic(diagnostics_, peek().position, message);
+        return std::nullopt;
+    }
+
+    std::optional<FunctionDecl> parse_function(const Token& fn_token) {
+        FunctionDecl declaration;
+        declaration.position = fn_token.position;
+
+        const auto name = expect(TokenKind::Identifier, "expected function name after 'fn'");
+        if (name.has_value()) {
+            declaration.name = name->text;
+        }
+        expect(TokenKind::LParen, "expected '(' after function name");
+        if (!check(TokenKind::RParen)) {
+            do {
+                Parameter parameter;
+                const auto parameter_name =
+                    expect(TokenKind::Identifier, "expected parameter name");
+                if (parameter_name.has_value()) {
+                    parameter.name = parameter_name->text;
+                    parameter.position = parameter_name->position;
+                }
+                expect(TokenKind::Colon, "expected ':' after parameter name");
+                parameter.type = parse_type();
+                declaration.parameters.push_back(std::move(parameter));
+            } while (match(TokenKind::Comma));
+        }
+        expect(TokenKind::RParen, "expected ')' after parameters");
+        expect(TokenKind::Arrow, "expected '->' before function return type");
+        declaration.return_type = parse_type();
+        expect(TokenKind::LBrace, "expected '{' before function body");
+
+        while (!check(TokenKind::RBrace) && !check(TokenKind::End)) {
+            if (starts_statement()) {
+                auto statement = parse_statement();
+                if (statement.has_value()) {
+                    declaration.statements.push_back(std::move(*statement));
+                } else {
+                    synchronize();
+                }
+                continue;
+            }
+
+            declaration.result = parse_expression();
+            break;
+        }
+
+        if (!declaration.result && diagnostics_.empty()) {
+            add_diagnostic(diagnostics_, peek().position,
+                           "function body must end with an expression");
+        }
+        expect(TokenKind::RBrace, "expected '}' after function body");
+        return declaration;
+    }
+
+    [[nodiscard]] bool starts_statement() const {
+        if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While)) {
+            return true;
+        }
+        return assignment_ahead();
+    }
+
+    [[nodiscard]] bool assignment_ahead() const {
+        if (!check(TokenKind::Identifier)) {
+            return false;
+        }
+        std::size_t index = current_ + 1;
+        while (index + 1 < tokens_.size() && tokens_[index].kind == TokenKind::Dot &&
+               (tokens_[index + 1].kind == TokenKind::Left ||
+                tokens_[index + 1].kind == TokenKind::Right)) {
+            index += 2;
+        }
+        return index < tokens_.size() && tokens_[index].kind == TokenKind::Equal;
+    }
+
+    std::optional<Statement> parse_statement() {
+        if (match(TokenKind::Let)) {
+            return parse_let(previous());
+        }
+        if (match(TokenKind::If)) {
+            return parse_if(previous());
+        }
+        if (match(TokenKind::While)) {
+            return parse_while(previous());
+        }
+        if (assignment_ahead()) {
+            return parse_assignment();
+        }
+        add_diagnostic(diagnostics_, peek().position, "expected statement");
+        return std::nullopt;
+    }
+
+    std::optional<Statement> parse_let(const Token& let_token) {
+        Statement statement;
+        statement.kind = Statement::Kind::Let;
+        statement.position = let_token.position;
+
+        const auto name = expect(TokenKind::Identifier, "expected local name after 'let'");
+        if (name.has_value()) {
+            statement.name = name->text;
+        }
+        expect(TokenKind::Colon, "expected ':' after local name");
+        statement.declared_type = parse_type();
+        const auto equals = expect(TokenKind::Equal, "let declarations require an initializer");
+        if (equals.has_value()) {
+            statement.equals_position = equals->position;
+        }
+        statement.initializer = parse_expression();
+        expect(TokenKind::Semicolon, "expected ';' after let declaration");
+        return statement;
+    }
+
+    TypeSpec parse_type() {
+        if (match(TokenKind::I64)) {
+            return int64_type();
+        }
+        if (match(TokenKind::Bool)) {
+            return bool_type();
+        }
+        if (match(TokenKind::Pair)) {
+            if (match(TokenKind::Less)) {
+                auto left = parse_type();
+                expect(TokenKind::Comma, "expected ',' between pair field types");
+                auto right = parse_type();
+                expect(TokenKind::Greater, "expected '>' after pair field types");
+                return pair_type(std::move(left), std::move(right));
+            }
+            return pair_type();
+        }
+        add_diagnostic(diagnostics_, peek().position,
+                       "expected type 'i64', 'bool', or 'pair'");
+        return invalid_type();
+    }
+
+    std::optional<Statement> parse_assignment() {
+        Statement statement;
+        statement.kind = Statement::Kind::Assign;
+        statement.position = peek().position;
+        statement.target = parse_lvalue();
+        const auto equals = expect(TokenKind::Equal, "expected '=' in assignment");
+        if (equals.has_value()) {
+            statement.equals_position = equals->position;
+        }
+        statement.value = parse_expression();
+        expect(TokenKind::Semicolon, "expected ';' after assignment");
+        return statement;
+    }
+
+    std::optional<Statement> parse_if(const Token& if_token) {
+        Statement statement;
+        statement.kind = Statement::Kind::If;
+        statement.position = if_token.position;
+        statement.condition = parse_expression();
+        statement.then_branch = parse_block("expected '{' before if body");
+        if (!match(TokenKind::Else)) {
+            add_diagnostic(diagnostics_, peek().position, "if statements require an else branch");
+        } else {
+            statement.else_branch = parse_block("expected '{' before else body");
+        }
+        return statement;
+    }
+
+    std::optional<Statement> parse_while(const Token& while_token) {
+        Statement statement;
+        statement.kind = Statement::Kind::While;
+        statement.position = while_token.position;
+        statement.condition = parse_expression();
+        statement.body = parse_block("expected '{' before while body");
+        return statement;
+    }
+
+    std::vector<Statement> parse_block(const std::string& open_message) {
+        std::vector<Statement> statements;
+        if (!expect(TokenKind::LBrace, open_message).has_value()) {
+            return statements;
+        }
+        while (!check(TokenKind::RBrace) && !check(TokenKind::End)) {
+            auto statement = parse_statement();
+            if (statement.has_value()) {
+                statements.push_back(std::move(*statement));
+            } else {
+                synchronize();
+            }
+        }
+        expect(TokenKind::RBrace, "expected '}' after block");
+        return statements;
+    }
+
+    LValue parse_lvalue() {
+        LValue value;
+        const auto name = expect(TokenKind::Identifier, "expected assignment target");
+        if (name.has_value()) {
+            value.base_name = name->text;
+            value.base_position = name->position;
+        }
+        while (match(TokenKind::Dot)) {
+            if (match(TokenKind::Left) || match(TokenKind::Right)) {
+                value.fields.push_back(FieldStep{previous().text, previous().position});
+            } else {
+                add_diagnostic(diagnostics_, peek().position,
+                               "expected field name 'left' or 'right'");
+                break;
+            }
+        }
+        return value;
+    }
+
+    std::unique_ptr<Expr> parse_expression() { return parse_comparison(); }
+
+    std::unique_ptr<Expr> parse_comparison() {
+        auto expression = parse_addition();
+        while (match(TokenKind::Less)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::Binary;
+            node->position = expression->position;
+            node->operator_position = previous().position;
+            node->binary_op = '<';
+            node->left = std::move(expression);
+            node->right = parse_addition();
+            expression = std::move(node);
+        }
+        return expression;
+    }
+
+    std::unique_ptr<Expr> parse_addition() {
+        auto expression = parse_postfix();
+        while (match(TokenKind::Plus)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::Binary;
+            node->position = expression->position;
+            node->operator_position = previous().position;
+            node->binary_op = '+';
+            node->left = std::move(expression);
+            node->right = parse_postfix();
+            expression = std::move(node);
+        }
+        return expression;
+    }
+
+    std::unique_ptr<Expr> parse_postfix() {
+        auto expression = parse_primary();
+        bool keep_parsing = true;
+        while (keep_parsing) {
+            if (match(TokenKind::Dot)) {
+                if (match(TokenKind::Left) || match(TokenKind::Right)) {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::Field;
+                    node->position = previous().position;
+                    node->name = previous().text;
+                    node->receiver = std::move(expression);
+                    expression = std::move(node);
+                } else {
+                    add_diagnostic(diagnostics_, peek().position,
+                                   "expected field name 'left' or 'right'");
+                    break;
+                }
+            } else if (match(TokenKind::LParen)) {
+                auto node = std::make_unique<Expr>();
+                node->kind = Expr::Kind::Call;
+                node->position = expression->position;
+                if (expression->kind == Expr::Kind::Variable) {
+                    node->name = expression->name;
+                } else {
+                    add_diagnostic(diagnostics_, node->position,
+                                   "call target must be a function name");
+                }
+                if (!check(TokenKind::RParen)) {
+                    do {
+                        node->arguments.push_back(parse_expression());
+                    } while (match(TokenKind::Comma));
+                }
+                expect(TokenKind::RParen, "expected ')' after call arguments");
+                expression = std::move(node);
+            } else {
+                keep_parsing = false;
+            }
+        }
+        return expression;
+    }
+
+    std::unique_ptr<Expr> parse_primary() {
+        if (match(TokenKind::Integer)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::IntLiteral;
+            node->position = previous().position;
+            node->int_value = previous().integer;
+            return node;
+        }
+        if (match(TokenKind::True) || match(TokenKind::False)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::BoolLiteral;
+            node->position = previous().position;
+            node->bool_value = previous().kind == TokenKind::True;
+            return node;
+        }
+        if (match(TokenKind::Identifier)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::Variable;
+            node->position = previous().position;
+            node->name = previous().text;
+            return node;
+        }
+        if (match(TokenKind::Pair)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::PairLiteral;
+            node->position = previous().position;
+            node->pair_site = next_pair_site_++;
+            expect(TokenKind::LParen, "expected '(' after 'pair'");
+            node->left = parse_expression();
+            expect(TokenKind::Comma, "expected ',' between pair fields");
+            node->right = parse_expression();
+            expect(TokenKind::RParen, "expected ')' after pair fields");
+            return node;
+        }
+        if (match(TokenKind::LParen)) {
+            auto expression = parse_expression();
+            expect(TokenKind::RParen, "expected ')' after expression");
+            return expression;
+        }
+
+        add_diagnostic(diagnostics_, peek().position, "expected expression");
+        auto node = std::make_unique<Expr>();
+        node->kind = Expr::Kind::IntLiteral;
+        node->position = peek().position;
+        node->inferred_type = invalid_type();
+        if (!at_end()) {
+            ++current_;
+        }
+        return node;
+    }
+
+    void synchronize() {
+        while (!at_end()) {
+            if (current_ > 0 && previous().kind == TokenKind::Semicolon) {
+                return;
+            }
+            if (check(TokenKind::Fn) || check(TokenKind::Let) || check(TokenKind::If) ||
+                check(TokenKind::While) || check(TokenKind::RBrace)) {
+                return;
+            }
+            ++current_;
+        }
+    }
+
+    std::vector<Token> tokens_;
+    std::size_t current_{0};
+    std::size_t next_pair_site_{0};
+    std::vector<Diagnostic> diagnostics_;
+};
+
+} // namespace
+
+ParseResult parse_tokens(std::vector<Token> tokens) {
+    Parser parser(std::move(tokens));
+    auto program = parser.parse();
+    ParseResult result;
+    if (program.has_value()) {
+        result.program = std::move(*program);
+    }
+    result.diagnostics = std::vector<Diagnostic>(parser.diagnostics().begin(),
+                                                 parser.diagnostics().end());
+    return result;
+}
+
+} // namespace lang::frontend::detail
