@@ -18,8 +18,14 @@
 namespace {
 
 constexpr std::uint64_t kSnapshotSeed = 17;
+constexpr std::uint64_t kCallSnapshotSeed = 17;
 constexpr std::uint64_t kFirstCorpusSeed = 1;
 constexpr std::uint64_t kCorpusSize = 64;
+
+enum class Grammar {
+    Single,
+    Calls,
+};
 
 const char* op_name(lang::OpCode op) {
     switch (op) {
@@ -57,12 +63,58 @@ const char* op_name(lang::OpCode op) {
     return "<unknown>";
 }
 
+const char* value_kind_name(lang::ValueKind kind) {
+    switch (kind) {
+    case lang::ValueKind::Int64:
+        return "i64";
+    case lang::ValueKind::Bool:
+        return "bool";
+    case lang::ValueKind::Object:
+        return "object";
+    case lang::ValueKind::Nil:
+        return "nil";
+    }
+    return "<unknown>";
+}
+
+std::string signature_text(const lang::FunctionSignature& signature) {
+    std::ostringstream out;
+    out << "(";
+    for (std::size_t i = 0; i < signature.parameters.size(); ++i) {
+        if (i != 0) {
+            out << ",";
+        }
+        out << value_kind_name(signature.parameters[i]);
+    }
+    out << ")->" << value_kind_name(signature.return_type);
+    return out.str();
+}
+
 std::string describe(const lang::Function& function) {
     std::ostringstream out;
     out << "locals=" << function.local_count << "\n";
     for (std::size_t pc = 0; pc < function.code.size(); ++pc) {
         const auto& ins = function.code[pc];
         out << "  #" << pc << " " << op_name(ins.op) << " " << ins.operand << "\n";
+    }
+    return out.str();
+}
+
+std::string describe(const lang::Module& module) {
+    std::ostringstream out;
+    out << "entry=" << module.entry_function << " functions="
+        << module.functions.size() << "\n";
+    for (std::size_t function_index = 0; function_index < module.functions.size();
+         ++function_index) {
+        const auto& function = module.functions[function_index];
+        out << "function=" << function_index << " signature="
+            << signature_text(function.signature) << " locals="
+            << function.local_count << "\n";
+        for (std::size_t pc = 0; pc < function.code.size(); ++pc) {
+            const auto& ins = function.code[pc];
+            out << "  #" << pc << " " << op_name(ins.op) << " " << ins.operand
+                << "\n";
+        }
     }
     return out.str();
 }
@@ -103,12 +155,39 @@ enum class Kind {
     Object,
 };
 
+Kind kind_from_value_kind(lang::ValueKind kind) {
+    switch (kind) {
+    case lang::ValueKind::Int64:
+        return Kind::Int64;
+    case lang::ValueKind::Bool:
+        return Kind::Bool;
+    case lang::ValueKind::Object:
+        return Kind::Object;
+    case lang::ValueKind::Nil:
+        break;
+    }
+    throw std::logic_error("fuzzer generator does not emit nil values");
+}
+
+lang::FunctionSignature object_return_signature() {
+    lang::FunctionSignature signature;
+    signature.return_type = lang::ValueKind::Object;
+    return signature;
+}
+
 class Builder {
 public:
-    explicit Builder(std::uint32_t local_count) {
+    explicit Builder(std::uint32_t local_count)
+        : Builder(local_count, object_return_signature()) {}
+
+    Builder(std::uint32_t local_count, lang::FunctionSignature signature) {
         function_.local_count = local_count;
-        function_.signature.return_type = lang::ValueKind::Object;
+        function_.signature = std::move(signature);
+        assert(function_.local_count >= function_.signature.parameters.size());
         locals_.resize(local_count);
+        for (std::size_t i = 0; i < function_.signature.parameters.size(); ++i) {
+            locals_[i] = kind_from_value_kind(function_.signature.parameters[i]);
+        }
     }
 
     [[nodiscard]] std::size_t pc() const { return function_.code.size(); }
@@ -187,6 +266,14 @@ public:
 
     void collect() { emit(lang::OpCode::Collect, 0); }
 
+    void call(std::size_t callee_index, const lang::FunctionSignature& signature) {
+        for (std::size_t i = signature.parameters.size(); i > 0; --i) {
+            pop_expect(kind_from_value_kind(signature.parameters[i - 1]));
+        }
+        emit(lang::OpCode::Call, static_cast<std::int64_t>(callee_index));
+        stack_.push_back(kind_from_value_kind(signature.return_type));
+    }
+
     std::size_t jump_if_false_placeholder() {
         pop_expect(Kind::Bool);
         const auto index = pc();
@@ -204,7 +291,7 @@ public:
     }
 
     void return_top() {
-        pop_any();
+        pop_expect(kind_from_value_kind(function_.signature.return_type));
         emit(lang::OpCode::Return, 0);
     }
 
@@ -389,6 +476,327 @@ lang::Function generate_program(std::uint64_t seed) {
     return function;
 }
 
+lang::FunctionSignature make_signature(std::vector<lang::ValueKind> parameters,
+                                       lang::ValueKind return_type) {
+    lang::FunctionSignature signature;
+    signature.parameters = std::move(parameters);
+    signature.return_type = return_type;
+    return signature;
+}
+
+std::vector<lang::FunctionSignature> call_signatures(std::size_t function_count) {
+    std::vector<lang::FunctionSignature> signatures(function_count);
+    signatures[0] = make_signature({}, lang::ValueKind::Object);
+    signatures[1] = make_signature({lang::ValueKind::Int64,
+                                    lang::ValueKind::Object,
+                                    lang::ValueKind::Object},
+                                   lang::ValueKind::Object);
+    if (function_count >= 3) {
+        signatures[2] = make_signature({lang::ValueKind::Object,
+                                        lang::ValueKind::Object,
+                                        lang::ValueKind::Bool,
+                                        lang::ValueKind::Int64},
+                                       lang::ValueKind::Object);
+    }
+    if (function_count >= 4) {
+        signatures[3] = make_signature({lang::ValueKind::Int64,
+                                        lang::ValueKind::Int64,
+                                        lang::ValueKind::Object},
+                                       lang::ValueKind::Bool);
+    }
+    if (function_count >= 5) {
+        signatures[4] = make_signature({lang::ValueKind::Int64,
+                                        lang::ValueKind::Bool,
+                                        lang::ValueKind::Object},
+                                       lang::ValueKind::Int64);
+    }
+    return signatures;
+}
+
+lang::Function generate_call_entry(SplitMix64& rng,
+                                   const std::vector<lang::FunctionSignature>& signatures) {
+    constexpr std::uint32_t kRoot = 0;
+    constexpr std::uint32_t kTail = 1;
+    constexpr std::uint32_t kReturned = 2;
+    constexpr std::uint32_t kFlag = 3;
+    constexpr std::uint32_t kDepth = 4;
+    constexpr std::uint32_t kScratch = 5;
+    constexpr std::uint32_t kDead = 6;
+    constexpr std::uint32_t kLocalCount = 7;
+
+    const auto base_depth = static_cast<std::int64_t>(2 + rng.bounded(4));
+    const bool final_mutate_left = rng.bounded(2) == 0;
+
+    Builder b(kLocalCount, signatures[0]);
+    b.constant_i64(rng.small_i64());
+    b.constant_i64(rng.small_i64());
+    b.alloc_pair();
+    b.store_local(kTail);
+
+    b.load_local(kTail);
+    b.constant_i64(rng.small_i64());
+    b.alloc_pair();
+    b.store_local(kRoot);
+
+    b.load_local(kRoot);
+    b.store_local(kScratch);
+
+    b.collect();
+
+    b.constant_i64(rng.small_i64());
+    b.constant_i64(rng.small_i64());
+    b.alloc_pair();
+    b.store_local(kDead);
+    b.constant_i64(0);
+    b.store_local(kDead);
+
+    if (signatures.size() >= 4) {
+        b.load_local(kTail);
+        b.constant_i64(rng.small_i64());
+        b.constant_i64(rng.small_i64());
+        b.load_local(kRoot);
+        b.call(3, signatures[3]);
+        b.store_local(kFlag);
+        b.store_local(kScratch);
+    } else {
+        b.constant_i64(rng.small_i64());
+        b.constant_i64(rng.small_i64());
+        b.less_i64();
+        b.store_local(kFlag);
+    }
+
+    if (signatures.size() >= 5) {
+        b.load_local(kTail);
+        b.constant_i64(base_depth);
+        b.load_local(kFlag);
+        b.load_local(kRoot);
+        b.call(4, signatures[4]);
+        b.store_local(kDepth);
+        b.store_local(kScratch);
+    } else {
+        b.constant_i64(base_depth);
+        b.store_local(kDepth);
+    }
+
+    b.load_local(kRoot);
+    b.load_local(kDepth);
+    b.load_local(kTail);
+    b.load_local(kRoot);
+    b.call(1, signatures[1]);
+    b.store_local(kReturned);
+    b.store_local(kScratch);
+
+    if (signatures.size() >= 3) {
+        b.load_local(kTail);
+        b.load_local(kRoot);
+        b.load_local(kReturned);
+        b.load_local(kFlag);
+        b.load_local(kDepth);
+        b.call(2, signatures[2]);
+        b.store_local(kReturned);
+        b.store_local(kScratch);
+    }
+
+    b.load_local(kRoot);
+    b.load_local(kReturned);
+    if (final_mutate_left) {
+        b.set_left();
+    } else {
+        b.set_right();
+    }
+    b.collect();
+    b.load_local(kRoot);
+    b.return_top();
+    return b.finish();
+}
+
+lang::Function generate_recursive_builder(
+    SplitMix64& rng, const std::vector<lang::FunctionSignature>& signatures) {
+    constexpr std::uint32_t kCounter = 0;
+    constexpr std::uint32_t kTail = 1;
+    constexpr std::uint32_t kAnchor = 2;
+    constexpr std::uint32_t kNode = 3;
+    constexpr std::uint32_t kLocalCount = 4;
+
+    const bool mutate_anchor_left = rng.bounded(2) == 0;
+
+    Builder b(kLocalCount, signatures[1]);
+    b.load_local(kCounter);
+    b.constant_i64(1);
+    b.less_i64();
+    const auto recurse_jump = b.jump_if_false_placeholder();
+    b.load_local(kTail);
+    b.return_top();
+
+    const auto recurse_pc = b.pc();
+    b.patch_jump_target(recurse_jump, recurse_pc);
+    b.load_local(kCounter);
+    b.load_local(kTail);
+    b.alloc_pair();
+    b.store_local(kNode);
+
+    b.load_local(kNode);
+    b.load_local(kNode);
+    b.set_right();
+
+    b.load_local(kAnchor);
+    b.load_local(kNode);
+    if (mutate_anchor_left) {
+        b.set_left();
+    } else {
+        b.set_right();
+    }
+    b.collect();
+
+    b.load_local(kCounter);
+    b.constant_i64(-1);
+    b.add_i64();
+    b.load_local(kNode);
+    b.load_local(kAnchor);
+    b.call(1, signatures[1]);
+    b.return_top();
+    return b.finish();
+}
+
+lang::Function generate_object_mutator(
+    SplitMix64& rng, const std::vector<lang::FunctionSignature>& signatures) {
+    constexpr std::uint32_t kAnchor = 0;
+    constexpr std::uint32_t kIncoming = 1;
+    constexpr std::uint32_t kFlag = 2;
+    constexpr std::uint32_t kSalt = 3;
+    constexpr std::uint32_t kScratch = 4;
+    constexpr std::uint32_t kLocalCount = 5;
+
+    const bool self_cycle_left = rng.bounded(2) == 0;
+
+    Builder b(kLocalCount, signatures[2]);
+    b.load_local(kIncoming);
+    b.load_local(kSalt);
+    b.alloc_pair();
+    b.store_local(kScratch);
+
+    b.load_local(kScratch);
+    b.load_local(kScratch);
+    if (self_cycle_left) {
+        b.set_left();
+    } else {
+        b.set_right();
+    }
+
+    b.load_local(kFlag);
+    const auto else_jump = b.jump_if_false_placeholder();
+    b.load_local(kAnchor);
+    b.load_local(kScratch);
+    b.set_left();
+    b.collect();
+    b.load_local(kScratch);
+    b.return_top();
+
+    const auto else_pc = b.pc();
+    b.patch_jump_target(else_jump, else_pc);
+    b.load_local(kAnchor);
+    b.load_local(kScratch);
+    b.set_right();
+    b.collect();
+    b.load_local(kScratch);
+    b.return_top();
+    return b.finish();
+}
+
+lang::Function generate_bool_helper(
+    const std::vector<lang::FunctionSignature>& signatures) {
+    constexpr std::uint32_t kLhs = 0;
+    constexpr std::uint32_t kRhs = 1;
+    constexpr std::uint32_t kAnchor = 2;
+    constexpr std::uint32_t kScratch = 3;
+    constexpr std::uint32_t kLocalCount = 4;
+
+    Builder b(kLocalCount, signatures[3]);
+    b.load_local(kLhs);
+    b.load_local(kAnchor);
+    b.alloc_pair();
+    b.store_local(kScratch);
+    b.load_local(kAnchor);
+    b.load_local(kScratch);
+    b.set_right();
+    b.collect();
+    b.load_local(kLhs);
+    b.load_local(kRhs);
+    b.less_i64();
+    b.return_top();
+    return b.finish();
+}
+
+lang::Function generate_i64_helper(
+    SplitMix64& rng, const std::vector<lang::FunctionSignature>& signatures) {
+    constexpr std::uint32_t kBase = 0;
+    constexpr std::uint32_t kFlag = 1;
+    constexpr std::uint32_t kAnchor = 2;
+    constexpr std::uint32_t kScratch = 3;
+    constexpr std::uint32_t kLocalCount = 4;
+
+    const bool mutate_anchor_left = rng.bounded(2) == 0;
+
+    Builder b(kLocalCount, signatures[4]);
+    b.load_local(kBase);
+    b.load_local(kAnchor);
+    b.alloc_pair();
+    b.store_local(kScratch);
+    b.load_local(kScratch);
+    b.load_local(kScratch);
+    b.set_right();
+    b.load_local(kAnchor);
+    b.load_local(kScratch);
+    if (mutate_anchor_left) {
+        b.set_left();
+    } else {
+        b.set_right();
+    }
+    b.collect();
+
+    b.load_local(kFlag);
+    const auto else_jump = b.jump_if_false_placeholder();
+    b.load_local(kBase);
+    b.constant_i64(1);
+    b.add_i64();
+    b.return_top();
+
+    const auto else_pc = b.pc();
+    b.patch_jump_target(else_jump, else_pc);
+    b.load_local(kBase);
+    b.constant_i64(2);
+    b.add_i64();
+    b.return_top();
+    return b.finish();
+}
+
+lang::Module generate_call_module(std::uint64_t seed) {
+    SplitMix64 rng(seed ^ 0xC411'5EED'F00D'0008ull);
+    const auto function_count =
+        static_cast<std::size_t>(2 + ((seed + 2) % 4));
+    const auto signatures = call_signatures(function_count);
+
+    lang::Module module;
+    module.entry_function = 0;
+    module.functions.reserve(function_count);
+    module.functions.push_back(generate_call_entry(rng, signatures));
+    module.functions.push_back(generate_recursive_builder(rng, signatures));
+    if (function_count >= 3) {
+        module.functions.push_back(generate_object_mutator(rng, signatures));
+    }
+    if (function_count >= 4) {
+        module.functions.push_back(generate_bool_helper(signatures));
+    }
+    if (function_count >= 5) {
+        module.functions.push_back(generate_i64_helper(rng, signatures));
+    }
+
+    require(lang::verify(module),
+            "call generator emitted verifier-rejected module for seed " +
+                std::to_string(seed) + "\n" + describe(module));
+    return module;
+}
+
 struct Schedule {
     const char* name;
     lang::gc::StressConfig stress;
@@ -538,10 +946,45 @@ Outcome execute_once(const lang::Function& function, const Schedule& schedule) {
     }
 }
 
-std::string repro_command(std::uint64_t seed, const char* schedule_name) {
+Outcome execute_once(const lang::Module& module, const Schedule& schedule) {
+    try {
+        lang::VM vm;
+        vm.set_gc_stress(schedule.stress);
+        const auto value = vm.execute(module);
+        return Outcome{true, observable_for(vm, value), {}};
+    } catch (const std::exception& e) {
+        return Outcome{false, {}, e.what()};
+    }
+}
+
+const char* grammar_name(Grammar grammar) {
+    switch (grammar) {
+    case Grammar::Single:
+        return "single";
+    case Grammar::Calls:
+        return "calls";
+    }
+    return "<unknown>";
+}
+
+Grammar parse_grammar(const std::string& value) {
+    if (value == "single") {
+        return Grammar::Single;
+    }
+    if (value == "calls") {
+        return Grammar::Calls;
+    }
+    throw std::runtime_error("unknown grammar '" + value + "': expected single or calls");
+}
+
+std::string repro_command(Grammar grammar, std::uint64_t seed,
+                          const char* schedule_name) {
     std::ostringstream out;
-    out << "./build/lang_iteration5_fuzz --seed " << seed << " --schedule "
-        << schedule_name;
+    out << "./build/lang_iteration5_fuzz ";
+    if (grammar == Grammar::Calls) {
+        out << "--grammar calls ";
+    }
+    out << "--seed " << seed << " --schedule " << schedule_name;
     return out.str();
 }
 
@@ -551,9 +994,33 @@ std::string repro_command(std::uint64_t seed, const char* schedule_name) {
                                  const Outcome& observed) {
     std::ostringstream out;
     out << "differential GC timing fuzz failure\n";
-    out << "seed=" << seed << " schedule=" << schedule.name << "\n";
-    out << "repro: " << repro_command(seed, schedule.name) << "\n";
+    out << "grammar=" << grammar_name(Grammar::Single) << " seed=" << seed
+        << " schedule=" << schedule.name << "\n";
+    out << "repro: " << repro_command(Grammar::Single, seed, schedule.name) << "\n";
     out << "program:\n" << describe(function);
+    if (!baseline.ok) {
+        out << "baseline trap: " << baseline.error << "\n";
+    } else {
+        out << "baseline observable:\n" << baseline.observable << "\n";
+    }
+    if (!observed.ok) {
+        out << "observed trap: " << observed.error << "\n";
+    } else {
+        out << "observed observable:\n" << observed.observable << "\n";
+    }
+    throw std::runtime_error(out.str());
+}
+
+[[noreturn]] void report_failure(std::uint64_t seed, const Schedule& schedule,
+                                 const lang::Module& module,
+                                 const Outcome& baseline,
+                                 const Outcome& observed) {
+    std::ostringstream out;
+    out << "differential GC timing fuzz failure\n";
+    out << "grammar=" << grammar_name(Grammar::Calls) << " seed=" << seed
+        << " schedule=" << schedule.name << "\n";
+    out << "repro: " << repro_command(Grammar::Calls, seed, schedule.name) << "\n";
+    out << "module:\n" << describe(module);
     if (!baseline.ok) {
         out << "baseline trap: " << baseline.error << "\n";
     } else {
@@ -581,6 +1048,20 @@ void run_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
     }
 }
 
+void run_call_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
+    const auto module = generate_call_module(seed);
+    const auto all_schedules = schedules();
+    const auto& baseline_schedule = find_schedule(all_schedules, "no_stress");
+    const auto baseline = execute_once(module, baseline_schedule);
+    const auto observed = schedule.name == std::string("no_stress")
+                              ? baseline
+                              : execute_once(module, schedule);
+
+    if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+        report_failure(seed, schedule, module, baseline, observed);
+    }
+}
+
 void run_seed_all_schedules(std::uint64_t seed, const std::vector<Schedule>& all_schedules) {
     const auto function = generate_program(seed);
     const auto baseline = execute_once(function, all_schedules.front());
@@ -590,6 +1071,20 @@ void run_seed_all_schedules(std::uint64_t seed, const std::vector<Schedule>& all
                                   : execute_once(function, schedule);
         if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
             report_failure(seed, schedule, function, baseline, observed);
+        }
+    }
+}
+
+void run_call_seed_all_schedules(std::uint64_t seed,
+                                 const std::vector<Schedule>& all_schedules) {
+    const auto module = generate_call_module(seed);
+    const auto baseline = execute_once(module, all_schedules.front());
+    for (const auto& schedule : all_schedules) {
+        const auto observed = schedule.name == std::string(all_schedules.front().name)
+                                  ? baseline
+                                  : execute_once(module, schedule);
+        if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+            report_failure(seed, schedule, module, baseline, observed);
         }
     }
 }
@@ -659,6 +1154,151 @@ void pinned_seed_snapshot() {
                 "\nexpected:\n" + expected + "actual:\n" + describe(function));
 }
 
+void calls_pinned_seed_snapshot() {
+    const auto module = generate_call_module(kCallSnapshotSeed);
+    const std::string expected = R"SNAPSHOT(entry=0 functions=5
+function=0 signature=()->object locals=7
+  #0 ConstantI64 6
+  #1 ConstantI64 35
+  #2 AllocPair 0
+  #3 StoreLocal 1
+  #4 LoadLocal 1
+  #5 ConstantI64 22
+  #6 AllocPair 0
+  #7 StoreLocal 0
+  #8 LoadLocal 0
+  #9 StoreLocal 5
+  #10 Collect 0
+  #11 ConstantI64 -36
+  #12 ConstantI64 38
+  #13 AllocPair 0
+  #14 StoreLocal 6
+  #15 ConstantI64 0
+  #16 StoreLocal 6
+  #17 LoadLocal 1
+  #18 ConstantI64 -25
+  #19 ConstantI64 -34
+  #20 LoadLocal 0
+  #21 Call 3
+  #22 StoreLocal 3
+  #23 StoreLocal 5
+  #24 LoadLocal 1
+  #25 ConstantI64 5
+  #26 LoadLocal 3
+  #27 LoadLocal 0
+  #28 Call 4
+  #29 StoreLocal 4
+  #30 StoreLocal 5
+  #31 LoadLocal 0
+  #32 LoadLocal 4
+  #33 LoadLocal 1
+  #34 LoadLocal 0
+  #35 Call 1
+  #36 StoreLocal 2
+  #37 StoreLocal 5
+  #38 LoadLocal 1
+  #39 LoadLocal 0
+  #40 LoadLocal 2
+  #41 LoadLocal 3
+  #42 LoadLocal 4
+  #43 Call 2
+  #44 StoreLocal 2
+  #45 StoreLocal 5
+  #46 LoadLocal 0
+  #47 LoadLocal 2
+  #48 SetLeft 0
+  #49 Collect 0
+  #50 LoadLocal 0
+  #51 Return 0
+function=1 signature=(i64,object,object)->object locals=4
+  #0 LoadLocal 0
+  #1 ConstantI64 1
+  #2 LessI64 0
+  #3 JumpIfFalse 6
+  #4 LoadLocal 1
+  #5 Return 0
+  #6 LoadLocal 0
+  #7 LoadLocal 1
+  #8 AllocPair 0
+  #9 StoreLocal 3
+  #10 LoadLocal 3
+  #11 LoadLocal 3
+  #12 SetRight 0
+  #13 LoadLocal 2
+  #14 LoadLocal 3
+  #15 SetRight 0
+  #16 Collect 0
+  #17 LoadLocal 0
+  #18 ConstantI64 -1
+  #19 AddI64 0
+  #20 LoadLocal 3
+  #21 LoadLocal 2
+  #22 Call 1
+  #23 Return 0
+function=2 signature=(object,object,bool,i64)->object locals=5
+  #0 LoadLocal 1
+  #1 LoadLocal 3
+  #2 AllocPair 0
+  #3 StoreLocal 4
+  #4 LoadLocal 4
+  #5 LoadLocal 4
+  #6 SetLeft 0
+  #7 LoadLocal 2
+  #8 JumpIfFalse 15
+  #9 LoadLocal 0
+  #10 LoadLocal 4
+  #11 SetLeft 0
+  #12 Collect 0
+  #13 LoadLocal 4
+  #14 Return 0
+  #15 LoadLocal 0
+  #16 LoadLocal 4
+  #17 SetRight 0
+  #18 Collect 0
+  #19 LoadLocal 4
+  #20 Return 0
+function=3 signature=(i64,i64,object)->bool locals=4
+  #0 LoadLocal 0
+  #1 LoadLocal 2
+  #2 AllocPair 0
+  #3 StoreLocal 3
+  #4 LoadLocal 2
+  #5 LoadLocal 3
+  #6 SetRight 0
+  #7 Collect 0
+  #8 LoadLocal 0
+  #9 LoadLocal 1
+  #10 LessI64 0
+  #11 Return 0
+function=4 signature=(i64,bool,object)->i64 locals=4
+  #0 LoadLocal 0
+  #1 LoadLocal 2
+  #2 AllocPair 0
+  #3 StoreLocal 3
+  #4 LoadLocal 3
+  #5 LoadLocal 3
+  #6 SetRight 0
+  #7 LoadLocal 2
+  #8 LoadLocal 3
+  #9 SetRight 0
+  #10 Collect 0
+  #11 LoadLocal 1
+  #12 JumpIfFalse 17
+  #13 LoadLocal 0
+  #14 ConstantI64 1
+  #15 AddI64 0
+  #16 Return 0
+  #17 LoadLocal 0
+  #18 ConstantI64 2
+  #19 AddI64 0
+  #20 Return 0
+)SNAPSHOT";
+    require(describe(module) == expected,
+            "call generator snapshot changed for seed " +
+                std::to_string(kCallSnapshotSeed) + "\nexpected:\n" + expected +
+                "actual:\n" + describe(module));
+}
+
 std::uint64_t parse_seed(const std::string& value) {
     std::size_t parsed = 0;
     const auto seed = std::stoull(value, &parsed, 10);
@@ -676,14 +1316,33 @@ int run(int argc, char** argv) {
         const auto seed = parse_seed(argv[2]);
         const auto& schedule = find_schedule(all_schedules, argv[4]);
         run_seed_schedule(seed, schedule);
-        std::cerr << "[PASS] replay seed=" << seed << " schedule=" << schedule.name
-                  << "\n";
+        std::cerr << "[PASS] replay grammar=" << grammar_name(Grammar::Single)
+                  << " seed=" << seed << " schedule=" << schedule.name << "\n";
+        return 0;
+    }
+
+    if (argc == 7 && std::string(argv[1]) == "--grammar" &&
+        std::string(argv[3]) == "--seed" &&
+        std::string(argv[5]) == "--schedule") {
+        const auto grammar = parse_grammar(argv[2]);
+        const auto seed = parse_seed(argv[4]);
+        const auto& schedule = find_schedule(all_schedules, argv[6]);
+        if (grammar == Grammar::Calls) {
+            run_call_seed_schedule(seed, schedule);
+        } else {
+            run_seed_schedule(seed, schedule);
+        }
+        std::cerr << "[PASS] replay grammar=" << grammar_name(grammar)
+                  << " seed=" << seed << " schedule=" << schedule.name << "\n";
         return 0;
     }
 
     if (argc != 1) {
         std::cerr << "usage: " << argv[0]
-                  << " [--seed <uint64> --schedule <schedule-name>]\n";
+                  << " [--seed <uint64> --schedule <schedule-name>]\n"
+                  << "       " << argv[0]
+                  << " --grammar <single|calls> --seed <uint64>"
+                  << " --schedule <schedule-name>\n";
         std::cerr << "schedules:";
         for (const auto& schedule : all_schedules) {
             std::cerr << " " << schedule.name;
@@ -693,14 +1352,23 @@ int run(int argc, char** argv) {
     }
 
     pinned_seed_snapshot();
+    calls_pinned_seed_snapshot();
 
     for (std::uint64_t seed = kFirstCorpusSeed;
          seed < kFirstCorpusSeed + kCorpusSize; ++seed) {
         run_seed_all_schedules(seed, all_schedules);
     }
+    for (std::uint64_t seed = kFirstCorpusSeed;
+         seed < kFirstCorpusSeed + kCorpusSize; ++seed) {
+        run_call_seed_all_schedules(seed, all_schedules);
+    }
 
     std::cerr << "[PASS] pinned_seed_snapshot seed=" << kSnapshotSeed << "\n";
+    std::cerr << "[PASS] calls_pinned_seed_snapshot seed=" << kCallSnapshotSeed << "\n";
     std::cerr << "[PASS] lang_iteration5_fuzz corpus seeds=" << kCorpusSize
+              << " schedules=" << all_schedules.size()
+              << " executions=" << (kCorpusSize * all_schedules.size()) << "\n";
+    std::cerr << "[PASS] lang_iteration5_fuzz call corpus seeds=" << kCorpusSize
               << " schedules=" << all_schedules.size()
               << " executions=" << (kCorpusSize * all_schedules.size()) << "\n";
     return 0;
