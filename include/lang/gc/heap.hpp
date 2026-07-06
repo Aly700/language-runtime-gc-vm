@@ -34,6 +34,16 @@ struct StressConfig {
     std::uint64_t collect_minor_every_n_instructions{0};
 };
 
+struct HeapMetrics {
+    std::uint64_t allocations{0};
+    std::uint64_t major_collections{0};
+    std::uint64_t minor_collections{0};
+    std::uint64_t objects_moved{0};
+    std::uint64_t write_barrier_hits{0};
+    std::uint64_t remembered_set_peak{0};
+    std::uint64_t heap_peak_slots{0};
+};
+
 enum class ObjectGeneration {
     Young,
     Old,
@@ -101,6 +111,7 @@ public:
     [[nodiscard]] std::size_t live_count() const;
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
+    [[nodiscard]] HeapMetrics metrics() const { return metrics_; }
 
     [[nodiscard]] bool TEST_ONLY_is_young_object(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_old_object(ObjectId id) const;
@@ -130,6 +141,7 @@ private:
         ForwardingTable forwarding;
         std::vector<std::optional<Object>> objects;
         std::vector<std::uint32_t> generations;
+        std::uint64_t objects_moved{0};
     };
 
     ObjectId allocate_slot(Value left, Value right);
@@ -171,6 +183,7 @@ private:
     std::vector<std::uint32_t> generations_;
     std::vector<ObjectId> remembered_set_;
     std::vector<Value*> handle_roots_;
+    HeapMetrics metrics_{};
     bool TEST_ONLY_skip_next_write_barrier_{false};
     mutable std::uint64_t TEST_ONLY_validation_count_{0};
 };
