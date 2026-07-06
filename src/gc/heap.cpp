@@ -41,14 +41,15 @@ std::uint32_t next_generation(std::uint32_t generation) {
 
 class Heap::MarkingVisitor final : public RootVisitor {
 public:
-    MarkingVisitor(Heap& heap, std::vector<ObjectId>& worklist)
-        : heap_(heap), worklist_(worklist) {}
+    MarkingVisitor(Heap& heap, std::vector<ObjectId>& worklist, CollectionKind kind)
+        : heap_(heap), worklist_(worklist), kind_(kind) {}
 
-    void visit(Value& root) override { heap_.enqueue_mark_value(root, worklist_); }
+    void visit(Value& root) override { heap_.enqueue_mark_value(root, worklist_, kind_); }
 
 private:
     Heap& heap_;
     std::vector<ObjectId>& worklist_;
+    CollectionKind kind_;
 };
 
 class Heap::ForwardingVisitor final : public RootVisitor {
@@ -95,7 +96,7 @@ ObjectId Heap::allocate_slot(Value left, Value right) {
     for (std::size_t i = 0; i < objects_.size(); ++i) {
         if (!objects_[i].has_value()) {
             generations_[i] = next_generation(generations_[i]);
-            objects_[i] = Object{false, left, right};
+            objects_[i] = Object{false, ObjectGeneration::Young, left, right};
             return make_object_id(static_cast<std::uint32_t>(i), generations_[i]);
         }
     }
@@ -103,7 +104,7 @@ ObjectId Heap::allocate_slot(Value left, Value right) {
     if (objects_.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::length_error("heap object slot limit exceeded");
     }
-    objects_.push_back(Object{false, left, right});
+    objects_.push_back(Object{false, ObjectGeneration::Young, left, right});
     generations_.push_back(kFirstGeneration);
     return make_object_id(static_cast<std::uint32_t>(objects_.size() - 1), kFirstGeneration);
 }
@@ -122,7 +123,7 @@ const Object& Heap::object(ObjectId id) const {
     return *objects_[checked_slot(id)];
 }
 
-Object& Heap::object(ObjectId id) {
+Object& Heap::mutable_object(ObjectId id) {
     return *objects_[checked_slot(id)];
 }
 
@@ -143,66 +144,165 @@ void Heap::set_right(ObjectId id, Value value) {
 }
 
 void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
-    // Barrier hook: every pair field mutation flows through this method. A future
-    // generational collector should run its old-to-young write barrier here before
-    // publishing the new field value.
-    auto& obj = object(id);
+    // Barrier hook: every pair field mutation must flow through this method. The public
+    // heap API intentionally exposes only const object inspection plus set_left/set_right,
+    // so bytecode cannot publish a field without running this old-to-young barrier.
+    const bool barrier_triggered = record_write_barrier_if_needed(id, value);
+
+    auto& obj = mutable_object(id);
     if (field == PairField::Left) {
         obj.left = value;
     } else {
         obj.right = value;
     }
-}
 
-void Heap::enqueue_mark_value(Value value, std::vector<ObjectId>& worklist) {
-    if (value.is_object()) {
-        const auto slot = checked_slot(value.as_object());
-        if (!objects_[slot]->marked) {
-            worklist.push_back(value.as_object());
-        }
+    if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
+        collect_minor();
     }
 }
 
-void Heap::drain_mark_worklist(std::vector<ObjectId>& worklist) {
+bool Heap::record_write_barrier_if_needed(ObjectId owner, Value value) {
+    if (!value.is_object()) {
+        return false;
+    }
+
+    const auto owner_slot = checked_slot(owner);
+    const auto target_slot = checked_slot(value.as_object());
+    const bool must_remember = is_old_slot(owner_slot) && is_young_slot(target_slot);
+    if (!must_remember) {
+        return false;
+    }
+
+    if (TEST_ONLY_skip_next_write_barrier_) {
+        TEST_ONLY_skip_next_write_barrier_ = false;
+        return false;
+    }
+
+    record_remembered_object(owner);
+    return true;
+}
+
+void Heap::record_remembered_object(ObjectId id) {
+    const auto slot = checked_slot(id);
+    if (!is_old_slot(slot)) {
+        throw std::logic_error("write barrier attempted to remember a non-old object");
+    }
+    if (!remembered_set_contains(id)) {
+        remembered_set_.push_back(id);
+    }
+}
+
+bool Heap::remembered_set_contains(ObjectId id) const {
+    for (const auto remembered : remembered_set_) {
+        if (remembered == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Heap::is_young_slot(std::size_t slot) const {
+    assert(slot < objects_.size());
+    return objects_[slot].has_value() &&
+           objects_[slot]->generation == ObjectGeneration::Young;
+}
+
+bool Heap::is_old_slot(std::size_t slot) const {
+    assert(slot < objects_.size());
+    return objects_[slot].has_value() &&
+           objects_[slot]->generation == ObjectGeneration::Old;
+}
+
+void Heap::enqueue_mark_value(Value value, std::vector<ObjectId>& worklist,
+                              CollectionKind kind) {
+    if (!value.is_object()) {
+        return;
+    }
+
+    const auto slot = checked_slot(value.as_object());
+    if (kind == CollectionKind::Minor && !is_young_slot(slot)) {
+        return;
+    }
+    if (!objects_[slot]->marked) {
+        worklist.push_back(value.as_object());
+    }
+}
+
+void Heap::enqueue_young_references_from_remembered_set(std::vector<ObjectId>& worklist) {
+    for (const auto remembered : remembered_set_) {
+        const auto slot = checked_slot(remembered);
+        if (!is_old_slot(slot)) {
+            throw std::logic_error("remembered-set entry does not name an old object");
+        }
+        const auto& obj = *objects_[slot];
+        // Push right first so the LIFO worklist processes left before right.
+        enqueue_mark_value(obj.right, worklist, CollectionKind::Minor);
+        enqueue_mark_value(obj.left, worklist, CollectionKind::Minor);
+    }
+}
+
+void Heap::drain_mark_worklist(std::vector<ObjectId>& worklist, CollectionKind kind) {
     while (!worklist.empty()) {
         const auto id = worklist.back();
         worklist.pop_back();
 
-        auto& obj = *objects_[checked_slot(id)];
+        const auto slot = checked_slot(id);
+        if (kind == CollectionKind::Minor && !is_young_slot(slot)) {
+            continue;
+        }
+
+        auto& obj = *objects_[slot];
         if (obj.marked) {
             continue;
         }
         obj.marked = true;
 
         // Push right first so the LIFO worklist processes left before right.
-        enqueue_mark_value(obj.right, worklist);
-        enqueue_mark_value(obj.left, worklist);
+        enqueue_mark_value(obj.right, worklist, kind);
+        enqueue_mark_value(obj.left, worklist, kind);
     }
 }
 
 void Heap::collect() {
-    collect_impl(nullptr, {});
+    collect_impl(CollectionKind::Major, nullptr, {});
 }
 
 void Heap::collect(RootProvider& roots) {
-    collect_impl(&roots, {});
+    collect_impl(CollectionKind::Major, &roots, {});
+}
+
+void Heap::collect_minor() {
+    collect_impl(CollectionKind::Minor, nullptr, {});
+}
+
+void Heap::collect_minor(RootProvider& roots) {
+    collect_impl(CollectionKind::Minor, &roots, {});
 }
 
 void Heap::collect_with_extra_roots(std::span<Value*> extra_roots) {
-    collect_impl(nullptr, extra_roots);
+    collect_impl(CollectionKind::Major, nullptr, extra_roots);
 }
 
-void Heap::collect_impl(RootProvider* roots, std::span<Value*> extra_roots) {
-    std::vector<ObjectId> worklist;
-    MarkingVisitor marker(*this, worklist);
-    trace_collection_roots(marker, roots, extra_roots);
-    drain_mark_worklist(worklist);
+void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots) {
+    validate_remembered_set();
 
-    auto compacted = compact_marked_objects();
+    std::vector<ObjectId> worklist;
+    MarkingVisitor marker(*this, worklist, kind);
+    trace_collection_roots(marker, roots, extra_roots);
+    if (kind == CollectionKind::Minor) {
+        enqueue_young_references_from_remembered_set(worklist);
+    }
+    drain_mark_worklist(worklist, kind);
+
+    auto compacted = compact_live_objects(kind);
     rewrite_references(compacted.forwarding, compacted.objects, roots, extra_roots);
+    auto rewritten_remembered_set = rewrite_remembered_set(compacted.forwarding);
 
     objects_ = std::move(compacted.objects);
     generations_ = std::move(compacted.generations);
+    remembered_set_ = std::move(rewritten_remembered_set);
+    prune_remembered_set();
+
     validate_after_collection(roots, extra_roots);
 }
 
@@ -221,7 +321,7 @@ void Heap::trace_collection_roots(RootVisitor& visitor, RootProvider* roots,
     }
 }
 
-Heap::CompactionResult Heap::compact_marked_objects() const {
+Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
     CompactionResult result;
     result.forwarding.resize(objects_.size());
     result.objects.resize(objects_.size());
@@ -230,12 +330,23 @@ Heap::CompactionResult Heap::compact_marked_objects() const {
     std::size_t next_live_slot = 0;
     for (std::size_t old_slot = 0; old_slot < objects_.size(); ++old_slot) {
         const auto& slot = objects_[old_slot];
-        if (!slot.has_value() || !slot->marked) {
+        if (!slot.has_value()) {
+            continue;
+        }
+
+        const bool live = kind == CollectionKind::Major
+                              ? slot->marked
+                              : (slot->generation == ObjectGeneration::Old || slot->marked);
+        if (!live) {
             continue;
         }
 
         auto moved = *slot;
         moved.marked = false;
+        if (moved.generation == ObjectGeneration::Young) {
+            moved.generation = ObjectGeneration::Old;
+        }
+
         if (old_slot != next_live_slot) {
             result.generations[next_live_slot] = next_generation(result.generations[next_live_slot]);
         }
@@ -278,7 +389,57 @@ void Heap::rewrite_value(Value& value, const ForwardingTable& forwarding) const 
     value = Value::object(*forwarding[old_slot]);
 }
 
+std::vector<ObjectId> Heap::rewrite_remembered_set(const ForwardingTable& forwarding) const {
+    std::vector<ObjectId> rewritten;
+    rewritten.reserve(remembered_set_.size());
+
+    for (const auto remembered : remembered_set_) {
+        const auto old_slot = checked_slot(remembered);
+        if (old_slot >= forwarding.size() || !forwarding[old_slot].has_value()) {
+            continue;
+        }
+        const auto rewritten_id = *forwarding[old_slot];
+        bool already_present = false;
+        for (const auto existing : rewritten) {
+            if (existing == rewritten_id) {
+                already_present = true;
+                break;
+            }
+        }
+        if (!already_present) {
+            rewritten.push_back(rewritten_id);
+        }
+    }
+
+    return rewritten;
+}
+
+void Heap::prune_remembered_set() {
+    std::vector<ObjectId> pruned;
+    for (std::size_t slot = 0; slot < objects_.size(); ++slot) {
+        if (!objects_[slot].has_value() || !is_old_slot(slot)) {
+            continue;
+        }
+
+        const auto& obj = *objects_[slot];
+        bool has_young_reference = false;
+        for (const auto value : {obj.left, obj.right}) {
+            if (!value.is_object()) {
+                continue;
+            }
+            const auto target_slot = checked_slot(value.as_object());
+            has_young_reference = has_young_reference || is_young_slot(target_slot);
+        }
+        if (has_young_reference) {
+            pruned.push_back(make_object_id(static_cast<std::uint32_t>(slot), generations_[slot]));
+        }
+    }
+    remembered_set_ = std::move(pruned);
+}
+
 void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const {
+    ++TEST_ONLY_validation_count_;
+
     ValidatingVisitor visitor(*this);
     trace_collection_roots(visitor, roots, extra_roots);
 
@@ -289,6 +450,36 @@ void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extr
         assert(!slot->marked && "collector invariant violated: mark bit survived collection");
         validate_value(slot->left);
         validate_value(slot->right);
+    }
+
+    validate_remembered_set();
+}
+
+void Heap::validate_remembered_set() const {
+    for (const auto remembered : remembered_set_) {
+        const auto slot = checked_slot(remembered);
+        if (!is_old_slot(slot)) {
+            throw std::logic_error("remembered-set entry does not name an old object");
+        }
+    }
+
+    for (std::size_t slot = 0; slot < objects_.size(); ++slot) {
+        if (!objects_[slot].has_value() || !is_old_slot(slot)) {
+            continue;
+        }
+
+        const auto owner = make_object_id(static_cast<std::uint32_t>(slot), generations_[slot]);
+        const auto& obj = *objects_[slot];
+        for (const auto value : {obj.left, obj.right}) {
+            if (!value.is_object()) {
+                continue;
+            }
+            const auto target_slot = checked_slot(value.as_object());
+            if (is_young_slot(target_slot) && !remembered_set_contains(owner)) {
+                throw std::logic_error(
+                    "old-to-young reference missing remembered-set entry");
+            }
+        }
     }
 }
 
@@ -307,6 +498,22 @@ std::size_t Heap::live_count() const {
         if (slot.has_value()) ++n;
     }
     return n;
+}
+
+bool Heap::TEST_ONLY_is_young_object(ObjectId id) const {
+    return is_young_slot(checked_slot(id));
+}
+
+bool Heap::TEST_ONLY_is_old_object(ObjectId id) const {
+    return is_old_slot(checked_slot(id));
+}
+
+void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {
+    TEST_ONLY_skip_next_write_barrier_ = true;
+}
+
+void Heap::TEST_ONLY_validate_gc_invariants() const {
+    validate_after_collection(nullptr, {});
 }
 
 } // namespace lang::gc

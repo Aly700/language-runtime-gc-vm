@@ -41,13 +41,21 @@ void VM::assert_stack_matches_map(const VerificationResult& verification, std::s
 
 void VM::collect_at_instruction_boundary_if_needed(const VerificationResult& verification,
                                                    std::size_t pc) {
-    const auto interval = gc_stress_.collect_every_n_instructions;
-    if (interval == 0 || instructions_executed_ == 0 || instructions_executed_ % interval != 0) {
-        return;
+    const auto major_interval = gc_stress_.collect_every_n_instructions;
+    if (major_interval != 0 && instructions_executed_ != 0 &&
+        instructions_executed_ % major_interval == 0) {
+        assert_stack_matches_map(verification, pc);
+        heap_.collect();
+        assert_stack_matches_map(verification, pc);
     }
-    assert_stack_matches_map(verification, pc);
-    heap_.collect();
-    assert_stack_matches_map(verification, pc);
+
+    const auto minor_interval = gc_stress_.collect_minor_every_n_instructions;
+    if (minor_interval != 0 && instructions_executed_ != 0 &&
+        instructions_executed_ % minor_interval == 0) {
+        assert_stack_matches_map(verification, pc);
+        heap_.collect_minor();
+        assert_stack_matches_map(verification, pc);
+    }
 }
 
 Value VM::pop() {
