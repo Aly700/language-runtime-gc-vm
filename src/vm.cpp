@@ -47,6 +47,7 @@ void VM::collect_at_instruction_boundary_if_needed(const VerificationResult& ver
     }
     assert_stack_matches_map(verification, pc);
     heap_.collect();
+    assert_stack_matches_map(verification, pc);
 }
 
 Value VM::pop() {
@@ -181,6 +182,7 @@ Value VM::execute(const Function& function) {
         case OpCode::Collect: {
             assert_stack_matches_map(*verification, pc);
             heap_.collect();
+            assert_stack_matches_map(*verification, pc);
             ++pc;
             break;
         }

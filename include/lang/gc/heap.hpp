@@ -55,15 +55,33 @@ public:
 
 private:
     class MarkingVisitor;
+    class ForwardingVisitor;
+    class ValidatingVisitor;
     enum class PairField { Left, Right };
+    using ForwardingTable = std::vector<std::optional<ObjectId>>;
+
+    struct CompactionResult {
+        ForwardingTable forwarding;
+        std::vector<std::optional<Object>> objects;
+        std::vector<std::uint32_t> generations;
+    };
 
     ObjectId allocate_slot(Value left, Value right);
     [[nodiscard]] std::size_t checked_slot(ObjectId id) const;
+    void collect_impl(RootProvider* roots, std::span<Value*> extra_roots);
     void collect_with_extra_roots(std::span<Value*> extra_roots);
+    void trace_collection_roots(RootVisitor& visitor, RootProvider* roots,
+                                std::span<Value*> extra_roots) const;
     void store_pair_field(ObjectId id, PairField field, Value value);
-    void mark_value(Value value);
-    void mark_object(ObjectId id);
-    void sweep();
+    void enqueue_mark_value(Value value, std::vector<ObjectId>& worklist);
+    void drain_mark_worklist(std::vector<ObjectId>& worklist);
+    [[nodiscard]] CompactionResult compact_marked_objects() const;
+    void rewrite_references(const ForwardingTable& forwarding,
+                            std::vector<std::optional<Object>>& compacted_objects,
+                            RootProvider* roots, std::span<Value*> extra_roots) const;
+    void rewrite_value(Value& value, const ForwardingTable& forwarding) const;
+    void validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const;
+    void validate_value(Value value) const;
 
     RootProvider* root_provider_{nullptr};
     StressConfig stress_config_{};

@@ -23,7 +23,11 @@ target_link_libraries(lang_phase1_correctness PRIVATE lang_runtime)
 add_executable(lang_iteration2_correctness tests/iteration2_correctness.cpp)
 target_link_libraries(lang_iteration2_correctness PRIVATE lang_runtime)
 
+add_executable(lang_iteration3_movement tests/iteration3_movement.cpp)
+target_link_libraries(lang_iteration3_movement PRIVATE lang_runtime)
+
 include(CTest)
 add_test(NAME lang_smoke COMMAND lang_smoke)
 add_test(NAME lang_phase1_correctness COMMAND lang_phase1_correctness)
 add_test(NAME lang_iteration2_correctness COMMAND lang_iteration2_correctness)
+add_test(NAME lang_iteration3_movement COMMAND lang_iteration3_movement)
