@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <cstddef>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -96,6 +97,54 @@ struct ModuleVerificationResult {
     std::vector<VerificationResult> functions;
 };
 
+// Stable verifier rejection categories. Keep names append-only when possible:
+// callers and fuzz failures use these as machine-readable diagnostics.
+enum class VerifierReason {
+    ModuleShapeMismatch,       // Module has no functions or an invalid entry function.
+    EmptyFunction,             // Function body has no bytecode to enter.
+    SignatureShapeMismatch,    // Detailed signature metadata disagrees with coarse kinds.
+    LocalCountMismatch,        // Function locals cannot hold declared parameters.
+    BadStackMap,               // Supplied stack map count, height, or object bits are wrong.
+    StackUnderflow,            // Instruction needs more stack operands than are available.
+    TypeMismatch,              // Instruction consumed a value of the wrong kind.
+    PoisonUse,                 // Merged incompatible value kind was consumed or mapped.
+    UninitializedLocal,        // LoadLocal reads a local not initialized on all paths.
+    BadLocalIndex,             // LoadLocal/StoreLocal operand is outside local_count.
+    BadJumpTarget,             // Jump/JumpIfFalse target is outside the function body.
+    FallOffEnd,                // Non-Return instruction would fall through past code end.
+    StackHeightMergeMismatch,  // Control-flow merge has different incoming stack heights.
+    UnreachableCode,           // A bytecode pc has no verifier state after analysis.
+    BadPairFieldRead,          // Pair field facts are absent, opaque, or poisoned.
+    BadPairFieldWrite,         // Pair field write violates available field facts.
+    BadCallTarget,             // Call operand does not name a function in the module.
+    BadCallArity,              // Call stack does not contain all callee arguments.
+    BadCallArgKind,            // Call argument kind or detailed pair shape is invalid.
+    BadReturnKind,             // Return value kind or detailed pair shape is invalid.
+    InvalidOpcode,             // Instruction opcode is not a known OpCode value.
+};
+
+struct VerifierDiagnostic {
+    std::size_t function_index{0};
+    std::optional<std::size_t> pc;
+    VerifierReason reason{VerifierReason::InvalidOpcode};
+    std::string message;
+};
+
+struct FunctionVerifierReport {
+    std::optional<VerificationResult> result;
+    std::vector<VerifierDiagnostic> diagnostics;
+};
+
+struct ModuleVerifierReport {
+    std::optional<ModuleVerificationResult> result;
+    std::vector<VerifierDiagnostic> diagnostics;
+};
+
+const char* verifier_reason_name(VerifierReason reason);
+std::string format_verifier_diagnostic(const VerifierDiagnostic& diagnostic);
+
+FunctionVerifierReport verify_with_diagnostics(const Function& function);
+ModuleVerifierReport verify_with_diagnostics(const Module& module);
 std::optional<VerificationResult> verify_with_stack_maps(const Function& function);
 std::optional<ModuleVerificationResult> verify_with_stack_maps(const Module& module);
 bool verify(const Function& function);

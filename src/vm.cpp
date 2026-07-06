@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstddef>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace lang {
@@ -114,10 +115,16 @@ void VM::push_frame(const Module& module, std::size_t function_index,
 }
 
 Value VM::execute(const Module& module) {
-    auto verification = verify_with_stack_maps(module);
-    if (!verification.has_value()) {
-        throw std::runtime_error("bytecode verifier rejected module");
+    auto verification_report = verify_with_diagnostics(module);
+    if (!verification_report.result.has_value()) {
+        std::string message = "bytecode verifier rejected module";
+        if (!verification_report.diagnostics.empty()) {
+            message += ": " +
+                       format_verifier_diagnostic(verification_report.diagnostics.front());
+        }
+        throw std::runtime_error(message);
     }
+    const auto& verification = *verification_report.result;
     frames_.clear();
     instructions_executed_ = 0;
     push_frame(module, module.entry_function, {});
@@ -125,8 +132,8 @@ Value VM::execute(const Module& module) {
     while (!frames_.empty()) {
         auto& frame = frames_.back();
         const auto& function = module.functions[frame.function_index];
-        assert_stack_matches_map(*verification, frame);
-        collect_at_instruction_boundary_if_needed(*verification, frame);
+        assert_stack_matches_map(verification, frame);
+        collect_at_instruction_boundary_if_needed(verification, frame);
         const auto& ins = function.code[frame.pc];
         switch (ins.op) {
         case OpCode::ConstantI64:
@@ -232,9 +239,9 @@ Value VM::execute(const Module& module) {
             break;
         }
         case OpCode::Collect: {
-            assert_stack_matches_map(*verification, frame);
+            assert_stack_matches_map(verification, frame);
             heap_.collect();
-            assert_stack_matches_map(*verification, frame);
+            assert_stack_matches_map(verification, frame);
             ++frame.pc;
             break;
         }
