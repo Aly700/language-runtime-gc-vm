@@ -9,8 +9,9 @@ source -> lexer -> parser -> AST -> type checker -> compiler -> verifier -> VM -
 ## Frontend surface
 
 `lang::frontend::compile_program` is the narrow public entry point. It returns either a
-`lang::Function` with verifier-generated stack maps attached, or deterministic diagnostics
-with byte offsets plus 1-based line/column positions.
+`lang::Module` with verifier-generated per-function stack maps attached, or deterministic
+diagnostics with byte offsets plus 1-based line/column positions. For compatibility with
+single-entry tests, the result also exposes a copy of the entry `lang::Function`.
 
 The source language is intentionally small:
 
@@ -20,14 +21,19 @@ The source language is intentionally small:
 - Expressions include i64/bool literals, variables, `+`, `<`, `pair(left, right)`, field
   access, and parentheses.
 - `if condition { ... } else { ... }` and `while condition { ... }` are statement forms.
+- Function declarations use `fn name(a: i64, b: pair) -> pair { ... }`. Function bodies
+  have the same shape as the top level: statements followed by a final expression.
+- Calls are expressions and recursion is allowed.
 - A program ends with a final expression, which becomes the VM result.
 
-Minimal cuts: there are no functions, parameters, nil literals, strings, expression-valued
-blocks, user-defined types, parametric pair types, or block-local `let` declarations. Pair
-is monomorphic at the local type level, but the type checker tracks pair field types
+Minimal cuts: there are no nil literals, strings, expression-valued blocks, user-defined
+types, parametric pair types, first-class functions, or block-local `let` declarations.
+Pair is monomorphic at the local type level, but the type checker tracks pair field types
 flow-sensitively by allocation site. This keeps cycles expressible by initializing a field
 with any pair and later storing another pair into it, while still rejecting reads from a
-field whose possible allocation sites disagree on field kind.
+field whose possible allocation sites disagree on field kind. Pair values that cross a
+function boundary keep only the signature kind `pair`; field type information is not
+transported interprocedurally.
 
 Rejected alternative: expose a parametric `pair<T, U>` surface. That would make simple
 field reads obvious, but it would either reject useful cyclic structures outright or require
@@ -36,15 +42,20 @@ field lattice is closer to the bytecode verifier and keeps the agreement boundar
 
 ## Runtime scaffold
 
-- `lang::Function` stores bytecode and optional stack maps.
-- `lang::verify` is the bytecode safety gate. It runs a worklist dataflow analysis over
-  reachable bytecode, proving stack depth before every instruction, `LoadLocal`
-  initialization over all incoming paths, branch target validity, and value kinds for
-  generated stack maps. This protects the VM invariants for stack depth and initialized
-  local reads across loops and merge points.
-- `lang::VM` owns stack/locals and registers itself as a `lang::gc::RootProvider`.
-  Root tracing visits mutable `Value` slots, not copied root values, so a future moving
-  collector can update roots before mutator execution resumes.
+- `lang::Module` stores a designated entry function plus all callable `lang::Function`
+  bodies. Each function carries a `FunctionSignature` of parameter kinds and return kind,
+  bytecode, local count, and optional stack maps.
+- `lang::verify` is the bytecode safety gate. It runs a per-function worklist dataflow
+  analysis over reachable bytecode, proving stack depth before every instruction,
+  `LoadLocal` initialization over all incoming paths, branch target validity, call
+  argument kinds/counts against the module signature table, return kind against the
+  current function signature, and value kinds for generated stack maps. This protects the
+  VM invariants for stack depth, initialized local reads, and function boundaries across
+  loops and merge points.
+- `lang::VM` owns a vector of call frames and registers itself as a `lang::gc::RootProvider`.
+  Each frame owns its own operand stack and locals. Root tracing visits mutable `Value`
+  slots in every live frame, not copied root values, so moving collection can update
+  active and suspended frames before mutator execution resumes.
 - `lang::gc::Heap` implements deterministic major and minor mark-compact collection over
   generation-tagged object IDs. The low bits identify the storage slot and the high bits
   identify that slot's current generation, so a swept or moved ID cannot alias a later
@@ -59,12 +70,38 @@ field lattice is closer to the bytecode verifier and keeps the agreement boundar
   as explicit collections. No stress trigger depends on wall-clock time, randomness,
   threads, or host addresses.
 
+## Functions and frames
+
+Function 0 is the compiled top-level entry. Source `fn` declarations are emitted as
+functions 1..N, and `Call` operands are direct callee indexes. Parameters occupy locals
+0..N-1 in the callee and are initialized when the VM pushes the frame.
+
+The verifier is modular at function boundaries: it does not import caller allocation-site
+state into the callee and does not export callee allocation-site state back to the caller.
+Only the module signature table crosses a call boundary. This is the soundness boundary:
+calls prove parameter count/kind compatibility and push the declared return kind. A pair
+returned from or passed into a function is therefore known as an object root, but its field
+types are unknown unless established by allocations inside the current function.
+
+The VM uses per-frame operand stacks rather than a single shared stack segment. This keeps
+root rewriting direct: `trace_roots` walks every frame and visits each stack/local slot by
+mutable reference. On `Call`, arguments are popped from the caller and copied into callee
+locals; the caller's pc is advanced to the return pc before suspension. Suspended caller
+stacks therefore do not necessarily match a public stack map until the callee returns and
+the result has been pushed, so runtime stack-map assertions are enforced for the active
+frame at instruction boundaries. The design does not assert suspended-frame maps because
+their in-call continuation stack is between verifier-visible states.
+
+Call depth is checked by an explicit `VM::set_max_call_depth` limit before pushing a frame,
+so recursion traps deterministically with a VM error instead of depending on the host C++
+stack.
+
 ## Source/Verifier agreement
 
-Well-typed source must compile to bytecode accepted by `verify_with_stack_maps`. A verifier
+Well-typed source must compile to a module accepted by `verify_with_stack_maps`. A verifier
 rejection of type-checked compiler output is a compiler bug, not a user error.
-`compile_program` enforces this by running `verify_with_stack_maps` on every emitted
-function, asserting success, then attaching the generated maps and asserting the maps
+`compile_program` enforces this by running module-level `verify_with_stack_maps`, asserting
+success, then attaching the generated maps to every emitted function and asserting the maps
 round-trip through the verifier.
 
 Compiler accommodations for verifier strictness:
@@ -81,6 +118,9 @@ Compiler accommodations for verifier strictness:
 - No fall-off-end: the final source expression is followed immediately by `Return`.
 - Reachability: the compiler emits no bytecode after `Return`, and branch targets are
   patched only to emitted instruction boundaries reachable through verifier dataflow.
+- Function boundaries: calls emit arguments left-to-right followed by `Call <callee>`.
+  Function signatures initialize parameter locals in the verifier and VM, and `Return`
+  must match the declared return kind.
 - Pair fields: the type checker uses the same allocation-site join idea as the verifier.
   A field can be read only when all possible pair sites agree on the field kind; field
   assignment must preserve that kind.
@@ -108,8 +148,9 @@ Collection is mark, forward, rewrite, install, validate:
    old stale ID for the destination slot cannot alias the moved object. The old source slot
    is emptied, so the pre-move ID also traps.
 4. Before installing the compacted slot vector, the collector rewrites all roots
-   (`RootProvider` roots plus allocation extra roots) and every copied live pair field
-   through the forwarding table while the old layout can still validate old IDs.
+   (`RootProvider` roots from every VM frame plus allocation extra roots) and every copied
+   live pair field through the forwarding table while the old layout can still validate old
+   IDs.
 5. After installation, validation walks all roots and all live-object fields and checks that
    every object reference resolves through the current generation table.
 
@@ -158,10 +199,13 @@ remembered-set entries.
   its push result, rather than checking only net stack effect.
 - Local safety: locals have an explicit verifier state of uninitialized or known value kind;
   `LoadLocal` requires a known initialized kind on every incoming path.
-- Root precision: `verify_with_stack_maps` emits per-pc stack object maps from the
-  verifier's abstract states. Hand-written maps, when present, must match those generated
-  maps, and VM-controlled collection points assert that runtime stack object tags agree
-  with the generated map for the current pc.
+- Root precision: `verify_with_stack_maps` emits per-function per-pc stack object maps from
+  the verifier's abstract states. Hand-written maps, when present, must match those
+  generated maps, and VM-controlled collection points assert that the active frame's
+  runtime stack object tags agree with the generated map for the current function and pc.
+- Frame-root precision: every live frame's locals and operand stack slots are traced as
+  mutable roots. A collection triggered in a deep callee rewrites references held by
+  suspended callers before the callee or caller can resume.
 - GC identity safety: dereferencing, marking, forwarding, or validating an invalid/stale
   `ObjectId` throws, exposing root-precision and missed-forwarding bugs instead of silently
   ignoring or aliasing them.
@@ -173,8 +217,12 @@ remembered-set entries.
   minor collection traces young objects from mutator roots plus remembered old objects,
   remembered-set entries are rewritten/pruned after movement, and validation traps any
   valid old-to-young field absent from the remembered set.
+- Signature safety: call sites are checked against the callee signature only; returns are
+  checked against the current function signature. This keeps bytecode verification
+  modular and rejects out-of-range calls, wrong arity, wrong argument kind, and wrong
+  return kind.
 - Source agreement: `compile_program` does not return bytecode for rejected source, and
-  every returned function has passed `verify_with_stack_maps` with generated stack maps.
+  every returned module has passed `verify_with_stack_maps` with generated stack maps.
 
 ## Verifier join lattice
 

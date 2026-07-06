@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstddef>
 #include <stdexcept>
+#include <utility>
 
 namespace lang {
 
@@ -16,187 +17,251 @@ void VM::set_gc_stress(gc::StressConfig config) {
 }
 
 void VM::trace_roots(gc::RootVisitor& visitor) {
-    // VM root layout assumption: every mutator-visible Value lives either on the operand
-    // stack or in locals while bytecode runs. The visitor receives mutable slots so a
-    // future moving collector can update roots before execution resumes.
-    for (auto& value : stack_) {
-        visitor.visit(value);
-    }
-    for (auto& value : locals_) {
-        visitor.visit(value);
+    // Frame root layout assumption: every mutator-visible Value lives in exactly one
+    // live frame's operand stack or locals while bytecode runs. The visitor receives
+    // mutable slots so moving collection rewrites active and suspended frames alike.
+    for (auto& frame : frames_) {
+        for (auto& value : frame.stack) {
+            visitor.visit(value);
+        }
+        for (auto& value : frame.locals) {
+            visitor.visit(value);
+        }
     }
 }
 
-void VM::assert_stack_matches_map(const VerificationResult& verification, std::size_t pc) const {
-    assert(pc < verification.stack_maps.size() &&
+void VM::assert_stack_matches_map(const ModuleVerificationResult& verification,
+                                  const Frame& frame) const {
+    assert(frame.function_index < verification.functions.size() &&
+           "verifier invariant violated: missing function verification result");
+    const auto& function_verification = verification.functions[frame.function_index];
+    assert(frame.pc < function_verification.stack_maps.size() &&
            "verifier invariant violated: missing stack map for pc");
-    const auto& map = verification.stack_maps[pc];
-    assert(map.object_slots.size() == stack_.size() &&
+    const auto& map = function_verification.stack_maps[frame.pc];
+    assert(map.object_slots.size() == frame.stack.size() &&
            "verifier invariant violated: runtime stack height differs from stack map");
-    for (std::size_t i = 0; i < stack_.size(); ++i) {
-        assert(map.object_slots[i] == stack_[i].is_object() &&
+    for (std::size_t i = 0; i < frame.stack.size(); ++i) {
+        assert(map.object_slots[i] == frame.stack[i].is_object() &&
                "verifier invariant violated: runtime stack tag differs from stack map");
     }
 }
 
-void VM::collect_at_instruction_boundary_if_needed(const VerificationResult& verification,
-                                                   std::size_t pc) {
+void VM::collect_at_instruction_boundary_if_needed(const ModuleVerificationResult& verification,
+                                                   const Frame& frame) {
     const auto major_interval = gc_stress_.collect_every_n_instructions;
     if (major_interval != 0 && instructions_executed_ != 0 &&
         instructions_executed_ % major_interval == 0) {
-        assert_stack_matches_map(verification, pc);
+        assert_stack_matches_map(verification, frame);
         heap_.collect();
-        assert_stack_matches_map(verification, pc);
+        assert_stack_matches_map(verification, frame);
     }
 
     const auto minor_interval = gc_stress_.collect_minor_every_n_instructions;
     if (minor_interval != 0 && instructions_executed_ != 0 &&
         instructions_executed_ % minor_interval == 0) {
-        assert_stack_matches_map(verification, pc);
+        assert_stack_matches_map(verification, frame);
         heap_.collect_minor();
-        assert_stack_matches_map(verification, pc);
+        assert_stack_matches_map(verification, frame);
     }
 }
 
-Value VM::pop() {
-    if (stack_.empty()) {
+Value VM::pop(Frame& frame) {
+    if (frame.stack.empty()) {
         assert(false && "verifier invariant violated: VM stack underflow");
         throw std::runtime_error("VM stack underflow after bytecode verification");
     }
-    auto value = stack_.back();
-    stack_.pop_back();
+    auto value = frame.stack.back();
+    frame.stack.pop_back();
     return value;
 }
 
-void VM::push(Value value) { stack_.push_back(value); }
+void VM::push(Frame& frame, Value value) {
+    frame.stack.push_back(value);
+}
 
 Value VM::execute(const Function& function) {
-    auto verification = verify_with_stack_maps(function);
-    if (!verification.has_value()) {
-        throw std::runtime_error("bytecode verifier rejected function");
-    }
-    stack_.clear();
-    // Locals start as Nil storage, but LoadLocal is legal only after the verifier has
-    // proven a StoreLocal initialized that slot on the linear path to the load.
-    locals_.assign(function.local_count, Value::nil());
-    instructions_executed_ = 0;
+    Module module;
+    module.entry_function = 0;
+    module.functions.push_back(function);
+    return execute(module);
+}
 
-    std::size_t pc = 0;
-    while (pc < function.code.size()) {
-        assert_stack_matches_map(*verification, pc);
-        collect_at_instruction_boundary_if_needed(*verification, pc);
-        const auto& ins = function.code[pc];
+void VM::push_frame(const Module& module, std::size_t function_index,
+                    std::vector<Value> arguments) {
+    if (frames_.size() >= max_call_depth_) {
+        throw std::runtime_error("VM call depth limit exceeded");
+    }
+    if (function_index >= module.functions.size()) {
+        throw std::runtime_error("VM attempted to call out-of-range function");
+    }
+
+    const auto& function = module.functions[function_index];
+    if (arguments.size() != function.signature.parameters.size()) {
+        throw std::runtime_error("VM call argument count mismatch after bytecode verification");
+    }
+    if (function.local_count < arguments.size()) {
+        throw std::runtime_error("VM callee local count is smaller than parameter count");
+    }
+
+    Frame frame;
+    frame.function_index = function_index;
+    frame.pc = 0;
+    frame.locals.assign(function.local_count, Value::nil());
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        frame.locals[i] = arguments[i];
+    }
+    frames_.push_back(std::move(frame));
+}
+
+Value VM::execute(const Module& module) {
+    auto verification = verify_with_stack_maps(module);
+    if (!verification.has_value()) {
+        throw std::runtime_error("bytecode verifier rejected module");
+    }
+    frames_.clear();
+    instructions_executed_ = 0;
+    push_frame(module, module.entry_function, {});
+
+    while (!frames_.empty()) {
+        auto& frame = frames_.back();
+        const auto& function = module.functions[frame.function_index];
+        assert_stack_matches_map(*verification, frame);
+        collect_at_instruction_boundary_if_needed(*verification, frame);
+        const auto& ins = function.code[frame.pc];
         switch (ins.op) {
         case OpCode::ConstantI64:
-            push(Value::int64(ins.operand));
-            ++pc;
+            push(frame, Value::int64(ins.operand));
+            ++frame.pc;
             break;
         case OpCode::AddI64: {
-            const auto rhs_value = pop();
-            const auto lhs_value = pop();
+            const auto rhs_value = pop(frame);
+            const auto lhs_value = pop(frame);
             assert(rhs_value.tag() == Value::Tag::Int64 &&
                    "verifier invariant violated: AddI64 rhs must be i64");
             assert(lhs_value.tag() == Value::Tag::Int64 &&
                    "verifier invariant violated: AddI64 lhs must be i64");
             const auto rhs = rhs_value.as_i64();
             const auto lhs = lhs_value.as_i64();
-            push(Value::int64(lhs + rhs));
-            ++pc;
+            push(frame, Value::int64(lhs + rhs));
+            ++frame.pc;
             break;
         }
         case OpCode::LessI64: {
-            const auto rhs_value = pop();
-            const auto lhs_value = pop();
+            const auto rhs_value = pop(frame);
+            const auto lhs_value = pop(frame);
             assert(rhs_value.tag() == Value::Tag::Int64 &&
                    "verifier invariant violated: LessI64 rhs must be i64");
             assert(lhs_value.tag() == Value::Tag::Int64 &&
                    "verifier invariant violated: LessI64 lhs must be i64");
-            push(Value::boolean(lhs_value.as_i64() < rhs_value.as_i64()));
-            ++pc;
+            push(frame, Value::boolean(lhs_value.as_i64() < rhs_value.as_i64()));
+            ++frame.pc;
             break;
         }
         case OpCode::AllocPair: {
-            auto right = pop();
-            auto left = pop();
-            push(Value::object(heap_.allocate_pair(left, right)));
-            ++pc;
+            auto right = pop(frame);
+            auto left = pop(frame);
+            push(frame, Value::object(heap_.allocate_pair(left, right)));
+            ++frame.pc;
             break;
         }
         case OpCode::GetLeft: {
-            const auto receiver = pop();
+            const auto receiver = pop(frame);
             assert(receiver.tag() == Value::Tag::Object &&
                    "verifier invariant violated: GetLeft receiver must be object");
-            push(heap_.left(receiver.as_object()));
-            ++pc;
+            push(frame, heap_.left(receiver.as_object()));
+            ++frame.pc;
             break;
         }
         case OpCode::GetRight: {
-            const auto receiver = pop();
+            const auto receiver = pop(frame);
             assert(receiver.tag() == Value::Tag::Object &&
                    "verifier invariant violated: GetRight receiver must be object");
-            push(heap_.right(receiver.as_object()));
-            ++pc;
+            push(frame, heap_.right(receiver.as_object()));
+            ++frame.pc;
             break;
         }
         case OpCode::SetLeft: {
-            const auto value = pop();
-            const auto receiver = pop();
+            const auto value = pop(frame);
+            const auto receiver = pop(frame);
             assert(receiver.tag() == Value::Tag::Object &&
                    "verifier invariant violated: SetLeft receiver must be object");
             heap_.set_left(receiver.as_object(), value);
-            ++pc;
+            ++frame.pc;
             break;
         }
         case OpCode::SetRight: {
-            const auto value = pop();
-            const auto receiver = pop();
+            const auto value = pop(frame);
+            const auto receiver = pop(frame);
             assert(receiver.tag() == Value::Tag::Object &&
                    "verifier invariant violated: SetRight receiver must be object");
             heap_.set_right(receiver.as_object(), value);
-            ++pc;
+            ++frame.pc;
             break;
         }
         case OpCode::LoadLocal:
-            assert(ins.operand >= 0 && static_cast<std::size_t>(ins.operand) < locals_.size() &&
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) < frame.locals.size() &&
                    "verifier invariant violated: LoadLocal index must be in range");
-            push(locals_.at(static_cast<std::size_t>(ins.operand)));
-            ++pc;
+            push(frame, frame.locals.at(static_cast<std::size_t>(ins.operand)));
+            ++frame.pc;
             break;
         case OpCode::StoreLocal:
-            assert(ins.operand >= 0 && static_cast<std::size_t>(ins.operand) < locals_.size() &&
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) < frame.locals.size() &&
                    "verifier invariant violated: StoreLocal index must be in range");
-            locals_.at(static_cast<std::size_t>(ins.operand)) = pop();
-            ++pc;
+            frame.locals.at(static_cast<std::size_t>(ins.operand)) = pop(frame);
+            ++frame.pc;
             break;
         case OpCode::Jump:
             assert(ins.operand >= 0 && static_cast<std::size_t>(ins.operand) < function.code.size() &&
                    "verifier invariant violated: Jump target must be in range");
-            pc = static_cast<std::size_t>(ins.operand);
+            frame.pc = static_cast<std::size_t>(ins.operand);
             break;
         case OpCode::JumpIfFalse: {
-            const auto condition = pop();
+            const auto condition = pop(frame);
             assert(condition.tag() == Value::Tag::Bool &&
                    "verifier invariant violated: JumpIfFalse condition must be bool");
             if (!condition.as_bool()) {
                 assert(ins.operand >= 0 &&
                        static_cast<std::size_t>(ins.operand) < function.code.size() &&
                        "verifier invariant violated: JumpIfFalse target must be in range");
-                pc = static_cast<std::size_t>(ins.operand);
+                frame.pc = static_cast<std::size_t>(ins.operand);
             } else {
-                ++pc;
+                ++frame.pc;
             }
             break;
         }
         case OpCode::Collect: {
-            assert_stack_matches_map(*verification, pc);
+            assert_stack_matches_map(*verification, frame);
             heap_.collect();
-            assert_stack_matches_map(*verification, pc);
-            ++pc;
+            assert_stack_matches_map(*verification, frame);
+            ++frame.pc;
             break;
         }
-        case OpCode::Return:
+        case OpCode::Call: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) < module.functions.size() &&
+                   "verifier invariant violated: Call target must be in range");
+            const auto callee_index = static_cast<std::size_t>(ins.operand);
+            const auto& signature = module.functions[callee_index].signature;
+            std::vector<Value> arguments(signature.parameters.size(), Value::nil());
+            for (std::size_t i = signature.parameters.size(); i > 0; --i) {
+                arguments[i - 1] = pop(frame);
+            }
+            ++frame.pc;
+            push_frame(module, callee_index, std::move(arguments));
+            break;
+        }
+        case OpCode::Return: {
+            const auto result = pop(frame);
+            frames_.pop_back();
             ++instructions_executed_;
-            return pop();
+            if (frames_.empty()) {
+                return result;
+            }
+            push(frames_.back(), result);
+            continue;
+        }
         }
         ++instructions_executed_;
     }

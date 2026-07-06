@@ -42,6 +42,8 @@ const char* op_name(lang::OpCode op) {
         return "JumpIfFalse";
     case lang::OpCode::Collect:
         return "Collect";
+    case lang::OpCode::Call:
+        return "Call";
     case lang::OpCode::Return:
         return "Return";
     }
@@ -195,6 +197,7 @@ void heap_stale_pre_compaction_id_traps_after_move() {
 
 lang::Function local_root_movement_program() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.local_count = 2;
     function.code = {
         {lang::OpCode::ConstantI64, 100},
@@ -231,6 +234,7 @@ void vm_collect_rewrites_local_root_after_movement() {
 
 lang::Function stack_root_movement_program() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.local_count = 1;
     function.code = {
         {lang::OpCode::ConstantI64, 100},
@@ -265,6 +269,7 @@ void vm_collect_rewrites_stack_root_after_movement() {
 
 lang::Function interleaved_loop_program() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.local_count = 3;
     function.code = {
         {lang::OpCode::ConstantI64, -1}, // 0: initial head.left
@@ -393,6 +398,7 @@ void heap_compaction_updates_moved_self_cycle() {
 
 lang::Function before_alloc_operand_movement_program() {
     lang::Function function;
+    function.signature.return_type = lang::ValueKind::Object;
     function.local_count = 3;
     function.code = {
         {lang::OpCode::ConstantI64, 900},

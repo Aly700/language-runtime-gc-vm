@@ -22,6 +22,7 @@ enum class TokenKind {
     Identifier,
     Integer,
     Let,
+    Fn,
     If,
     Else,
     While,
@@ -35,6 +36,7 @@ enum class TokenKind {
     Plus,
     Less,
     Equal,
+    Arrow,
     Colon,
     Semicolon,
     Comma,
@@ -79,6 +81,12 @@ public:
             const char c = peek();
             if (is_identifier_start(c)) {
                 tokens.push_back(identifier(start));
+                continue;
+            }
+            if (c == '-' && offset_ + 1 < source_.size() && source_[offset_ + 1] == '>') {
+                advance();
+                advance();
+                tokens.push_back(simple(TokenKind::Arrow, start, "->"));
                 continue;
             }
             if (std::isdigit(static_cast<unsigned char>(c)) ||
@@ -197,6 +205,8 @@ private:
         TokenKind kind = TokenKind::Identifier;
         if (text == "let") {
             kind = TokenKind::Let;
+        } else if (text == "fn") {
+            kind = TokenKind::Fn;
         } else if (text == "if") {
             kind = TokenKind::If;
         } else if (text == "else") {
@@ -256,6 +266,7 @@ struct Expr {
         PairLiteral,
         Binary,
         Field,
+        Call,
     };
 
     Kind kind{Kind::IntLiteral};
@@ -266,11 +277,20 @@ struct Expr {
     std::string name;
     char binary_op{0};
     std::size_t pair_site{0};
+    std::size_t callee_index{0};
     std::unique_ptr<Expr> left;
     std::unique_ptr<Expr> right;
     std::unique_ptr<Expr> receiver;
+    std::vector<std::unique_ptr<Expr>> arguments;
     Type inferred_type{Type::Invalid};
     std::set<std::size_t> object_sites;
+    std::uint32_t local_index{0};
+};
+
+struct Parameter {
+    std::string name;
+    SourcePosition position;
+    Type type{Type::Invalid};
     std::uint32_t local_index{0};
 };
 
@@ -309,9 +329,22 @@ struct Statement {
     std::vector<Statement> body;
 };
 
-struct Program {
+struct FunctionDecl {
+    std::string name;
+    SourcePosition position;
+    std::vector<Parameter> parameters;
+    Type return_type{Type::Invalid};
     std::vector<Statement> statements;
     std::unique_ptr<Expr> result;
+    std::size_t function_index{0};
+    std::uint32_t local_count{0};
+};
+
+struct Program {
+    std::vector<FunctionDecl> functions;
+    std::vector<Statement> statements;
+    std::unique_ptr<Expr> result;
+    std::uint32_t entry_local_count{0};
     std::size_t pair_site_count{0};
 };
 
@@ -321,6 +354,15 @@ public:
 
     std::optional<Program> parse() {
         Program program;
+        while (match(TokenKind::Fn)) {
+            auto declaration = parse_function(previous());
+            if (declaration.has_value()) {
+                program.functions.push_back(std::move(*declaration));
+            } else {
+                synchronize();
+            }
+        }
+
         while (!check(TokenKind::End)) {
             if (starts_statement()) {
                 auto statement = parse_statement();
@@ -378,6 +420,57 @@ private:
         }
         add_diagnostic(diagnostics_, peek().position, message);
         return std::nullopt;
+    }
+
+    std::optional<FunctionDecl> parse_function(const Token& fn_token) {
+        FunctionDecl declaration;
+        declaration.position = fn_token.position;
+
+        const auto name = expect(TokenKind::Identifier, "expected function name after 'fn'");
+        if (name.has_value()) {
+            declaration.name = name->text;
+        }
+        expect(TokenKind::LParen, "expected '(' after function name");
+        if (!check(TokenKind::RParen)) {
+            do {
+                Parameter parameter;
+                const auto parameter_name =
+                    expect(TokenKind::Identifier, "expected parameter name");
+                if (parameter_name.has_value()) {
+                    parameter.name = parameter_name->text;
+                    parameter.position = parameter_name->position;
+                }
+                expect(TokenKind::Colon, "expected ':' after parameter name");
+                parameter.type = parse_type();
+                declaration.parameters.push_back(std::move(parameter));
+            } while (match(TokenKind::Comma));
+        }
+        expect(TokenKind::RParen, "expected ')' after parameters");
+        expect(TokenKind::Arrow, "expected '->' before function return type");
+        declaration.return_type = parse_type();
+        expect(TokenKind::LBrace, "expected '{' before function body");
+
+        while (!check(TokenKind::RBrace) && !check(TokenKind::End)) {
+            if (starts_statement()) {
+                auto statement = parse_statement();
+                if (statement.has_value()) {
+                    declaration.statements.push_back(std::move(*statement));
+                } else {
+                    synchronize();
+                }
+                continue;
+            }
+
+            declaration.result = parse_expression();
+            break;
+        }
+
+        if (!declaration.result && diagnostics_.empty()) {
+            add_diagnostic(diagnostics_, peek().position,
+                           "function body must end with an expression");
+        }
+        expect(TokenKind::RBrace, "expected '}' after function body");
+        return declaration;
     }
 
     [[nodiscard]] bool starts_statement() const {
@@ -558,18 +651,40 @@ private:
 
     std::unique_ptr<Expr> parse_postfix() {
         auto expression = parse_primary();
-        while (match(TokenKind::Dot)) {
-            if (match(TokenKind::Left) || match(TokenKind::Right)) {
+        bool keep_parsing = true;
+        while (keep_parsing) {
+            if (match(TokenKind::Dot)) {
+                if (match(TokenKind::Left) || match(TokenKind::Right)) {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::Field;
+                    node->position = previous().position;
+                    node->name = previous().text;
+                    node->receiver = std::move(expression);
+                    expression = std::move(node);
+                } else {
+                    add_diagnostic(diagnostics_, peek().position,
+                                   "expected field name 'left' or 'right'");
+                    break;
+                }
+            } else if (match(TokenKind::LParen)) {
                 auto node = std::make_unique<Expr>();
-                node->kind = Expr::Kind::Field;
-                node->position = previous().position;
-                node->name = previous().text;
-                node->receiver = std::move(expression);
+                node->kind = Expr::Kind::Call;
+                node->position = expression->position;
+                if (expression->kind == Expr::Kind::Variable) {
+                    node->name = expression->name;
+                } else {
+                    add_diagnostic(diagnostics_, node->position,
+                                   "call target must be a function name");
+                }
+                if (!check(TokenKind::RParen)) {
+                    do {
+                        node->arguments.push_back(parse_expression());
+                    } while (match(TokenKind::Comma));
+                }
+                expect(TokenKind::RParen, "expected ')' after call arguments");
                 expression = std::move(node);
             } else {
-                add_diagnostic(diagnostics_, peek().position,
-                               "expected field name 'left' or 'right'");
-                break;
+                keep_parsing = false;
             }
         }
         return expression;
@@ -631,8 +746,8 @@ private:
             if (current_ > 0 && previous().kind == TokenKind::Semicolon) {
                 return;
             }
-            if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While) ||
-                check(TokenKind::RBrace)) {
+            if (check(TokenKind::Fn) || check(TokenKind::Let) || check(TokenKind::If) ||
+                check(TokenKind::While) || check(TokenKind::RBrace)) {
                 return;
             }
             ++current_;
@@ -697,6 +812,13 @@ TypedValue pair_value(std::size_t site) {
     return value;
 }
 
+TypedValue value_from_type(Type type) {
+    if (type == Type::Pair) {
+        return TypedValue{Type::Pair, {}};
+    }
+    return scalar_value(type);
+}
+
 TypedValue join_values(const TypedValue& lhs, const TypedValue& rhs) {
     if (lhs.type == Type::Invalid) {
         return rhs;
@@ -741,17 +863,32 @@ FlowState join_states(const FlowState& lhs, const FlowState& rhs) {
     return result;
 }
 
+struct FunctionSymbol {
+    std::string name;
+    SourcePosition position;
+    std::size_t index{0};
+    std::vector<Type> parameters;
+    Type return_type{Type::Invalid};
+};
+
 class TypeChecker {
 public:
-    explicit TypeChecker(std::size_t pair_site_count) {
-        state_.fields_by_site.resize(pair_site_count);
+    explicit TypeChecker(std::size_t pair_site_count) : pair_site_count_(pair_site_count) {
+        state_.fields_by_site.resize(pair_site_count_);
     }
 
     Type check(Program& program) {
+        collect_function_symbols(program);
+        for (auto& function : program.functions) {
+            check_function(function);
+        }
+
+        state_ = initial_state();
         for (auto& statement : program.statements) {
             check_statement(statement, state_, true);
         }
         const auto result = check_expr(*program.result, state_);
+        program.entry_local_count = static_cast<std::uint32_t>(state_.locals.size());
         return result.type;
     }
 
@@ -764,6 +901,83 @@ public:
     }
 
 private:
+    FlowState initial_state() const {
+        FlowState state;
+        state.fields_by_site.resize(pair_site_count_);
+        return state;
+    }
+
+    void collect_function_symbols(Program& program) {
+        for (std::size_t i = 0; i < program.functions.size(); ++i) {
+            auto& declaration = program.functions[i];
+            declaration.function_index = i + 1;
+            if (find_function(declaration.name) != nullptr) {
+                diagnose(declaration.position,
+                         "function '" + declaration.name + "' is already defined");
+                continue;
+            }
+
+            FunctionSymbol symbol;
+            symbol.name = declaration.name;
+            symbol.position = declaration.position;
+            symbol.index = declaration.function_index;
+            symbol.return_type = declaration.return_type;
+            for (const auto& parameter : declaration.parameters) {
+                symbol.parameters.push_back(parameter.type);
+            }
+            functions_.push_back(std::move(symbol));
+        }
+    }
+
+    void check_function(FunctionDecl& function) {
+        FlowState state = initial_state();
+        for (auto& parameter : function.parameters) {
+            if (find_local(state, parameter.name) != nullptr) {
+                diagnose(parameter.position,
+                         "parameter '" + parameter.name + "' is already defined");
+                continue;
+            }
+            const auto index = static_cast<std::uint32_t>(state.locals.size());
+            parameter.local_index = index;
+            state.locals.push_back(LocalState{parameter.name,
+                                              parameter.type,
+                                              index,
+                                              true,
+                                              value_from_type(parameter.type),
+                                              parameter.position});
+        }
+
+        for (auto& statement : function.statements) {
+            check_statement(statement, state, true);
+        }
+        const auto result = check_expr(*function.result, state);
+        if (result.type != Type::Invalid && result.type != function.return_type) {
+            diagnose(function.result->position,
+                     "function '" + function.name + "' returns " +
+                         std::string(type_name(result.type)) + " but is declared " +
+                         type_name(function.return_type));
+        }
+        function.local_count = static_cast<std::uint32_t>(state.locals.size());
+    }
+
+    FunctionSymbol* find_function(const std::string& name) {
+        for (auto& function : functions_) {
+            if (function.name == name) {
+                return &function;
+            }
+        }
+        return nullptr;
+    }
+
+    const FunctionSymbol* find_function(const std::string& name) const {
+        for (const auto& function : functions_) {
+            if (function.name == name) {
+                return &function;
+            }
+        }
+        return nullptr;
+    }
+
     LocalState* find_local(FlowState& state, const std::string& name) {
         for (auto& local : state.locals) {
             if (local.name == name) {
@@ -901,7 +1115,7 @@ private:
 
     void check_while(Statement& statement, FlowState& state) {
         FlowState head = state;
-        for (std::size_t iteration = 0; iteration < max_loop_iterations(); ++iteration) {
+        for (std::size_t iteration = 0; iteration < max_loop_iterations(state); ++iteration) {
             auto body_input = head;
             const auto condition = check_expr(*statement.condition, body_input);
             if (condition.type != Type::Invalid && condition.type != Type::Bool) {
@@ -924,8 +1138,8 @@ private:
         state = std::move(head);
     }
 
-    std::size_t max_loop_iterations() const {
-        return state_.fields_by_site.size() + state_.locals.size() + 8;
+    std::size_t max_loop_iterations(const FlowState& state) const {
+        return state.fields_by_site.size() + state.locals.size() + 8;
     }
 
     TypedValue check_expr(Expr& expression, FlowState& state) {
@@ -942,6 +1156,8 @@ private:
             return check_binary(expression, state);
         case Expr::Kind::Field:
             return check_field_access(expression, state);
+        case Expr::Kind::Call:
+            return check_call(expression, state);
         }
         return annotate(expression, invalid_value());
     }
@@ -1015,6 +1231,50 @@ private:
         const auto receiver = check_expr(*expression.receiver, state);
         const auto field = load_field(receiver, expression.name, expression.position, state);
         return annotate(expression, field);
+    }
+
+    TypedValue check_call(Expr& expression, FlowState& state) {
+        std::vector<TypedValue> arguments;
+        arguments.reserve(expression.arguments.size());
+        for (auto& argument : expression.arguments) {
+            arguments.push_back(check_expr(*argument, state));
+        }
+
+        const auto* function = find_function(expression.name);
+        if (function == nullptr) {
+            diagnose(expression.position,
+                     "cannot call non-function name '" + expression.name + "'");
+            return annotate(expression, invalid_value());
+        }
+
+        expression.callee_index = function->index;
+        if (arguments.size() != function->parameters.size()) {
+            diagnose(expression.position,
+                     "function '" + expression.name + "' expects " +
+                         std::to_string(function->parameters.size()) +
+                         " argument(s) but got " + std::to_string(arguments.size()));
+            return annotate(expression, invalid_value());
+        }
+
+        bool valid = true;
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            if (arguments[i].type == Type::Invalid) {
+                valid = false;
+                continue;
+            }
+            if (arguments[i].type != function->parameters[i]) {
+                diagnose(expression.arguments[i]->position,
+                         "argument " + std::to_string(i + 1) + " of function '" +
+                             expression.name + "' expects " +
+                             type_name(function->parameters[i]) + " but got " +
+                             type_name(arguments[i].type));
+                valid = false;
+            }
+        }
+        if (!valid) {
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, value_from_type(function->return_type));
     }
 
     TypedValue check_lvalue_prefix(LValue& lvalue, FlowState& state,
@@ -1094,21 +1354,49 @@ private:
         }
     }
 
+    std::size_t pair_site_count_{0};
     FlowState state_;
+    std::vector<FunctionSymbol> functions_;
     std::vector<Diagnostic> diagnostics_;
 };
 
+ValueKind bytecode_kind(Type type) {
+    switch (type) {
+    case Type::Int64:
+        return ValueKind::Int64;
+    case Type::Bool:
+        return ValueKind::Bool;
+    case Type::Pair:
+        return ValueKind::Object;
+    case Type::Invalid:
+        return ValueKind::Nil;
+    }
+    return ValueKind::Nil;
+}
+
+FunctionSignature signature_from_types(const std::vector<Parameter>& parameters,
+                                       Type return_type) {
+    FunctionSignature signature;
+    signature.parameters.reserve(parameters.size());
+    for (const auto& parameter : parameters) {
+        signature.parameters.push_back(bytecode_kind(parameter.type));
+    }
+    signature.return_type = bytecode_kind(return_type);
+    return signature;
+}
+
 class Compiler {
 public:
-    explicit Compiler(std::uint32_t local_count) {
+    Compiler(std::uint32_t local_count, FunctionSignature signature) {
+        function_.signature = std::move(signature);
         function_.local_count = local_count;
     }
 
-    Function compile(const Program& program) {
-        for (const auto& statement : program.statements) {
+    Function compile(const std::vector<Statement>& statements, const Expr& result) {
+        for (const auto& statement : statements) {
             compile_statement(statement);
         }
-        compile_expr(*program.result);
+        compile_expr(result);
         // Verifier accommodation: source programs always end in a final expression, and
         // the compiler emits an explicit Return immediately after it so bytecode cannot
         // fall off the end.
@@ -1222,6 +1510,12 @@ private:
             compile_expr(*expression.receiver);
             emit(expression.name == "left" ? OpCode::GetLeft : OpCode::GetRight, 0);
             break;
+        case Expr::Kind::Call:
+            for (const auto& argument : expression.arguments) {
+                compile_expr(*argument);
+            }
+            emit(OpCode::Call, static_cast<std::int64_t>(expression.callee_index));
+            break;
         }
     }
 
@@ -1268,44 +1562,71 @@ CompileResult compile_program(std::string_view source) {
     Lexer lexer(source);
     auto tokens = lexer.lex();
     if (!lexer.diagnostics().empty()) {
-        return CompileResult{std::nullopt, Type::Invalid, lex_diagnostics(lexer)};
+        CompileResult result;
+        result.result_type = Type::Invalid;
+        result.diagnostics = lex_diagnostics(lexer);
+        return result;
     }
 
     Parser parser(std::move(tokens));
     auto program = parser.parse();
     if (!program.has_value()) {
-        return CompileResult{std::nullopt,
-                             Type::Invalid,
-                             std::vector<Diagnostic>(parser.diagnostics().begin(),
-                                                     parser.diagnostics().end())};
+        CompileResult result;
+        result.result_type = Type::Invalid;
+        result.diagnostics = std::vector<Diagnostic>(parser.diagnostics().begin(),
+                                                     parser.diagnostics().end());
+        return result;
     }
 
     TypeChecker checker(program->pair_site_count);
     const auto result_type = checker.check(*program);
     if (!checker.diagnostics().empty()) {
-        return CompileResult{std::nullopt,
-                             result_type,
-                             std::vector<Diagnostic>(checker.diagnostics().begin(),
-                                                     checker.diagnostics().end())};
+        CompileResult result;
+        result.result_type = result_type;
+        result.diagnostics = std::vector<Diagnostic>(checker.diagnostics().begin(),
+                                                     checker.diagnostics().end());
+        return result;
     }
 
-    Compiler compiler(checker.local_count());
-    auto function = compiler.compile(*program);
+    Module module;
+    module.entry_function = 0;
+    module.functions.reserve(program->functions.size() + 1);
 
-    auto verification = verify_with_stack_maps(function);
+    FunctionSignature entry_signature;
+    entry_signature.return_type = bytecode_kind(result_type);
+    Compiler entry_compiler(program->entry_local_count, std::move(entry_signature));
+    module.functions.push_back(entry_compiler.compile(program->statements, *program->result));
+
+    for (const auto& declaration : program->functions) {
+        Compiler function_compiler(declaration.local_count,
+                                   signature_from_types(declaration.parameters,
+                                                        declaration.return_type));
+        module.functions.push_back(
+            function_compiler.compile(declaration.statements, *declaration.result));
+    }
+
+    auto verification = verify_with_stack_maps(module);
     assert(verification.has_value() &&
-           "compiler bug: type-checked source emitted verifier-rejected bytecode");
+           "compiler bug: type-checked source emitted verifier-rejected module");
     if (!verification.has_value()) {
-        return CompileResult{
-            std::nullopt,
-            result_type,
-            {Diagnostic{SourcePosition{}, "compiler emitted verifier-rejected bytecode"}}};
+        CompileResult result;
+        result.result_type = result_type;
+        result.diagnostics = {
+            Diagnostic{SourcePosition{}, "compiler emitted verifier-rejected module"}};
+        return result;
     }
 
-    function.stack_maps = verification->stack_maps;
-    assert(verify_with_stack_maps(function).has_value() &&
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        module.functions[i].stack_maps = verification->functions[i].stack_maps;
+    }
+    assert(verify_with_stack_maps(module).has_value() &&
            "compiler bug: verifier-generated stack maps did not round-trip");
-    return CompileResult{std::move(function), result_type, {}};
+
+    CompileResult result;
+    result.result_type = result_type;
+    result.module = std::move(module);
+    result.function = result.module->functions.at(result.module->entry_function);
+    return result;
 }
 
 } // namespace lang::frontend

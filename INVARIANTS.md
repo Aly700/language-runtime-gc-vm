@@ -4,6 +4,15 @@
 
 - Bytecode verification must prove stack depth is valid at every instruction.
 - A bytecode instruction may only read locals proven initialized by the verifier.
+- A call instruction may only target an in-module function whose declared parameter kinds
+  match the values proven on the caller stack.
+- A return instruction may only return a value whose kind matches the current function's
+  declared return kind.
+- Every live VM frame's operand stack and locals are precise mutable roots. Moving
+  collection must rewrite references in active and suspended frames before bytecode
+  execution resumes.
+- Call depth is bounded by an explicit VM limit and must trap deterministically before
+  host stack exhaustion can matter.
 - VM observable behavior must not depend on host pointer addresses.
 
 ## GC
