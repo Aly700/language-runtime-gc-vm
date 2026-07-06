@@ -16,12 +16,17 @@ struct TypeSpec {
         Int64,
         Bool,
         Pair,
+        Named,
+        Nil,
         Invalid,
     };
 
     Kind kind{Kind::Invalid};
     std::shared_ptr<TypeSpec> left;
     std::shared_ptr<TypeSpec> right;
+    std::string name;
+    SourcePosition position;
+    std::optional<std::size_t> named_type_index;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == Kind::Pair && left != nullptr && right != nullptr;
@@ -31,6 +36,8 @@ struct TypeSpec {
 TypeSpec int64_type();
 TypeSpec bool_type();
 TypeSpec pair_type();
+TypeSpec named_type(std::string name, SourcePosition position);
+TypeSpec nil_type();
 TypeSpec invalid_type();
 TypeSpec pair_type(TypeSpec left, TypeSpec right);
 
@@ -46,11 +53,13 @@ struct Expr {
     enum class Kind {
         IntLiteral,
         BoolLiteral,
+        NilLiteral,
         Variable,
         PairLiteral,
         Binary,
         Field,
         Call,
+        IsNil,
     };
 
     Kind kind{Kind::IntLiteral};
@@ -124,7 +133,16 @@ struct FunctionDecl {
     std::uint32_t local_count{0};
 };
 
+struct TypeDecl {
+    std::string name;
+    SourcePosition position;
+    SourcePosition body_position;
+    TypeSpec body{invalid_type()};
+    std::size_t type_index{static_cast<std::size_t>(-1)};
+};
+
 struct Program {
+    std::vector<TypeDecl> types;
     std::vector<FunctionDecl> functions;
     std::vector<Statement> statements;
     std::unique_ptr<Expr> result;

@@ -30,7 +30,11 @@ struct AbstractValue {
     AbstractKind kind{AbstractKind::Poison};
     std::set<std::size_t> object_sites;
     bool includes_opaque_object{false};
+    bool includes_nil{false};
     std::shared_ptr<const PairFields> signature_fields;
+    std::optional<std::size_t> signature_named_type;
+    std::optional<std::size_t> source_local;
+    std::optional<std::size_t> nil_test_local;
 };
 
 struct PairFields {
@@ -82,6 +86,10 @@ const char* op_name(OpCode op) {
         return "Call";
     case OpCode::Return:
         return "Return";
+    case OpCode::Nil:
+        return "Nil";
+    case OpCode::IsNil:
+        return "IsNil";
     }
     return "<invalid>";
 }
@@ -143,6 +151,13 @@ AbstractValue int64_value() { return value_with_kind(AbstractKind::Int64); }
 AbstractValue bool_value() { return value_with_kind(AbstractKind::Bool); }
 AbstractValue poison_value() { return value_with_kind(AbstractKind::Poison); }
 
+AbstractValue nil_object_value() {
+    AbstractValue value;
+    value.kind = AbstractKind::Object;
+    value.includes_nil = true;
+    return value;
+}
+
 AbstractValue object_value(std::size_t site) {
     AbstractValue value;
     value.kind = AbstractKind::Object;
@@ -154,6 +169,20 @@ AbstractValue opaque_object_value() {
     AbstractValue value;
     value.kind = AbstractKind::Object;
     value.includes_opaque_object = true;
+    return value;
+}
+
+AbstractValue named_signature_object_value(std::size_t index) {
+    AbstractValue value;
+    value.kind = AbstractKind::Object;
+    value.includes_nil = true;
+    value.signature_named_type = index;
+    return value;
+}
+
+AbstractValue without_provenance(AbstractValue value) {
+    value.source_local.reset();
+    value.nil_test_local.reset();
     return value;
 }
 
@@ -183,6 +212,9 @@ AbstractValue value_from_signature(ValueKind kind) {
 }
 
 AbstractValue value_from_signature(const SignatureValue& signature) {
+    if (signature.is_named_type_reference()) {
+        return named_signature_object_value(*signature.named_type);
+    }
     if (signature.has_pair_fields()) {
         AbstractValue value;
         value.kind = AbstractKind::Object;
@@ -210,31 +242,53 @@ SignatureValue return_signature(const FunctionSignature& signature) {
     return signature_value(signature.return_type);
 }
 
-bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kind) {
+bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kind,
+                                  const Module& module) {
     if (signature.kind != kind) {
         return false;
     }
-    if (signature.has_pair_fields()) {
-        return signature_shape_matches_kind(*signature.left, signature.left->kind) &&
-               signature_shape_matches_kind(*signature.right, signature.right->kind);
+    if (signature.is_named_type_reference()) {
+        return signature.kind == ValueKind::Object &&
+               *signature.named_type < module.named_types.size() &&
+               signature.left == nullptr && signature.right == nullptr;
     }
-    return signature.left == nullptr && signature.right == nullptr;
+    if (signature.has_pair_fields()) {
+        return signature_shape_matches_kind(*signature.left, signature.left->kind,
+                                            module) &&
+               signature_shape_matches_kind(*signature.right, signature.right->kind,
+                                            module);
+    }
+    return signature.left == nullptr && signature.right == nullptr &&
+           !signature.named_type.has_value();
 }
 
-bool signature_is_well_formed(const FunctionSignature& signature) {
+bool named_types_are_well_formed(const Module& module) {
+    for (const auto& type : module.named_types) {
+        if (!type.body.has_pair_fields()) {
+            return false;
+        }
+        if (!signature_shape_matches_kind(type.body, ValueKind::Object, module)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool signature_is_well_formed(const FunctionSignature& signature,
+                              const Module& module) {
     if (!signature.parameter_types.empty() &&
         signature.parameter_types.size() != signature.parameters.size()) {
         return false;
     }
     for (std::size_t i = 0; i < signature.parameter_types.size(); ++i) {
         if (!signature_shape_matches_kind(signature.parameter_types[i],
-                                          signature.parameters[i])) {
+                                          signature.parameters[i], module)) {
             return false;
         }
     }
     if (signature.return_type_detail.has_value() &&
         !signature_shape_matches_kind(*signature.return_type_detail,
-                                      signature.return_type)) {
+                                      signature.return_type, module)) {
         return false;
     }
     return true;
@@ -246,7 +300,11 @@ bool fields_equal(const std::shared_ptr<const PairFields>& lhs,
 bool operator==(const AbstractValue& lhs, const AbstractValue& rhs) {
     return lhs.kind == rhs.kind && lhs.object_sites == rhs.object_sites &&
            lhs.includes_opaque_object == rhs.includes_opaque_object &&
-           fields_equal(lhs.signature_fields, rhs.signature_fields);
+           lhs.includes_nil == rhs.includes_nil &&
+           fields_equal(lhs.signature_fields, rhs.signature_fields) &&
+           lhs.signature_named_type == rhs.signature_named_type &&
+           lhs.source_local == rhs.source_local &&
+           lhs.nil_test_local == rhs.nil_test_local;
 }
 
 bool operator==(const PairFields& lhs, const PairFields& rhs) {
@@ -283,6 +341,18 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
         joined.object_sites.insert(rhs.object_sites.begin(), rhs.object_sites.end());
         joined.includes_opaque_object =
             lhs.includes_opaque_object || rhs.includes_opaque_object;
+        joined.includes_nil = lhs.includes_nil || rhs.includes_nil;
+        if (lhs.signature_named_type == rhs.signature_named_type) {
+            joined.signature_named_type = lhs.signature_named_type;
+        } else if (lhs.signature_named_type.has_value() &&
+                   !rhs.signature_named_type.has_value()) {
+            joined.signature_named_type = lhs.signature_named_type;
+        } else if (!lhs.signature_named_type.has_value() &&
+                   rhs.signature_named_type.has_value()) {
+            joined.signature_named_type = rhs.signature_named_type;
+        } else {
+            joined.signature_named_type.reset();
+        }
         if (lhs.signature_fields != nullptr && rhs.signature_fields != nullptr) {
             joined.signature_fields = fields_ptr(PairFields{
                 join_values(lhs.signature_fields->left, rhs.signature_fields->left),
@@ -293,6 +363,16 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
         } else {
             joined.signature_fields = rhs.signature_fields;
         }
+    }
+    if (lhs.source_local == rhs.source_local) {
+        joined.source_local = lhs.source_local;
+    } else {
+        joined.source_local.reset();
+    }
+    if (lhs.nil_test_local == rhs.nil_test_local) {
+        joined.nil_test_local = lhs.nil_test_local;
+    } else {
+        joined.nil_test_local.reset();
     }
     return joined;
 }
@@ -444,15 +524,32 @@ bool push_fallthrough_or_report(
     return true;
 }
 
-bool load_pair_field(const AbstractState& state, const AbstractValue& receiver, bool left,
-                     AbstractValue& out) {
-    if (receiver.includes_opaque_object) {
+bool load_pair_field(const Module& module, const AbstractState& state,
+                     const AbstractValue& receiver, bool left, AbstractValue& out) {
+    if (receiver.includes_nil || receiver.includes_opaque_object) {
         return false;
     }
 
     std::optional<AbstractValue> loaded;
     if (receiver.signature_fields != nullptr) {
         loaded = left ? receiver.signature_fields->left : receiver.signature_fields->right;
+    }
+    if (receiver.signature_named_type.has_value()) {
+        if (*receiver.signature_named_type >= module.named_types.size()) {
+            return false;
+        }
+        const auto named_body =
+            value_from_signature(module.named_types[*receiver.signature_named_type].body);
+        if (named_body.signature_fields == nullptr) {
+            return false;
+        }
+        const auto& field =
+            left ? named_body.signature_fields->left : named_body.signature_fields->right;
+        if (!loaded.has_value()) {
+            loaded = field;
+        } else {
+            *loaded = join_values(*loaded, field);
+        }
     }
 
     for (const auto site : receiver.object_sites) {
@@ -474,21 +571,106 @@ bool load_pair_field(const AbstractState& state, const AbstractValue& receiver, 
     return true;
 }
 
-bool value_conforms_to_expected(const AbstractState& state, const AbstractValue& value,
-                                const AbstractValue& expected);
+struct NonnilValueShape {
+    std::vector<std::size_t> object_sites;
+    bool includes_opaque_object{false};
+    std::uintptr_t signature_fields{0};
+    std::optional<std::size_t> signature_named_type;
 
-bool value_conforms_to_signature(const AbstractState& state, const AbstractValue& value,
-                                 const SignatureValue& signature) {
-    return value_conforms_to_expected(state, value, value_from_signature(signature));
+    [[nodiscard]] bool operator<(const NonnilValueShape& other) const {
+        if (object_sites != other.object_sites) {
+            return object_sites < other.object_sites;
+        }
+        if (includes_opaque_object != other.includes_opaque_object) {
+            return includes_opaque_object < other.includes_opaque_object;
+        }
+        if (signature_fields != other.signature_fields) {
+            return signature_fields < other.signature_fields;
+        }
+        return signature_named_type < other.signature_named_type;
+    }
+};
+
+struct ConformanceAssumption {
+    NonnilValueShape value;
+    std::size_t expected_named_type{0};
+
+    [[nodiscard]] bool operator<(const ConformanceAssumption& other) const {
+        if (value < other.value) {
+            return true;
+        }
+        if (other.value < value) {
+            return false;
+        }
+        return expected_named_type < other.expected_named_type;
+    }
+};
+
+NonnilValueShape nonnil_shape(const AbstractValue& value) {
+    return NonnilValueShape{
+        std::vector<std::size_t>(value.object_sites.begin(), value.object_sites.end()),
+        value.includes_opaque_object,
+        reinterpret_cast<std::uintptr_t>(value.signature_fields.get()),
+        value.signature_named_type,
+    };
 }
 
-bool value_conforms_to_expected(const AbstractState& state, const AbstractValue& value,
-                                const AbstractValue& expected) {
+bool has_nonnil_object_evidence(const AbstractValue& value) {
+    return value.includes_opaque_object || !value.object_sites.empty() ||
+           value.signature_fields != nullptr || value.signature_named_type.has_value();
+}
+
+bool value_conforms_to_expected(const Module& module, const AbstractState& state,
+                                const AbstractValue& value,
+                                const AbstractValue& expected,
+                                std::set<ConformanceAssumption>& assumptions);
+
+bool value_conforms_to_signature(const Module& module, const AbstractState& state,
+                                 const AbstractValue& value,
+                                 const SignatureValue& signature) {
+    std::set<ConformanceAssumption> assumptions;
+    return value_conforms_to_expected(module, state, value,
+                                      value_from_signature(signature), assumptions);
+}
+
+bool value_conforms_to_expected(const Module& module, const AbstractState& state,
+                                const AbstractValue& value,
+                                const AbstractValue& expected,
+                                std::set<ConformanceAssumption>& assumptions) {
     if (is_poison(value) || is_poison(expected) || value.kind != expected.kind) {
         return false;
     }
     if (expected.kind != AbstractKind::Object) {
         return true;
+    }
+    if (expected.signature_named_type.has_value()) {
+        if (*expected.signature_named_type >= module.named_types.size()) {
+            return false;
+        }
+        if (!has_nonnil_object_evidence(value)) {
+            return value.includes_nil;
+        }
+
+        auto nonnil = value;
+        nonnil.includes_nil = false;
+        const ConformanceAssumption assumption{nonnil_shape(nonnil),
+                                               *expected.signature_named_type};
+        // Termination: recursive signatures can only re-enter through finite
+        // Module::named_types references, and verifier values contain finite
+        // allocation-site/signature evidence. Once the same non-nil value shape is
+        // being checked against the same named type, the remaining obligation is the
+        // same coinductive proof, so it is assumed instead of unfolded again.
+        if (!assumptions.insert(assumption).second) {
+            return true;
+        }
+
+        return value_conforms_to_expected(
+            module, state, nonnil,
+            value_from_signature(module.named_types[*expected.signature_named_type].body),
+            assumptions);
+    }
+    if (value.includes_nil) {
+        return false;
     }
     if (expected.signature_fields == nullptr) {
         return true;
@@ -496,22 +678,48 @@ bool value_conforms_to_expected(const AbstractState& state, const AbstractValue&
 
     AbstractValue value_left;
     AbstractValue value_right;
-    return load_pair_field(state, value, true, value_left) &&
-           load_pair_field(state, value, false, value_right) &&
-           value_conforms_to_expected(state, value_left, expected.signature_fields->left) &&
-           value_conforms_to_expected(state, value_right, expected.signature_fields->right);
+    return load_pair_field(module, state, value, true, value_left) &&
+           load_pair_field(module, state, value, false, value_right) &&
+           value_conforms_to_expected(module, state, value_left,
+                                      expected.signature_fields->left, assumptions) &&
+           value_conforms_to_expected(module, state, value_right,
+                                      expected.signature_fields->right, assumptions);
 }
 
-bool store_pair_field(AbstractState& state, const AbstractValue& receiver, bool left,
+bool store_pair_field(const Module& module, AbstractState& state,
+                      const AbstractValue& receiver, bool left,
                       const AbstractValue& value) {
+    if (receiver.includes_nil) {
+        return false;
+    }
     if (receiver.includes_opaque_object && receiver.signature_fields != nullptr) {
         return false;
     }
 
+    std::optional<AbstractValue> expected;
     if (receiver.signature_fields != nullptr) {
-        const auto& expected =
-            left ? receiver.signature_fields->left : receiver.signature_fields->right;
-        if (!value_conforms_to_expected(state, value, expected)) {
+        expected = left ? receiver.signature_fields->left : receiver.signature_fields->right;
+    }
+    if (receiver.signature_named_type.has_value()) {
+        if (*receiver.signature_named_type >= module.named_types.size()) {
+            return false;
+        }
+        const auto named_body =
+            value_from_signature(module.named_types[*receiver.signature_named_type].body);
+        if (named_body.signature_fields == nullptr) {
+            return false;
+        }
+        const auto& named_expected =
+            left ? named_body.signature_fields->left : named_body.signature_fields->right;
+        if (!expected.has_value()) {
+            expected = named_expected;
+        } else {
+            *expected = join_values(*expected, named_expected);
+        }
+    }
+    if (expected.has_value()) {
+        std::set<ConformanceAssumption> assumptions;
+        if (!value_conforms_to_expected(module, state, value, *expected, assumptions)) {
             return false;
         }
     }
@@ -524,7 +732,8 @@ bool store_pair_field(AbstractState& state, const AbstractValue& receiver, bool 
         auto& field = left ? it->second.left : it->second.right;
         (void)join_value_into(field, value);
     }
-    return receiver.signature_fields != nullptr || !receiver.object_sites.empty() ||
+    return receiver.signature_fields != nullptr ||
+           receiver.signature_named_type.has_value() || !receiver.object_sites.empty() ||
            receiver.includes_opaque_object;
 }
 
@@ -541,6 +750,24 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         state.stack.push_back(int64_value());
         return push_fallthrough_or_report(pc, function, function_index, state,
                                           successors, diagnostics);
+    case OpCode::Nil:
+        state.stack.push_back(nil_object_value());
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
+    case OpCode::IsNil: {
+        AbstractValue value;
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Object, VerifierReason::StackUnderflow,
+                                  VerifierReason::TypeMismatch, "is_nil operand",
+                                  &value)) {
+            return false;
+        }
+        auto result = bool_value();
+        result.nil_test_local = value.source_local;
+        state.stack.push_back(result);
+        return push_fallthrough_or_report(pc, function, function_index, state,
+                                          successors, diagnostics);
+    }
     case OpCode::AddI64:
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64, VerifierReason::StackUnderflow,
@@ -574,7 +801,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                                VerifierReason::StackUnderflow, "left field", &left)) {
             return false;
         }
-        const PairFields allocated{left, right};
+        const PairFields allocated{without_provenance(left), without_provenance(right)};
         auto [it, inserted] = state.fields_by_site.emplace(pc, allocated);
         if (!inserted) {
             (void)join_value_into(it->second.left, allocated.left);
@@ -594,7 +821,8 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                                   &receiver)) {
             return false;
         }
-        if (!load_pair_field(state, receiver, ins.op == OpCode::GetLeft, loaded)) {
+        if (!load_pair_field(module, state, receiver, ins.op == OpCode::GetLeft,
+                             loaded)) {
             return reject(diagnostics, function_index, pc,
                           VerifierReason::BadPairFieldRead,
                           instruction_message(function, pc,
@@ -622,7 +850,8 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                                   &receiver)) {
             return false;
         }
-        if (!store_pair_field(state, receiver, ins.op == OpCode::SetLeft, value)) {
+        if (!store_pair_field(module, state, receiver, ins.op == OpCode::SetLeft,
+                              without_provenance(value))) {
             return reject(diagnostics, function_index, pc,
                           VerifierReason::BadPairFieldWrite,
                           instruction_message(function, pc,
@@ -655,7 +884,10 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             return reject(diagnostics, function_index, pc, VerifierReason::PoisonUse,
                           instruction_message(function, pc, message.str()));
         }
-        state.stack.push_back(*state.locals[local_index]);
+        auto loaded = *state.locals[local_index];
+        loaded.source_local = local_index;
+        loaded.nil_test_local.reset();
+        state.stack.push_back(loaded);
         return push_fallthrough_or_report(pc, function, function_index, state,
                                           successors, diagnostics);
     }
@@ -674,7 +906,8 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                                &stored)) {
             return false;
         }
-        state.locals[static_cast<std::size_t>(ins.operand)] = stored;
+        state.locals[static_cast<std::size_t>(ins.operand)] =
+            without_provenance(stored);
         return push_fallthrough_or_report(pc, function, function_index, state,
                                           successors, diagnostics);
     }
@@ -689,7 +922,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         }
         successors.push_back({static_cast<std::size_t>(ins.operand), state});
         return true;
-    case OpCode::JumpIfFalse:
+    case OpCode::JumpIfFalse: {
         if (!is_valid_target(ins.operand, function.code.size())) {
             std::ostringstream message;
             message << "target " << ins.operand << " is outside code size "
@@ -698,14 +931,29 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                           VerifierReason::BadJumpTarget,
                           instruction_message(function, pc, message.str()));
         }
+        AbstractValue condition;
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Bool, VerifierReason::StackUnderflow,
-                                  VerifierReason::TypeMismatch, "branch condition")) {
+                                  VerifierReason::TypeMismatch, "branch condition",
+                                  &condition)) {
             return false;
         }
-        successors.push_back({static_cast<std::size_t>(ins.operand), state});
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        auto false_state = state;
+        auto true_state = state;
+        if (condition.nil_test_local.has_value()) {
+            const auto local = *condition.nil_test_local;
+            if (local < true_state.locals.size() && true_state.locals[local].has_value()) {
+                true_state.locals[local] = nil_object_value();
+            }
+            if (local < false_state.locals.size() &&
+                false_state.locals[local].has_value()) {
+                false_state.locals[local]->includes_nil = false;
+            }
+        }
+        successors.push_back({static_cast<std::size_t>(ins.operand), false_state});
+        return push_fallthrough_or_report(pc, function, function_index, true_state,
                                           successors, diagnostics);
+    }
     case OpCode::Collect:
         return push_fallthrough_or_report(pc, function, function_index, state,
                                           successors, diagnostics);
@@ -733,7 +981,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                                       context.str(), &argument)) {
                 return false;
             }
-            if (!value_conforms_to_signature(state, argument,
+            if (!value_conforms_to_signature(module, state, argument,
                                              parameter_signature(callee,
                                                                  parameter_index))) {
                 std::ostringstream message;
@@ -756,7 +1004,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                                &returned)) {
             return false;
         }
-        if (!value_conforms_to_signature(state, returned,
+        if (!value_conforms_to_signature(module, state, returned,
                                          return_signature(function.signature))) {
             return reject(diagnostics, function_index, pc,
                           VerifierReason::BadReturnKind,
@@ -787,7 +1035,7 @@ std::optional<VerificationResult> verify_function_with_stack_maps(
                "function has no bytecode");
         return std::nullopt;
     }
-    if (!signature_is_well_formed(function.signature)) {
+    if (!signature_is_well_formed(function.signature, module)) {
         reject(diagnostics, function_index, std::nullopt,
                VerifierReason::SignatureShapeMismatch,
                "function signature detail shape does not match coarse kinds");
@@ -981,6 +1229,12 @@ ModuleVerifierReport verify_with_diagnostics(const Module& module) {
                 << " is outside function count " << module.functions.size();
         reject(report.diagnostics, module.entry_function, std::nullopt,
                VerifierReason::ModuleShapeMismatch, message.str());
+        return report;
+    }
+    if (!named_types_are_well_formed(module)) {
+        reject(report.diagnostics, 0, std::nullopt,
+               VerifierReason::SignatureShapeMismatch,
+               "module named type table contains a malformed recursive type");
         return report;
     }
 

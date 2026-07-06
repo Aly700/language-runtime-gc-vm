@@ -17,7 +17,10 @@ ValueKind bytecode_kind(const TypeSpec& type) {
     case TypeSpec::Kind::Bool:
         return ValueKind::Bool;
     case TypeSpec::Kind::Pair:
+    case TypeSpec::Kind::Named:
         return ValueKind::Object;
+    case TypeSpec::Kind::Nil:
+        return ValueKind::Nil;
     case TypeSpec::Kind::Invalid:
         return ValueKind::Nil;
     }
@@ -25,6 +28,9 @@ ValueKind bytecode_kind(const TypeSpec& type) {
 }
 
 SignatureValue signature_value_from_type(const TypeSpec& type) {
+    if (type.kind == TypeSpec::Kind::Named && type.named_type_index.has_value()) {
+        return named_type_signature(*type.named_type_index);
+    }
     if (type.has_pair_fields()) {
         return pair_signature(signature_value_from_type(*type.left),
                               signature_value_from_type(*type.right));
@@ -156,6 +162,9 @@ private:
         case Expr::Kind::BoolLiteral:
             compile_bool_literal(expression.bool_value);
             break;
+        case Expr::Kind::NilLiteral:
+            emit(OpCode::Nil, 0);
+            break;
         case Expr::Kind::Variable:
             emit(OpCode::LoadLocal, expression.local_index);
             break;
@@ -178,6 +187,10 @@ private:
                 compile_expr(*argument);
             }
             emit(OpCode::Call, static_cast<std::int64_t>(expression.callee_index));
+            break;
+        case Expr::Kind::IsNil:
+            compile_expr(*expression.receiver);
+            emit(OpCode::IsNil, 0);
             break;
         }
     }
@@ -207,6 +220,12 @@ CompileModuleResult compile_checked_program(const Program& program,
                                             const TypeSpec& result_type) {
     Module module;
     module.entry_function = 0;
+    module.named_types.reserve(program.types.size());
+    for (const auto& declaration : program.types) {
+        module.named_types.push_back(
+            NamedTypeSignature{declaration.name,
+                               signature_value_from_type(declaration.body)});
+    }
     module.functions.reserve(program.functions.size() + 1);
 
     FunctionSignature entry_signature;

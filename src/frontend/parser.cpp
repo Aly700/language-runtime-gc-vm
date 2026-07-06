@@ -9,10 +9,25 @@
 
 namespace lang::frontend::detail {
 
-TypeSpec int64_type() { return TypeSpec{TypeSpec::Kind::Int64, nullptr, nullptr}; }
-TypeSpec bool_type() { return TypeSpec{TypeSpec::Kind::Bool, nullptr, nullptr}; }
-TypeSpec pair_type() { return TypeSpec{TypeSpec::Kind::Pair, nullptr, nullptr}; }
-TypeSpec invalid_type() { return TypeSpec{TypeSpec::Kind::Invalid, nullptr, nullptr}; }
+TypeSpec type_with_kind(TypeSpec::Kind kind) {
+    TypeSpec type;
+    type.kind = kind;
+    return type;
+}
+
+TypeSpec int64_type() { return type_with_kind(TypeSpec::Kind::Int64); }
+TypeSpec bool_type() { return type_with_kind(TypeSpec::Kind::Bool); }
+TypeSpec pair_type() { return type_with_kind(TypeSpec::Kind::Pair); }
+TypeSpec nil_type() { return type_with_kind(TypeSpec::Kind::Nil); }
+TypeSpec invalid_type() { return type_with_kind(TypeSpec::Kind::Invalid); }
+
+TypeSpec named_type(std::string name, SourcePosition position) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Named;
+    type.name = std::move(name);
+    type.position = position;
+    return type;
+}
 
 TypeSpec pair_type(TypeSpec left, TypeSpec right) {
     TypeSpec type;
@@ -25,6 +40,12 @@ TypeSpec pair_type(TypeSpec left, TypeSpec right) {
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs.kind != rhs.kind) {
         return false;
+    }
+    if (lhs.kind == TypeSpec::Kind::Named) {
+        if (lhs.named_type_index.has_value() && rhs.named_type_index.has_value()) {
+            return lhs.named_type_index == rhs.named_type_index;
+        }
+        return lhs.name == rhs.name;
     }
     if (!lhs.has_pair_fields() && !rhs.has_pair_fields()) {
         return true;
@@ -44,7 +65,7 @@ bool is_invalid(const TypeSpec& type) {
 }
 
 bool is_pair(const TypeSpec& type) {
-    return type.kind == TypeSpec::Kind::Pair;
+    return type.kind == TypeSpec::Kind::Pair || type.kind == TypeSpec::Kind::Named;
 }
 
 Type public_type(const TypeSpec& type) {
@@ -55,6 +76,10 @@ Type public_type(const TypeSpec& type) {
         return Type::Bool;
     case TypeSpec::Kind::Pair:
         return Type::Pair;
+    case TypeSpec::Kind::Named:
+        return Type::Pair;
+    case TypeSpec::Kind::Nil:
+        return Type::Invalid;
     case TypeSpec::Kind::Invalid:
         return Type::Invalid;
     }
@@ -72,6 +97,10 @@ std::string type_name(const TypeSpec& type) {
             return "pair<" + type_name(*type.left) + ", " + type_name(*type.right) + ">";
         }
         return "pair";
+    case TypeSpec::Kind::Named:
+        return type.name;
+    case TypeSpec::Kind::Nil:
+        return "nil";
     case TypeSpec::Kind::Invalid:
         return "invalid";
     }
@@ -88,6 +117,12 @@ TypeSpec join_types(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs == rhs) {
         return lhs;
     }
+    if (lhs.kind == TypeSpec::Kind::Nil && is_pair(rhs)) {
+        return rhs;
+    }
+    if (rhs.kind == TypeSpec::Kind::Nil && is_pair(lhs)) {
+        return lhs;
+    }
     if (is_pair(lhs) && is_pair(rhs)) {
         return pair_type();
     }
@@ -102,12 +137,23 @@ public:
 
     std::optional<Program> parse() {
         Program program;
-        while (match(TokenKind::Fn)) {
-            auto declaration = parse_function(previous());
-            if (declaration.has_value()) {
-                program.functions.push_back(std::move(*declaration));
+        while (check(TokenKind::Type) || check(TokenKind::Fn)) {
+            if (match(TokenKind::Type)) {
+                auto declaration = parse_type_declaration(previous());
+                if (declaration.has_value()) {
+                    program.types.push_back(std::move(*declaration));
+                } else {
+                    synchronize();
+                }
+            } else if (match(TokenKind::Fn)) {
+                auto declaration = parse_function(previous());
+                if (declaration.has_value()) {
+                    program.functions.push_back(std::move(*declaration));
+                } else {
+                    synchronize();
+                }
             } else {
-                synchronize();
+                break;
             }
         }
 
@@ -168,6 +214,22 @@ private:
         }
         add_diagnostic(diagnostics_, peek().position, message);
         return std::nullopt;
+    }
+
+    std::optional<TypeDecl> parse_type_declaration(const Token& type_token) {
+        TypeDecl declaration;
+        declaration.position = type_token.position;
+
+        const auto name = expect(TokenKind::Identifier, "expected type name after 'type'");
+        if (name.has_value()) {
+            declaration.name = name->text;
+            declaration.position = name->position;
+        }
+        expect(TokenKind::Equal, "expected '=' in type declaration");
+        declaration.body_position = peek().position;
+        declaration.body = parse_type();
+        expect(TokenKind::Semicolon, "expected ';' after type declaration");
+        return declaration;
     }
 
     std::optional<FunctionDecl> parse_function(const Token& fn_token) {
@@ -280,23 +342,35 @@ private:
 
     TypeSpec parse_type() {
         if (match(TokenKind::I64)) {
-            return int64_type();
+            auto type = int64_type();
+            type.position = previous().position;
+            return type;
         }
         if (match(TokenKind::Bool)) {
-            return bool_type();
+            auto type = bool_type();
+            type.position = previous().position;
+            return type;
         }
         if (match(TokenKind::Pair)) {
+            const auto position = previous().position;
             if (match(TokenKind::Less)) {
                 auto left = parse_type();
                 expect(TokenKind::Comma, "expected ',' between pair field types");
                 auto right = parse_type();
                 expect(TokenKind::Greater, "expected '>' after pair field types");
-                return pair_type(std::move(left), std::move(right));
+                auto type = pair_type(std::move(left), std::move(right));
+                type.position = position;
+                return type;
             }
-            return pair_type();
+            auto type = pair_type();
+            type.position = position;
+            return type;
+        }
+        if (match(TokenKind::Identifier)) {
+            return named_type(previous().text, previous().position);
         }
         add_diagnostic(diagnostics_, peek().position,
-                       "expected type 'i64', 'bool', or 'pair'");
+                       "expected type 'i64', 'bool', 'pair', or named type");
         return invalid_type();
     }
 
@@ -461,6 +535,21 @@ private:
             node->bool_value = previous().kind == TokenKind::True;
             return node;
         }
+        if (match(TokenKind::Nil)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::NilLiteral;
+            node->position = previous().position;
+            return node;
+        }
+        if (match(TokenKind::IsNil)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::IsNil;
+            node->position = previous().position;
+            expect(TokenKind::LParen, "expected '(' after 'is_nil'");
+            node->receiver = parse_expression();
+            expect(TokenKind::RParen, "expected ')' after is_nil operand");
+            return node;
+        }
         if (match(TokenKind::Identifier)) {
             auto node = std::make_unique<Expr>();
             node->kind = Expr::Kind::Variable;
@@ -502,7 +591,8 @@ private:
             if (current_ > 0 && previous().kind == TokenKind::Semicolon) {
                 return;
             }
-            if (check(TokenKind::Fn) || check(TokenKind::Let) || check(TokenKind::If) ||
+            if (check(TokenKind::Type) || check(TokenKind::Fn) ||
+                check(TokenKind::Let) || check(TokenKind::If) ||
                 check(TokenKind::While) || check(TokenKind::RBrace)) {
                 return;
             }
