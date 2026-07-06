@@ -24,7 +24,9 @@ public:
     [[nodiscard]] gc::Heap& heap() { return heap_; }
 
 private:
-    void collect_at_instruction_boundary_if_needed();
+    void collect_at_instruction_boundary_if_needed(const VerificationResult& verification,
+                                                   std::size_t pc);
+    void assert_stack_matches_map(const VerificationResult& verification, std::size_t pc) const;
     Value pop();
     void push(Value value);
     std::vector<Value> stack_;

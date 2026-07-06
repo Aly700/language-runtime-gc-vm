@@ -30,6 +30,11 @@ public:
         return payload_;
     }
 
+    [[nodiscard]] bool as_bool() const {
+        if (tag_ != Tag::Bool) throw std::logic_error("value is not bool");
+        return payload_ != 0;
+    }
+
     [[nodiscard]] ObjectId as_object() const {
         if (tag_ != Tag::Object) throw std::logic_error("value is not object");
         return static_cast<ObjectId>(payload_);

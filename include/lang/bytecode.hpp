@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace lang {
@@ -8,9 +9,16 @@ namespace lang {
 enum class OpCode {
     ConstantI64,
     AddI64,
+    LessI64,
     AllocPair,
+    GetLeft,
+    GetRight,
+    SetLeft,
+    SetRight,
     LoadLocal,
     StoreLocal,
+    Jump,
+    JumpIfFalse,
     Collect,
     Return,
 };
@@ -32,6 +40,11 @@ struct Function {
     std::uint32_t local_count{0};
 };
 
+struct VerificationResult {
+    std::vector<StackMap> stack_maps;
+};
+
+std::optional<VerificationResult> verify_with_stack_maps(const Function& function);
 bool verify(const Function& function);
 
 } // namespace lang

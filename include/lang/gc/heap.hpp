@@ -45,16 +45,22 @@ public:
 
     [[nodiscard]] const Object& object(ObjectId id) const;
     [[nodiscard]] Object& object(ObjectId id);
+    [[nodiscard]] Value left(ObjectId id) const;
+    [[nodiscard]] Value right(ObjectId id) const;
+    void set_left(ObjectId id, Value value);
+    void set_right(ObjectId id, Value value);
     [[nodiscard]] std::size_t live_count() const;
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
 
 private:
     class MarkingVisitor;
+    enum class PairField { Left, Right };
 
     ObjectId allocate_slot(Value left, Value right);
     [[nodiscard]] std::size_t checked_slot(ObjectId id) const;
     void collect_with_extra_roots(std::span<Value*> extra_roots);
+    void store_pair_field(ObjectId id, PairField field, Value value);
     void mark_value(Value value);
     void mark_object(ObjectId id);
     void sweep();

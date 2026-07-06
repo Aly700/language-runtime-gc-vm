@@ -18,12 +18,26 @@ const char* op_name(lang::OpCode op) {
         return "ConstantI64";
     case lang::OpCode::AddI64:
         return "AddI64";
+    case lang::OpCode::LessI64:
+        return "LessI64";
     case lang::OpCode::AllocPair:
         return "AllocPair";
+    case lang::OpCode::GetLeft:
+        return "GetLeft";
+    case lang::OpCode::GetRight:
+        return "GetRight";
+    case lang::OpCode::SetLeft:
+        return "SetLeft";
+    case lang::OpCode::SetRight:
+        return "SetRight";
     case lang::OpCode::LoadLocal:
         return "LoadLocal";
     case lang::OpCode::StoreLocal:
         return "StoreLocal";
+    case lang::OpCode::Jump:
+        return "Jump";
+    case lang::OpCode::JumpIfFalse:
+        return "JumpIfFalse";
     case lang::OpCode::Collect:
         return "Collect";
     case lang::OpCode::Return:

@@ -98,6 +98,34 @@ Object& Heap::object(ObjectId id) {
     return *objects_[checked_slot(id)];
 }
 
+Value Heap::left(ObjectId id) const {
+    return object(id).left;
+}
+
+Value Heap::right(ObjectId id) const {
+    return object(id).right;
+}
+
+void Heap::set_left(ObjectId id, Value value) {
+    store_pair_field(id, PairField::Left, value);
+}
+
+void Heap::set_right(ObjectId id, Value value) {
+    store_pair_field(id, PairField::Right, value);
+}
+
+void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
+    // Barrier hook: every pair field mutation flows through this method. A future
+    // generational collector should run its old-to-young write barrier here before
+    // publishing the new field value.
+    auto& obj = object(id);
+    if (field == PairField::Left) {
+        obj.left = value;
+    } else {
+        obj.right = value;
+    }
+}
+
 void Heap::mark_value(Value value) {
     if (value.is_object()) {
         mark_object(value.as_object());
