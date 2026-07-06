@@ -1,21 +1,39 @@
 #pragma once
 
+#include "lang/bytecode.hpp"
+
+#include <cstddef>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace lang::frontend {
 
-enum class Type { Int64, Bool, Pair, Nil };
+enum class Type { Int64, Bool, Pair, Invalid };
+
+struct SourcePosition {
+    std::size_t offset{0};
+    std::size_t line{1};
+    std::size_t column{1};
+};
 
 struct Diagnostic {
+    SourcePosition position;
     std::string message;
 };
 
-struct TypeCheckResult {
-    bool ok{true};
+struct CompileResult {
+    std::optional<Function> function;
+    Type result_type{Type::Invalid};
     std::vector<Diagnostic> diagnostics;
+
+    [[nodiscard]] bool ok() const {
+        return function.has_value() && diagnostics.empty();
+    }
 };
 
-TypeCheckResult type_check_placeholder(const std::string& source);
+[[nodiscard]] const char* type_name(Type type);
+[[nodiscard]] CompileResult compile_program(std::string_view source);
 
 } // namespace lang::frontend
