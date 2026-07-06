@@ -20,3 +20,8 @@ Phase-1 implementation details:
 - `VM` owns instruction-count stress. For `collect_every_n_instructions = N`, collection
   runs at bytecode boundaries after N, 2N, 3N, ... instructions have executed and before
   the next instruction starts.
+- Phase-2 pair field mutation does not add a new stress trigger. All mutation programs are
+  still exercised by the existing before/after-allocation and instruction-boundary modes;
+  `Heap::store_pair_field` is the documented hook for the future write-barrier trigger.
+- VM-controlled collection points assert, in debug builds, that the generated verifier stack
+  map for the current pc agrees with the runtime stack's object tags before collecting.
