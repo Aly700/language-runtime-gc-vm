@@ -9,7 +9,12 @@ add_library(lang_runtime
     src/bytecode.cpp
     src/gc/heap.cpp
     src/vm.cpp
+    src/frontend/compiler.cpp
+    src/frontend/diagnostics.cpp
+    src/frontend/lexer.cpp
+    src/frontend/parser.cpp
     src/frontend/type_checker.cpp
+    src/frontend/type_checker_internal.cpp
 )
 target_include_directories(lang_runtime PUBLIC include)
 target_compile_options(lang_runtime PRIVATE -Wall -Wextra -Wpedantic)
