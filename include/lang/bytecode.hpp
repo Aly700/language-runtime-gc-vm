@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 namespace lang {
@@ -37,9 +39,35 @@ enum class ValueKind {
     Nil,
 };
 
+struct SignatureValue {
+    ValueKind kind{ValueKind::Nil};
+    std::shared_ptr<SignatureValue> left;
+    std::shared_ptr<SignatureValue> right;
+
+    [[nodiscard]] bool has_pair_fields() const {
+        return kind == ValueKind::Object && left != nullptr && right != nullptr;
+    }
+};
+
+inline SignatureValue signature_value(ValueKind kind) {
+    SignatureValue value;
+    value.kind = kind;
+    return value;
+}
+
+inline SignatureValue pair_signature(SignatureValue left, SignatureValue right) {
+    SignatureValue value;
+    value.kind = ValueKind::Object;
+    value.left = std::make_shared<SignatureValue>(std::move(left));
+    value.right = std::make_shared<SignatureValue>(std::move(right));
+    return value;
+}
+
 struct FunctionSignature {
     std::vector<ValueKind> parameters;
     ValueKind return_type{ValueKind::Int64};
+    std::vector<SignatureValue> parameter_types;
+    std::optional<SignatureValue> return_type_detail;
 };
 
 struct StackMap {

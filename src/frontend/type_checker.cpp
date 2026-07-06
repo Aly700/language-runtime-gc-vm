@@ -35,6 +35,7 @@ enum class TokenKind {
     Right,
     Plus,
     Less,
+    Greater,
     Equal,
     Arrow,
     Colon,
@@ -103,6 +104,9 @@ public:
                 break;
             case '<':
                 tokens.push_back(simple(TokenKind::Less, start, "<"));
+                break;
+            case '>':
+                tokens.push_back(simple(TokenKind::Greater, start, ">"));
                 break;
             case '=':
                 tokens.push_back(simple(TokenKind::Equal, start, "="));
@@ -258,6 +262,108 @@ private:
     std::vector<Diagnostic> diagnostics_;
 };
 
+struct TypeSpec {
+    enum class Kind {
+        Int64,
+        Bool,
+        Pair,
+        Invalid,
+    };
+
+    Kind kind{Kind::Invalid};
+    std::shared_ptr<TypeSpec> left;
+    std::shared_ptr<TypeSpec> right;
+
+    [[nodiscard]] bool has_pair_fields() const {
+        return kind == Kind::Pair && left != nullptr && right != nullptr;
+    }
+};
+
+TypeSpec int64_type() { return TypeSpec{TypeSpec::Kind::Int64, nullptr, nullptr}; }
+TypeSpec bool_type() { return TypeSpec{TypeSpec::Kind::Bool, nullptr, nullptr}; }
+TypeSpec pair_type() { return TypeSpec{TypeSpec::Kind::Pair, nullptr, nullptr}; }
+TypeSpec invalid_type() { return TypeSpec{TypeSpec::Kind::Invalid, nullptr, nullptr}; }
+
+TypeSpec pair_type(TypeSpec left, TypeSpec right) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Pair;
+    type.left = std::make_shared<TypeSpec>(std::move(left));
+    type.right = std::make_shared<TypeSpec>(std::move(right));
+    return type;
+}
+
+bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
+    if (lhs.kind != rhs.kind) {
+        return false;
+    }
+    if (!lhs.has_pair_fields() && !rhs.has_pair_fields()) {
+        return true;
+    }
+    if (lhs.has_pair_fields() != rhs.has_pair_fields()) {
+        return false;
+    }
+    return *lhs.left == *rhs.left && *lhs.right == *rhs.right;
+}
+
+bool operator!=(const TypeSpec& lhs, const TypeSpec& rhs) {
+    return !(lhs == rhs);
+}
+
+bool is_invalid(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Invalid;
+}
+
+bool is_pair(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Pair;
+}
+
+Type public_type(const TypeSpec& type) {
+    switch (type.kind) {
+    case TypeSpec::Kind::Int64:
+        return Type::Int64;
+    case TypeSpec::Kind::Bool:
+        return Type::Bool;
+    case TypeSpec::Kind::Pair:
+        return Type::Pair;
+    case TypeSpec::Kind::Invalid:
+        return Type::Invalid;
+    }
+    return Type::Invalid;
+}
+
+std::string type_name(const TypeSpec& type) {
+    switch (type.kind) {
+    case TypeSpec::Kind::Int64:
+        return "i64";
+    case TypeSpec::Kind::Bool:
+        return "bool";
+    case TypeSpec::Kind::Pair:
+        if (type.has_pair_fields()) {
+            return "pair<" + type_name(*type.left) + ", " + type_name(*type.right) + ">";
+        }
+        return "pair";
+    case TypeSpec::Kind::Invalid:
+        return "invalid";
+    }
+    return "invalid";
+}
+
+TypeSpec join_types(const TypeSpec& lhs, const TypeSpec& rhs) {
+    if (is_invalid(lhs)) {
+        return rhs;
+    }
+    if (is_invalid(rhs)) {
+        return lhs;
+    }
+    if (lhs == rhs) {
+        return lhs;
+    }
+    if (is_pair(lhs) && is_pair(rhs)) {
+        return pair_type();
+    }
+    return invalid_type();
+}
+
 struct Expr {
     enum class Kind {
         IntLiteral,
@@ -282,7 +388,7 @@ struct Expr {
     std::unique_ptr<Expr> right;
     std::unique_ptr<Expr> receiver;
     std::vector<std::unique_ptr<Expr>> arguments;
-    Type inferred_type{Type::Invalid};
+    TypeSpec inferred_type{invalid_type()};
     std::set<std::size_t> object_sites;
     std::uint32_t local_index{0};
 };
@@ -290,7 +396,7 @@ struct Expr {
 struct Parameter {
     std::string name;
     SourcePosition position;
-    Type type{Type::Invalid};
+    TypeSpec type{invalid_type()};
     std::uint32_t local_index{0};
 };
 
@@ -318,7 +424,7 @@ struct Statement {
     SourcePosition position;
     SourcePosition equals_position;
     std::string name;
-    Type declared_type{Type::Invalid};
+    TypeSpec declared_type{invalid_type()};
     std::uint32_t local_index{0};
     std::unique_ptr<Expr> initializer;
     LValue target;
@@ -333,7 +439,7 @@ struct FunctionDecl {
     std::string name;
     SourcePosition position;
     std::vector<Parameter> parameters;
-    Type return_type{Type::Invalid};
+    TypeSpec return_type{invalid_type()};
     std::vector<Statement> statements;
     std::unique_ptr<Expr> result;
     std::size_t function_index{0};
@@ -530,18 +636,26 @@ private:
         return statement;
     }
 
-    Type parse_type() {
+    TypeSpec parse_type() {
         if (match(TokenKind::I64)) {
-            return Type::Int64;
+            return int64_type();
         }
         if (match(TokenKind::Bool)) {
-            return Type::Bool;
+            return bool_type();
         }
         if (match(TokenKind::Pair)) {
-            return Type::Pair;
+            if (match(TokenKind::Less)) {
+                auto left = parse_type();
+                expect(TokenKind::Comma, "expected ',' between pair field types");
+                auto right = parse_type();
+                expect(TokenKind::Greater, "expected '>' after pair field types");
+                return pair_type(std::move(left), std::move(right));
+            }
+            return pair_type();
         }
-        add_diagnostic(diagnostics_, peek().position, "expected type 'i64', 'bool', or 'pair'");
-        return Type::Invalid;
+        add_diagnostic(diagnostics_, peek().position,
+                       "expected type 'i64', 'bool', or 'pair'");
+        return invalid_type();
     }
 
     std::optional<Statement> parse_assignment() {
@@ -734,7 +848,7 @@ private:
         auto node = std::make_unique<Expr>();
         node->kind = Expr::Kind::IntLiteral;
         node->position = peek().position;
-        node->inferred_type = Type::Invalid;
+        node->inferred_type = invalid_type();
         if (!at_end()) {
             ++current_;
         }
@@ -761,7 +875,7 @@ private:
 };
 
 struct TypedValue {
-    Type type{Type::Invalid};
+    TypeSpec type{invalid_type()};
     std::set<std::size_t> object_sites;
 };
 
@@ -772,7 +886,7 @@ struct FieldState {
 
 struct LocalState {
     std::string name;
-    Type declared_type{Type::Invalid};
+    TypeSpec declared_type{invalid_type()};
     std::uint32_t index{0};
     bool initialized{false};
     TypedValue value;
@@ -802,35 +916,44 @@ bool operator==(const FlowState& lhs, const FlowState& rhs) {
     return lhs.locals == rhs.locals && lhs.fields_by_site == rhs.fields_by_site;
 }
 
-TypedValue invalid_value() { return TypedValue{Type::Invalid, {}}; }
-TypedValue scalar_value(Type type) { return TypedValue{type, {}}; }
+TypedValue invalid_value() { return TypedValue{invalid_type(), {}}; }
+TypedValue scalar_value(TypeSpec type) { return TypedValue{std::move(type), {}}; }
 
-TypedValue pair_value(std::size_t site) {
+TypedValue pair_value(TypeSpec type, std::size_t site) {
     TypedValue value;
-    value.type = Type::Pair;
+    value.type = std::move(type);
     value.object_sites.insert(site);
     return value;
 }
 
-TypedValue value_from_type(Type type) {
-    if (type == Type::Pair) {
-        return TypedValue{Type::Pair, {}};
+TypedValue value_from_type(TypeSpec type) {
+    return TypedValue{std::move(type), {}};
+}
+
+TypedValue value_as_declared_type(const TypedValue& value, TypeSpec declared_type) {
+    TypedValue coerced;
+    coerced.type = std::move(declared_type);
+    if (is_pair(coerced.type)) {
+        coerced.object_sites = value.object_sites;
     }
-    return scalar_value(type);
+    return coerced;
 }
 
 TypedValue join_values(const TypedValue& lhs, const TypedValue& rhs) {
-    if (lhs.type == Type::Invalid) {
+    if (is_invalid(lhs.type)) {
         return rhs;
     }
-    if (rhs.type == Type::Invalid) {
+    if (is_invalid(rhs.type)) {
         return lhs;
     }
-    if (lhs.type != rhs.type) {
+    const auto joined_type = join_types(lhs.type, rhs.type);
+    if (is_invalid(joined_type)) {
         return invalid_value();
     }
-    TypedValue result = lhs;
-    if (result.type == Type::Pair) {
+    TypedValue result;
+    result.type = joined_type;
+    if (is_pair(result.type)) {
+        result.object_sites = lhs.object_sites;
         result.object_sites.insert(rhs.object_sites.begin(), rhs.object_sites.end());
     }
     return result;
@@ -867,8 +990,8 @@ struct FunctionSymbol {
     std::string name;
     SourcePosition position;
     std::size_t index{0};
-    std::vector<Type> parameters;
-    Type return_type{Type::Invalid};
+    std::vector<TypeSpec> parameters;
+    TypeSpec return_type{invalid_type()};
 };
 
 class TypeChecker {
@@ -877,7 +1000,7 @@ public:
         state_.fields_by_site.resize(pair_site_count_);
     }
 
-    Type check(Program& program) {
+    TypeSpec check(Program& program) {
         collect_function_symbols(program);
         for (auto& function : program.functions) {
             check_function(function);
@@ -951,10 +1074,11 @@ private:
             check_statement(statement, state, true);
         }
         const auto result = check_expr(*function.result, state);
-        if (result.type != Type::Invalid && result.type != function.return_type) {
+        if (!is_invalid(result.type) &&
+            !value_conforms_to_type(result, function.return_type, state)) {
             diagnose(function.result->position,
                      "function '" + function.name + "' returns " +
-                         std::string(type_name(result.type)) + " but is declared " +
+                         type_name(result.type) + " but is declared " +
                          type_name(function.return_type));
         }
         function.local_count = static_cast<std::uint32_t>(state.locals.size());
@@ -1000,6 +1124,64 @@ private:
         add_diagnostic(diagnostics_, position, std::move(message));
     }
 
+    std::optional<TypedValue> try_load_field(const TypedValue& receiver,
+                                             const std::string& field,
+                                             const FlowState& state) const {
+        if (!is_pair(receiver.type)) {
+            return std::nullopt;
+        }
+
+        std::optional<TypedValue> loaded;
+        if (receiver.type.has_pair_fields()) {
+            const auto& field_type = field == "left" ? *receiver.type.left
+                                                     : *receiver.type.right;
+            loaded = value_from_type(field_type);
+        }
+
+        for (const auto site : receiver.object_sites) {
+            if (site >= state.fields_by_site.size() ||
+                !state.fields_by_site[site].has_value()) {
+                return std::nullopt;
+            }
+            const auto& fields = *state.fields_by_site[site];
+            const auto& value = field == "left" ? fields.left : fields.right;
+            if (!loaded.has_value()) {
+                loaded = value;
+            } else {
+                loaded = join_values(*loaded, value);
+            }
+        }
+
+        if (!loaded.has_value() || is_invalid(loaded->type)) {
+            return std::nullopt;
+        }
+        return loaded;
+    }
+
+    bool value_conforms_to_type(const TypedValue& value, const TypeSpec& target,
+                                const FlowState& state) const {
+        if (is_invalid(value.type) || is_invalid(target)) {
+            return false;
+        }
+        if (target.kind == TypeSpec::Kind::Int64 || target.kind == TypeSpec::Kind::Bool) {
+            return value.type == target;
+        }
+        if (!is_pair(value.type)) {
+            return false;
+        }
+        if (!target.has_pair_fields()) {
+            return true;
+        }
+
+        const auto left = try_load_field(value, "left", state);
+        const auto right = try_load_field(value, "right", state);
+        if (!left.has_value() || !right.has_value()) {
+            return false;
+        }
+        return value_conforms_to_type(*left, *target.left, state) &&
+               value_conforms_to_type(*right, *target.right, state);
+    }
+
     void check_statement(Statement& statement, FlowState& state, bool allow_let) {
         switch (statement.kind) {
         case Statement::Kind::Let:
@@ -1029,11 +1211,11 @@ private:
         }
 
         const auto initializer = check_expr(*statement.initializer, state);
-        if (initializer.type != Type::Invalid &&
-            initializer.type != statement.declared_type) {
+        if (!is_invalid(initializer.type) &&
+            !value_conforms_to_type(initializer, statement.declared_type, state)) {
             diagnose(statement.equals_position,
                      "cannot initialize local '" + statement.name + "' of type " +
-                         std::string(type_name(statement.declared_type)) + " with " +
+                         type_name(statement.declared_type) + " with " +
                          type_name(initializer.type));
             return;
         }
@@ -1044,7 +1226,8 @@ private:
                                           statement.declared_type,
                                           index,
                                           true,
-                                          initializer,
+                                          value_as_declared_type(initializer,
+                                                                 statement.declared_type),
                                           statement.position});
     }
 
@@ -1058,36 +1241,37 @@ private:
                 return;
             }
             statement.target.local_index = local->index;
-            if (assigned.type != Type::Invalid && assigned.type != local->declared_type) {
+            if (!is_invalid(assigned.type) &&
+                !value_conforms_to_type(assigned, local->declared_type, state)) {
                 diagnose(statement.equals_position,
-                         "cannot assign " + std::string(type_name(assigned.type)) +
+                         "cannot assign " + type_name(assigned.type) +
                              " to local '" + local->name + "' of type " +
                              type_name(local->declared_type));
                 return;
             }
             local->initialized = true;
-            local->value = assigned;
+            local->value = value_as_declared_type(assigned, local->declared_type);
             return;
         }
 
         const auto receiver = check_lvalue_prefix(statement.target, state,
                                                  statement.target.fields.size() - 1);
         const auto& field = statement.target.fields.back();
-        if (receiver.type == Type::Invalid || assigned.type == Type::Invalid) {
+        if (is_invalid(receiver.type) || is_invalid(assigned.type)) {
             return;
         }
-        if (receiver.type != Type::Pair) {
+        if (!is_pair(receiver.type)) {
             diagnose(field.position, "field assignment requires pair");
             return;
         }
 
         auto existing = load_field(receiver, field.name, field.position, state);
-        if (existing.type == Type::Invalid) {
+        if (is_invalid(existing.type)) {
             return;
         }
-        if (existing.type != assigned.type) {
+        if (!value_conforms_to_type(assigned, existing.type, state)) {
             diagnose(statement.equals_position,
-                     "cannot assign " + std::string(type_name(assigned.type)) +
+                     "cannot assign " + type_name(assigned.type) +
                          " to field '" + field.name + "' of type " +
                          type_name(existing.type));
             return;
@@ -1098,7 +1282,7 @@ private:
 
     void check_if(Statement& statement, FlowState& state) {
         const auto condition = check_expr(*statement.condition, state);
-        if (condition.type != Type::Invalid && condition.type != Type::Bool) {
+        if (!is_invalid(condition.type) && condition.type != bool_type()) {
             diagnose(statement.condition->position, "if condition must be bool");
         }
 
@@ -1118,7 +1302,7 @@ private:
         for (std::size_t iteration = 0; iteration < max_loop_iterations(state); ++iteration) {
             auto body_input = head;
             const auto condition = check_expr(*statement.condition, body_input);
-            if (condition.type != Type::Invalid && condition.type != Type::Bool) {
+            if (!is_invalid(condition.type) && condition.type != bool_type()) {
                 diagnose(statement.condition->position, "while condition must be bool");
             }
 
@@ -1145,9 +1329,9 @@ private:
     TypedValue check_expr(Expr& expression, FlowState& state) {
         switch (expression.kind) {
         case Expr::Kind::IntLiteral:
-            return annotate(expression, scalar_value(Type::Int64));
+            return annotate(expression, scalar_value(int64_type()));
         case Expr::Kind::BoolLiteral:
-            return annotate(expression, scalar_value(Type::Bool));
+            return annotate(expression, scalar_value(bool_type()));
         case Expr::Kind::Variable:
             return check_variable(expression, state);
         case Expr::Kind::PairLiteral:
@@ -1201,27 +1385,28 @@ private:
         } else {
             slot = fields;
         }
-        return annotate(expression, pair_value(expression.pair_site));
+        const auto inferred_type = pair_type(left.type, right.type);
+        return annotate(expression, pair_value(inferred_type, expression.pair_site));
     }
 
     TypedValue check_binary(Expr& expression, FlowState& state) {
         const auto left = check_expr(*expression.left, state);
         const auto right = check_expr(*expression.right, state);
         if (expression.binary_op == '+') {
-            if ((left.type != Type::Invalid && left.type != Type::Int64) ||
-                (right.type != Type::Invalid && right.type != Type::Int64)) {
+            if ((!is_invalid(left.type) && left.type != int64_type()) ||
+                (!is_invalid(right.type) && right.type != int64_type())) {
                 diagnose(expression.operator_position, "operator '+' requires i64 operands");
                 return annotate(expression, invalid_value());
             }
-            return annotate(expression, scalar_value(Type::Int64));
+            return annotate(expression, scalar_value(int64_type()));
         }
         if (expression.binary_op == '<') {
-            if ((left.type != Type::Invalid && left.type != Type::Int64) ||
-                (right.type != Type::Invalid && right.type != Type::Int64)) {
+            if ((!is_invalid(left.type) && left.type != int64_type()) ||
+                (!is_invalid(right.type) && right.type != int64_type())) {
                 diagnose(expression.operator_position, "operator '<' requires i64 operands");
                 return annotate(expression, invalid_value());
             }
-            return annotate(expression, scalar_value(Type::Bool));
+            return annotate(expression, scalar_value(bool_type()));
         }
         diagnose(expression.operator_position, "unknown binary operator");
         return annotate(expression, invalid_value());
@@ -1258,11 +1443,11 @@ private:
 
         bool valid = true;
         for (std::size_t i = 0; i < arguments.size(); ++i) {
-            if (arguments[i].type == Type::Invalid) {
+            if (is_invalid(arguments[i].type)) {
                 valid = false;
                 continue;
             }
-            if (arguments[i].type != function->parameters[i]) {
+            if (!value_conforms_to_type(arguments[i], function->parameters[i], state)) {
                 diagnose(expression.arguments[i]->position,
                          "argument " + std::to_string(i + 1) + " of function '" +
                              expression.name + "' expects " +
@@ -1295,7 +1480,7 @@ private:
         for (std::size_t i = 0; i < field_count; ++i) {
             const auto& field = lvalue.fields[i];
             current = load_field(current, field.name, field.position, state);
-            if (current.type == Type::Invalid) {
+            if (is_invalid(current.type)) {
                 return current;
             }
         }
@@ -1304,40 +1489,19 @@ private:
 
     TypedValue load_field(const TypedValue& receiver, const std::string& field,
                           SourcePosition position, const FlowState& state) {
-        if (receiver.type == Type::Invalid) {
+        if (is_invalid(receiver.type)) {
             return invalid_value();
         }
-        if (receiver.type != Type::Pair) {
+        if (!is_pair(receiver.type)) {
             diagnose(position, "field access requires pair");
             return invalid_value();
         }
-        if (receiver.object_sites.empty()) {
+        const auto loaded_field = try_load_field(receiver, field, state);
+        if (!loaded_field.has_value()) {
             diagnose(position, "pair field type is unknown");
             return invalid_value();
         }
-
-        std::optional<TypedValue> loaded;
-        for (const auto site : receiver.object_sites) {
-            if (site >= state.fields_by_site.size() ||
-                !state.fields_by_site[site].has_value()) {
-                diagnose(position, "pair field type is unknown");
-                return invalid_value();
-            }
-            const auto& fields = *state.fields_by_site[site];
-            const auto& value = field == "left" ? fields.left : fields.right;
-            if (!loaded.has_value()) {
-                loaded = value;
-            } else {
-                loaded = join_values(*loaded, value);
-            }
-        }
-        if (!loaded.has_value() || loaded->type == Type::Invalid) {
-            diagnose(position,
-                     "field '" + field +
-                         "' has incompatible types across possible pair values");
-            return invalid_value();
-        }
-        return *loaded;
+        return *loaded_field;
     }
 
     void store_field(const TypedValue& receiver, const std::string& field,
@@ -1360,28 +1524,41 @@ private:
     std::vector<Diagnostic> diagnostics_;
 };
 
-ValueKind bytecode_kind(Type type) {
-    switch (type) {
-    case Type::Int64:
+ValueKind bytecode_kind(const TypeSpec& type) {
+    switch (type.kind) {
+    case TypeSpec::Kind::Int64:
         return ValueKind::Int64;
-    case Type::Bool:
+    case TypeSpec::Kind::Bool:
         return ValueKind::Bool;
-    case Type::Pair:
+    case TypeSpec::Kind::Pair:
         return ValueKind::Object;
-    case Type::Invalid:
+    case TypeSpec::Kind::Invalid:
         return ValueKind::Nil;
     }
     return ValueKind::Nil;
 }
 
+SignatureValue signature_value_from_type(const TypeSpec& type) {
+    if (type.has_pair_fields()) {
+        return pair_signature(signature_value_from_type(*type.left),
+                              signature_value_from_type(*type.right));
+    }
+    return signature_value(bytecode_kind(type));
+}
+
 FunctionSignature signature_from_types(const std::vector<Parameter>& parameters,
-                                       Type return_type) {
+                                       const TypeSpec& return_type) {
     FunctionSignature signature;
     signature.parameters.reserve(parameters.size());
+    signature.parameter_types.reserve(parameters.size());
     for (const auto& parameter : parameters) {
         signature.parameters.push_back(bytecode_kind(parameter.type));
+        signature.parameter_types.push_back(signature_value_from_type(parameter.type));
     }
     signature.return_type = bytecode_kind(return_type);
+    signature.return_type_detail = signature_value_from_type(return_type);
+    assert(signature.parameter_types.size() == signature.parameters.size());
+    assert(signature.return_type_detail->kind == signature.return_type);
     return signature;
 }
 
@@ -1580,9 +1757,10 @@ CompileResult compile_program(std::string_view source) {
 
     TypeChecker checker(program->pair_site_count);
     const auto result_type = checker.check(*program);
+    const auto coarse_result_type = public_type(result_type);
     if (!checker.diagnostics().empty()) {
         CompileResult result;
-        result.result_type = result_type;
+        result.result_type = coarse_result_type;
         result.diagnostics = std::vector<Diagnostic>(checker.diagnostics().begin(),
                                                      checker.diagnostics().end());
         return result;
@@ -1594,6 +1772,7 @@ CompileResult compile_program(std::string_view source) {
 
     FunctionSignature entry_signature;
     entry_signature.return_type = bytecode_kind(result_type);
+    entry_signature.return_type_detail = signature_value_from_type(result_type);
     Compiler entry_compiler(program->entry_local_count, std::move(entry_signature));
     module.functions.push_back(entry_compiler.compile(program->statements, *program->result));
 
@@ -1610,7 +1789,7 @@ CompileResult compile_program(std::string_view source) {
            "compiler bug: type-checked source emitted verifier-rejected module");
     if (!verification.has_value()) {
         CompileResult result;
-        result.result_type = result_type;
+        result.result_type = coarse_result_type;
         result.diagnostics = {
             Diagnostic{SourcePosition{}, "compiler emitted verifier-rejected module"}};
         return result;
@@ -1623,7 +1802,7 @@ CompileResult compile_program(std::string_view source) {
            "compiler bug: verifier-generated stack maps did not round-trip");
 
     CompileResult result;
-    result.result_type = result_type;
+    result.result_type = coarse_result_type;
     result.module = std::move(module);
     result.function = result.module->functions.at(result.module->entry_function);
     return result;

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <utility>
@@ -21,9 +22,13 @@ enum class AbstractKind {
     Poison,
 };
 
+struct PairFields;
+
 struct AbstractValue {
     AbstractKind kind{AbstractKind::Poison};
     std::set<std::size_t> object_sites;
+    bool includes_opaque_object{false};
+    std::shared_ptr<const PairFields> signature_fields;
 };
 
 struct PairFields {
@@ -43,14 +48,32 @@ enum class JoinOutcome {
     Invalid,
 };
 
-AbstractValue int64_value() { return {AbstractKind::Int64, {}}; }
-AbstractValue bool_value() { return {AbstractKind::Bool, {}}; }
+AbstractValue value_with_kind(AbstractKind kind) {
+    AbstractValue value;
+    value.kind = kind;
+    return value;
+}
+
+AbstractValue int64_value() { return value_with_kind(AbstractKind::Int64); }
+AbstractValue bool_value() { return value_with_kind(AbstractKind::Bool); }
+AbstractValue poison_value() { return value_with_kind(AbstractKind::Poison); }
 
 AbstractValue object_value(std::size_t site) {
     AbstractValue value;
     value.kind = AbstractKind::Object;
     value.object_sites.insert(site);
     return value;
+}
+
+AbstractValue opaque_object_value() {
+    AbstractValue value;
+    value.kind = AbstractKind::Object;
+    value.includes_opaque_object = true;
+    return value;
+}
+
+std::shared_ptr<const PairFields> fields_ptr(PairFields fields) {
+    return std::make_shared<const PairFields>(std::move(fields));
 }
 
 AbstractKind abstract_kind(ValueKind kind) {
@@ -68,13 +91,89 @@ AbstractKind abstract_kind(ValueKind kind) {
 }
 
 AbstractValue value_from_signature(ValueKind kind) {
-    AbstractValue value;
-    value.kind = abstract_kind(kind);
-    return value;
+    if (kind == ValueKind::Object) {
+        return opaque_object_value();
+    }
+    return value_with_kind(abstract_kind(kind));
 }
 
+AbstractValue value_from_signature(const SignatureValue& signature) {
+    if (signature.has_pair_fields()) {
+        AbstractValue value;
+        value.kind = AbstractKind::Object;
+        value.signature_fields = fields_ptr(PairFields{
+            value_from_signature(*signature.left),
+            value_from_signature(*signature.right),
+        });
+        return value;
+    }
+    return value_from_signature(signature.kind);
+}
+
+SignatureValue parameter_signature(const FunctionSignature& signature,
+                                   std::size_t index) {
+    if (signature.parameter_types.empty()) {
+        return signature_value(signature.parameters[index]);
+    }
+    return signature.parameter_types[index];
+}
+
+SignatureValue return_signature(const FunctionSignature& signature) {
+    if (signature.return_type_detail.has_value()) {
+        return *signature.return_type_detail;
+    }
+    return signature_value(signature.return_type);
+}
+
+bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kind) {
+    if (signature.kind != kind) {
+        return false;
+    }
+    if (signature.has_pair_fields()) {
+        return signature_shape_matches_kind(*signature.left, signature.left->kind) &&
+               signature_shape_matches_kind(*signature.right, signature.right->kind);
+    }
+    return signature.left == nullptr && signature.right == nullptr;
+}
+
+bool signature_is_well_formed(const FunctionSignature& signature) {
+    if (!signature.parameter_types.empty() &&
+        signature.parameter_types.size() != signature.parameters.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < signature.parameter_types.size(); ++i) {
+        if (!signature_shape_matches_kind(signature.parameter_types[i],
+                                          signature.parameters[i])) {
+            return false;
+        }
+    }
+    if (signature.return_type_detail.has_value() &&
+        !signature_shape_matches_kind(*signature.return_type_detail,
+                                      signature.return_type)) {
+        return false;
+    }
+    return true;
+}
+
+bool fields_equal(const std::shared_ptr<const PairFields>& lhs,
+                  const std::shared_ptr<const PairFields>& rhs);
+
 bool operator==(const AbstractValue& lhs, const AbstractValue& rhs) {
-    return lhs.kind == rhs.kind && lhs.object_sites == rhs.object_sites;
+    return lhs.kind == rhs.kind && lhs.object_sites == rhs.object_sites &&
+           lhs.includes_opaque_object == rhs.includes_opaque_object &&
+           fields_equal(lhs.signature_fields, rhs.signature_fields);
+}
+
+bool operator==(const PairFields& lhs, const PairFields& rhs) {
+    return lhs.left == rhs.left && lhs.right == rhs.right;
+}
+
+bool fields_equal(const std::shared_ptr<const PairFields>& lhs,
+                  const std::shared_ptr<const PairFields>& rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return lhs == rhs;
+    }
+    return *lhs == *rhs;
 }
 
 bool is_valid_local_index(std::int64_t operand, std::uint32_t local_count) {
@@ -91,12 +190,24 @@ bool is_poison(const AbstractValue& value) {
 
 AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
     if (lhs.kind != rhs.kind || is_poison(lhs) || is_poison(rhs)) {
-        return {AbstractKind::Poison, {}};
+        return poison_value();
     }
 
     AbstractValue joined = lhs;
     if (joined.kind == AbstractKind::Object) {
         joined.object_sites.insert(rhs.object_sites.begin(), rhs.object_sites.end());
+        joined.includes_opaque_object =
+            lhs.includes_opaque_object || rhs.includes_opaque_object;
+        if (lhs.signature_fields != nullptr && rhs.signature_fields != nullptr) {
+            joined.signature_fields = fields_ptr(PairFields{
+                join_values(lhs.signature_fields->left, rhs.signature_fields->left),
+                join_values(lhs.signature_fields->right, rhs.signature_fields->right),
+            });
+        } else if (lhs.signature_fields != nullptr) {
+            joined.signature_fields = lhs.signature_fields;
+        } else {
+            joined.signature_fields = rhs.signature_fields;
+        }
     }
     return joined;
 }
@@ -225,7 +336,15 @@ bool push_fallthrough(std::size_t pc, std::size_t code_size, const AbstractState
 
 bool load_pair_field(const AbstractState& state, const AbstractValue& receiver, bool left,
                      AbstractValue& out) {
+    if (receiver.includes_opaque_object) {
+        return false;
+    }
+
     std::optional<AbstractValue> loaded;
+    if (receiver.signature_fields != nullptr) {
+        loaded = left ? receiver.signature_fields->left : receiver.signature_fields->right;
+    }
+
     for (const auto site : receiver.object_sites) {
         const auto it = state.fields_by_site.find(site);
         if (it == state.fields_by_site.end()) {
@@ -245,8 +364,48 @@ bool load_pair_field(const AbstractState& state, const AbstractValue& receiver, 
     return true;
 }
 
+bool value_conforms_to_expected(const AbstractState& state, const AbstractValue& value,
+                                const AbstractValue& expected);
+
+bool value_conforms_to_signature(const AbstractState& state, const AbstractValue& value,
+                                 const SignatureValue& signature) {
+    return value_conforms_to_expected(state, value, value_from_signature(signature));
+}
+
+bool value_conforms_to_expected(const AbstractState& state, const AbstractValue& value,
+                                const AbstractValue& expected) {
+    if (is_poison(value) || is_poison(expected) || value.kind != expected.kind) {
+        return false;
+    }
+    if (expected.kind != AbstractKind::Object) {
+        return true;
+    }
+    if (expected.signature_fields == nullptr) {
+        return true;
+    }
+
+    AbstractValue value_left;
+    AbstractValue value_right;
+    return load_pair_field(state, value, true, value_left) &&
+           load_pair_field(state, value, false, value_right) &&
+           value_conforms_to_expected(state, value_left, expected.signature_fields->left) &&
+           value_conforms_to_expected(state, value_right, expected.signature_fields->right);
+}
+
 bool store_pair_field(AbstractState& state, const AbstractValue& receiver, bool left,
                       const AbstractValue& value) {
+    if (receiver.includes_opaque_object && receiver.signature_fields != nullptr) {
+        return false;
+    }
+
+    if (receiver.signature_fields != nullptr) {
+        const auto& expected =
+            left ? receiver.signature_fields->left : receiver.signature_fields->right;
+        if (!value_conforms_to_expected(state, value, expected)) {
+            return false;
+        }
+    }
+
     for (const auto site : receiver.object_sites) {
         const auto it = state.fields_by_site.find(site);
         if (it == state.fields_by_site.end()) {
@@ -255,7 +414,8 @@ bool store_pair_field(AbstractState& state, const AbstractValue& receiver, bool 
         auto& field = left ? it->second.left : it->second.right;
         (void)join_value_into(field, value);
     }
-    return true;
+    return receiver.signature_fields != nullptr || !receiver.object_sites.empty() ||
+           receiver.includes_opaque_object;
 }
 
 bool transfer_instruction(const Module& module, std::size_t function_index, std::size_t pc,
@@ -364,17 +524,24 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         const auto& callee =
             module.functions[static_cast<std::size_t>(ins.operand)].signature;
         for (std::size_t i = callee.parameters.size(); i > 0; --i) {
-            if (!pop_expect_signature_kind(state, callee.parameters[i - 1])) {
+            AbstractValue argument;
+            const auto parameter_index = i - 1;
+            if (!pop_expect_signature_kind(state, callee.parameters[parameter_index],
+                                           &argument) ||
+                !value_conforms_to_signature(state, argument,
+                                             parameter_signature(callee,
+                                                                 parameter_index))) {
                 return false;
             }
         }
-        state.stack.push_back(value_from_signature(callee.return_type));
+        state.stack.push_back(value_from_signature(return_signature(callee)));
         return push_fallthrough(pc, function.code.size(), state, successors);
     }
     case OpCode::Return: {
         AbstractValue returned;
         return pop_any(state, &returned) &&
-               returned.kind == abstract_kind(function.signature.return_type);
+               value_conforms_to_signature(state, returned,
+                                           return_signature(function.signature));
     }
     }
     return false;
@@ -391,6 +558,9 @@ std::optional<VerificationResult> verify_function_with_stack_maps(const Module& 
     if (function.code.empty()) {
         return std::nullopt;
     }
+    if (!signature_is_well_formed(function.signature)) {
+        return std::nullopt;
+    }
     if (function.local_count < function.signature.parameters.size()) {
         return std::nullopt;
     }
@@ -401,7 +571,7 @@ std::optional<VerificationResult> verify_function_with_stack_maps(const Module& 
     AbstractState initial;
     initial.locals.resize(function.local_count);
     for (std::size_t i = 0; i < function.signature.parameters.size(); ++i) {
-        initial.locals[i] = value_from_signature(function.signature.parameters[i]);
+        initial.locals[i] = value_from_signature(parameter_signature(function.signature, i));
     }
     states[0] = initial;
     worklist.push_back(0);

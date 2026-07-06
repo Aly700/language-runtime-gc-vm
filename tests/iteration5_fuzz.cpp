@@ -252,6 +252,12 @@ public:
         stack_.push_back(Kind::Object);
     }
 
+    void get_right_i64() {
+        pop_expect(Kind::Object);
+        emit(lang::OpCode::GetRight, 0);
+        stack_.push_back(Kind::Int64);
+    }
+
     void set_left() {
         pop_any();
         pop_expect(Kind::Object);
@@ -484,6 +490,30 @@ lang::FunctionSignature make_signature(std::vector<lang::ValueKind> parameters,
     return signature;
 }
 
+lang::SignatureValue scalar_signature(lang::ValueKind kind) {
+    return lang::signature_value(kind);
+}
+
+lang::SignatureValue typed_pair_signature(lang::SignatureValue left,
+                                          lang::SignatureValue right) {
+    return lang::pair_signature(std::move(left), std::move(right));
+}
+
+void set_parameter_detail(lang::FunctionSignature& signature, std::size_t index,
+                          lang::SignatureValue detail) {
+    if (signature.parameter_types.empty()) {
+        signature.parameter_types.reserve(signature.parameters.size());
+        for (const auto parameter : signature.parameters) {
+            signature.parameter_types.push_back(scalar_signature(parameter));
+        }
+    }
+    signature.parameter_types[index] = std::move(detail);
+}
+
+void set_return_detail(lang::FunctionSignature& signature, lang::SignatureValue detail) {
+    signature.return_type_detail = std::move(detail);
+}
+
 std::vector<lang::FunctionSignature> call_signatures(std::size_t function_count) {
     std::vector<lang::FunctionSignature> signatures(function_count);
     signatures[0] = make_signature({}, lang::ValueKind::Object);
@@ -497,12 +527,20 @@ std::vector<lang::FunctionSignature> call_signatures(std::size_t function_count)
                                         lang::ValueKind::Bool,
                                         lang::ValueKind::Int64},
                                        lang::ValueKind::Object);
+        set_return_detail(signatures[2],
+                          typed_pair_signature(
+                              scalar_signature(lang::ValueKind::Object),
+                              scalar_signature(lang::ValueKind::Int64)));
     }
     if (function_count >= 4) {
         signatures[3] = make_signature({lang::ValueKind::Int64,
                                         lang::ValueKind::Int64,
                                         lang::ValueKind::Object},
                                        lang::ValueKind::Bool);
+        set_parameter_detail(signatures[3], 2,
+                             typed_pair_signature(
+                                 scalar_signature(lang::ValueKind::Object),
+                                 scalar_signature(lang::ValueKind::Int64)));
     }
     if (function_count >= 5) {
         signatures[4] = make_signature({lang::ValueKind::Int64,
@@ -595,6 +633,9 @@ lang::Function generate_call_entry(SplitMix64& rng,
         b.call(2, signatures[2]);
         b.store_local(kReturned);
         b.store_local(kScratch);
+        b.load_local(kReturned);
+        b.get_right_i64();
+        b.store_local(kDepth);
     }
 
     b.load_local(kRoot);
@@ -677,11 +718,8 @@ lang::Function generate_object_mutator(
 
     b.load_local(kScratch);
     b.load_local(kScratch);
-    if (self_cycle_left) {
-        b.set_left();
-    } else {
-        b.set_right();
-    }
+    (void)self_cycle_left;
+    b.set_left();
 
     b.load_local(kFlag);
     const auto else_jump = b.jump_if_false_placeholder();
@@ -712,13 +750,17 @@ lang::Function generate_bool_helper(
     constexpr std::uint32_t kLocalCount = 4;
 
     Builder b(kLocalCount, signatures[3]);
+    b.load_local(kAnchor);
+    b.get_right_i64();
+    b.store_local(kRhs);
+
     b.load_local(kLhs);
     b.load_local(kAnchor);
     b.alloc_pair();
     b.store_local(kScratch);
     b.load_local(kAnchor);
     b.load_local(kScratch);
-    b.set_right();
+    b.set_left();
     b.collect();
     b.load_local(kLhs);
     b.load_local(kRhs);
@@ -1204,12 +1246,15 @@ function=0 signature=()->object locals=7
   #43 Call 2
   #44 StoreLocal 2
   #45 StoreLocal 5
-  #46 LoadLocal 0
-  #47 LoadLocal 2
-  #48 SetLeft 0
-  #49 Collect 0
-  #50 LoadLocal 0
-  #51 Return 0
+  #46 LoadLocal 2
+  #47 GetRight 0
+  #48 StoreLocal 4
+  #49 LoadLocal 0
+  #50 LoadLocal 2
+  #51 SetLeft 0
+  #52 Collect 0
+  #53 LoadLocal 0
+  #54 Return 0
 function=1 signature=(i64,object,object)->object locals=4
   #0 LoadLocal 0
   #1 ConstantI64 1
@@ -1258,18 +1303,21 @@ function=2 signature=(object,object,bool,i64)->object locals=5
   #19 LoadLocal 4
   #20 Return 0
 function=3 signature=(i64,i64,object)->bool locals=4
-  #0 LoadLocal 0
-  #1 LoadLocal 2
-  #2 AllocPair 0
-  #3 StoreLocal 3
+  #0 LoadLocal 2
+  #1 GetRight 0
+  #2 StoreLocal 1
+  #3 LoadLocal 0
   #4 LoadLocal 2
-  #5 LoadLocal 3
-  #6 SetRight 0
-  #7 Collect 0
-  #8 LoadLocal 0
-  #9 LoadLocal 1
-  #10 LessI64 0
-  #11 Return 0
+  #5 AllocPair 0
+  #6 StoreLocal 3
+  #7 LoadLocal 2
+  #8 LoadLocal 3
+  #9 SetLeft 0
+  #10 Collect 0
+  #11 LoadLocal 0
+  #12 LoadLocal 1
+  #13 LessI64 0
+  #14 Return 0
 function=4 signature=(i64,bool,object)->i64 locals=4
   #0 LoadLocal 0
   #1 LoadLocal 2
