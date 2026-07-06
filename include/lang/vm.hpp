@@ -10,6 +10,11 @@
 
 namespace lang {
 
+struct VMMetrics {
+    std::uint64_t instructions_executed{0};
+    gc::HeapMetrics heap;
+};
+
 class VM : public gc::RootProvider {
 public:
     VM();
@@ -25,6 +30,9 @@ public:
 
     [[nodiscard]] const gc::Heap& heap() const { return heap_; }
     [[nodiscard]] gc::Heap& heap() { return heap_; }
+    [[nodiscard]] VMMetrics metrics() const {
+        return VMMetrics{instructions_executed_, heap_.metrics()};
+    }
 
 private:
     struct Frame {

@@ -58,6 +58,9 @@ target_link_libraries(lang_iteration13_verifier_diagnostics PRIVATE lang_runtime
 add_executable(lang_iteration14_recursive_types tests/iteration14_recursive_types.cpp)
 target_link_libraries(lang_iteration14_recursive_types PRIVATE lang_runtime)
 
+add_executable(lang_bench src/bench.cpp)
+target_link_libraries(lang_bench PRIVATE lang_runtime)
+
 include(CTest)
 add_test(NAME lang_smoke COMMAND lang_smoke)
 add_test(NAME lang_phase1_correctness COMMAND lang_phase1_correctness)
@@ -72,3 +75,4 @@ add_test(NAME lang_iteration10_source_fuzz COMMAND lang_iteration10_source_fuzz)
 add_test(NAME lang_iteration12_handles COMMAND lang_iteration12_handles)
 add_test(NAME lang_iteration13_verifier_diagnostics COMMAND lang_iteration13_verifier_diagnostics)
 add_test(NAME lang_iteration14_recursive_types COMMAND lang_iteration14_recursive_types)
+add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

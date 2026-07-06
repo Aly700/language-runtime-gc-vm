@@ -205,6 +205,10 @@ ObjectId Heap::allocate_slot(Value left, Value right) {
         if (!objects_[i].has_value()) {
             generations_[i] = next_generation(generations_[i]);
             objects_[i] = Object{false, ObjectGeneration::Young, left, right};
+            ++metrics_.allocations;
+            if (objects_.size() > metrics_.heap_peak_slots) {
+                metrics_.heap_peak_slots = objects_.size();
+            }
             return make_object_id(static_cast<std::uint32_t>(i), generations_[i]);
         }
     }
@@ -214,6 +218,10 @@ ObjectId Heap::allocate_slot(Value left, Value right) {
     }
     objects_.push_back(Object{false, ObjectGeneration::Young, left, right});
     generations_.push_back(kFirstGeneration);
+    ++metrics_.allocations;
+    if (objects_.size() > metrics_.heap_peak_slots) {
+        metrics_.heap_peak_slots = objects_.size();
+    }
     return make_object_id(static_cast<std::uint32_t>(objects_.size() - 1), kFirstGeneration);
 }
 
@@ -321,6 +329,7 @@ bool Heap::record_write_barrier_if_needed(ObjectId owner, Value value) {
         return false;
     }
 
+    ++metrics_.write_barrier_hits;
     record_remembered_object(owner);
     return true;
 }
@@ -332,6 +341,9 @@ void Heap::record_remembered_object(ObjectId id) {
     }
     if (!remembered_set_contains(id)) {
         remembered_set_.push_back(id);
+    }
+    if (remembered_set_.size() > metrics_.remembered_set_peak) {
+        metrics_.remembered_set_peak = remembered_set_.size();
     }
 }
 
@@ -428,6 +440,11 @@ void Heap::collect_with_extra_roots(std::span<Value*> extra_roots) {
 
 void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots) {
     validate_remembered_set();
+    if (kind == CollectionKind::Major) {
+        ++metrics_.major_collections;
+    } else {
+        ++metrics_.minor_collections;
+    }
 
     std::vector<ObjectId> worklist;
     MarkingVisitor marker(*this, worklist, kind);
@@ -438,6 +455,7 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     drain_mark_worklist(worklist, kind);
 
     auto compacted = compact_live_objects(kind);
+    metrics_.objects_moved += compacted.objects_moved;
     rewrite_references(compacted.forwarding, compacted.objects, roots, extra_roots);
     auto rewritten_remembered_set = rewrite_remembered_set(compacted.forwarding);
 
@@ -493,6 +511,7 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
 
         if (old_slot != next_live_slot) {
             result.generations[next_live_slot] = next_generation(result.generations[next_live_slot]);
+            ++result.objects_moved;
         }
 
         const auto new_id =

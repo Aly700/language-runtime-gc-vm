@@ -97,6 +97,16 @@ check. This preserves the old non-nil guarantees for anonymous `pair<T, U>` and 
   as explicit collections. No stress trigger depends on wall-clock time, randomness,
   threads, or host addresses.
 
+## Performance measurement
+
+`lang_bench` is the runtime's standalone performance baseline harness. It is intentionally
+outside the correctness suite except for a minimal CTest smoke entry that checks completion
+and deterministic counters across two in-process runs. The harness reports deterministic
+VM/heap counters separately from median wall-clock timings; wall-clock values are allowed
+only in this measurement tool and are documented as machine-specific. The current baseline
+and observed cost centers live in `docs/perf-baseline.md` as the ADR-0001 anchor for future
+optimization work.
+
 ## Functions and frames
 
 Function 0 is the compiled top-level entry. Source `fn` declarations are emitted as
