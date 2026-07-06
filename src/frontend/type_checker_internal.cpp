@@ -5,6 +5,7 @@
 #include <cassert>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,6 +16,7 @@ namespace {
 struct TypedValue {
     TypeSpec type{invalid_type()};
     std::set<std::size_t> object_sites;
+    bool includes_nil{false};
 };
 
 struct FieldState {
@@ -37,7 +39,8 @@ struct FlowState {
 };
 
 bool operator==(const TypedValue& lhs, const TypedValue& rhs) {
-    return lhs.type == rhs.type && lhs.object_sites == rhs.object_sites;
+    return lhs.type == rhs.type && lhs.object_sites == rhs.object_sites &&
+           lhs.includes_nil == rhs.includes_nil;
 }
 
 bool operator==(const FieldState& lhs, const FieldState& rhs) {
@@ -54,8 +57,9 @@ bool operator==(const FlowState& lhs, const FlowState& rhs) {
     return lhs.locals == rhs.locals && lhs.fields_by_site == rhs.fields_by_site;
 }
 
-TypedValue invalid_value() { return TypedValue{invalid_type(), {}}; }
-TypedValue scalar_value(TypeSpec type) { return TypedValue{std::move(type), {}}; }
+TypedValue invalid_value() { return TypedValue{invalid_type(), {}, false}; }
+TypedValue scalar_value(TypeSpec type) { return TypedValue{std::move(type), {}, false}; }
+TypedValue nil_value() { return TypedValue{nil_type(), {}, true}; }
 
 TypedValue pair_value(TypeSpec type, std::size_t site) {
     TypedValue value;
@@ -65,7 +69,8 @@ TypedValue pair_value(TypeSpec type, std::size_t site) {
 }
 
 TypedValue value_from_type(TypeSpec type) {
-    return TypedValue{std::move(type), {}};
+    const bool includes_nil = type.kind == TypeSpec::Kind::Named;
+    return TypedValue{std::move(type), {}, includes_nil};
 }
 
 TypedValue value_as_declared_type(const TypedValue& value, TypeSpec declared_type) {
@@ -73,6 +78,7 @@ TypedValue value_as_declared_type(const TypedValue& value, TypeSpec declared_typ
     coerced.type = std::move(declared_type);
     if (is_pair(coerced.type)) {
         coerced.object_sites = value.object_sites;
+        coerced.includes_nil = value.includes_nil || value.type.kind == TypeSpec::Kind::Nil;
     }
     return coerced;
 }
@@ -93,6 +99,9 @@ TypedValue join_values(const TypedValue& lhs, const TypedValue& rhs) {
     if (is_pair(result.type)) {
         result.object_sites = lhs.object_sites;
         result.object_sites.insert(rhs.object_sites.begin(), rhs.object_sites.end());
+        result.includes_nil = lhs.includes_nil || rhs.includes_nil ||
+                              lhs.type.kind == TypeSpec::Kind::Nil ||
+                              rhs.type.kind == TypeSpec::Kind::Nil;
     }
     return result;
 }
@@ -132,6 +141,13 @@ struct FunctionSymbol {
     TypeSpec return_type{invalid_type()};
 };
 
+struct TypeSymbol {
+    std::string name;
+    SourcePosition position;
+    std::size_t index{0};
+    TypeSpec body{invalid_type()};
+};
+
 class TypeChecker {
 public:
     explicit TypeChecker(std::size_t pair_site_count) : pair_site_count_(pair_site_count) {
@@ -139,6 +155,7 @@ public:
     }
 
     TypeSpec check(Program& program) {
+        collect_type_symbols(program);
         collect_function_symbols(program);
         for (auto& function : program.functions) {
             check_function(function);
@@ -149,6 +166,10 @@ public:
             check_statement(statement, state_, true);
         }
         const auto result = check_expr(*program.result, state_);
+        if (result.type.kind == TypeSpec::Kind::Nil) {
+            diagnose(program.result->position,
+                     "nil literal requires a named pair type context");
+        }
         program.entry_local_count = static_cast<std::uint32_t>(state_.locals.size());
         return result.type;
     }
@@ -166,6 +187,48 @@ private:
         FlowState state;
         state.fields_by_site.resize(pair_site_count_);
         return state;
+    }
+
+    void collect_type_symbols(Program& program) {
+        for (std::size_t i = 0; i < program.types.size(); ++i) {
+            auto& declaration = program.types[i];
+            if (find_type(declaration.name) != nullptr) {
+                diagnose(declaration.position,
+                         "type '" + declaration.name + "' is already defined");
+                continue;
+            }
+
+            TypeSymbol symbol;
+            symbol.name = declaration.name;
+            symbol.position = declaration.position;
+            symbol.index = types_.size();
+            declaration.type_index = symbol.index;
+            types_.push_back(std::move(symbol));
+        }
+
+        for (auto& declaration : program.types) {
+            resolve_type(declaration.body);
+            if (!declaration.body.has_pair_fields()) {
+                diagnose(declaration.position,
+                         "type '" + declaration.name +
+                             "' must be declared as pair<...>");
+                continue;
+            }
+            if (declaration.type_index < types_.size() &&
+                types_[declaration.type_index].name == declaration.name) {
+                types_[declaration.type_index].body = declaration.body;
+            }
+        }
+
+        for (auto& function : program.functions) {
+            for (auto& parameter : function.parameters) {
+                resolve_type(parameter.type);
+            }
+            resolve_type(function.return_type);
+        }
+        for (auto& statement : program.statements) {
+            resolve_statement_types(statement);
+        }
     }
 
     void collect_function_symbols(Program& program) {
@@ -240,6 +303,56 @@ private:
         return nullptr;
     }
 
+    TypeSymbol* find_type(const std::string& name) {
+        for (auto& type : types_) {
+            if (type.name == name) {
+                return &type;
+            }
+        }
+        return nullptr;
+    }
+
+    const TypeSymbol* find_type(const TypeSpec& type) const {
+        if (type.kind != TypeSpec::Kind::Named || !type.named_type_index.has_value() ||
+            *type.named_type_index >= types_.size()) {
+            return nullptr;
+        }
+        return &types_[*type.named_type_index];
+    }
+
+    void resolve_type(TypeSpec& type) {
+        if (type.has_pair_fields()) {
+            resolve_type(*type.left);
+            resolve_type(*type.right);
+            return;
+        }
+        if (type.kind != TypeSpec::Kind::Named) {
+            return;
+        }
+        auto* symbol = find_type(type.name);
+        if (symbol == nullptr) {
+            diagnose(type.position, "unknown type '" + type.name + "'");
+            type = invalid_type();
+            return;
+        }
+        type.named_type_index = symbol->index;
+    }
+
+    void resolve_statement_types(Statement& statement) {
+        if (statement.kind == Statement::Kind::Let) {
+            resolve_type(statement.declared_type);
+        }
+        for (auto& inner : statement.then_branch) {
+            resolve_statement_types(inner);
+        }
+        for (auto& inner : statement.else_branch) {
+            resolve_statement_types(inner);
+        }
+        for (auto& inner : statement.body) {
+            resolve_statement_types(inner);
+        }
+    }
+
     LocalState* find_local(FlowState& state, const std::string& name) {
         for (auto& local : state.locals) {
             if (local.name == name) {
@@ -265,7 +378,7 @@ private:
     std::optional<TypedValue> try_load_field(const TypedValue& receiver,
                                              const std::string& field,
                                              const FlowState& state) const {
-        if (!is_pair(receiver.type)) {
+        if (!is_pair(receiver.type) || receiver.includes_nil) {
             return std::nullopt;
         }
 
@@ -273,6 +386,15 @@ private:
         if (receiver.type.has_pair_fields()) {
             const auto& field_type = field == "left" ? *receiver.type.left
                                                      : *receiver.type.right;
+            loaded = value_from_type(field_type);
+        }
+        if (receiver.type.kind == TypeSpec::Kind::Named) {
+            const auto* symbol = find_type(receiver.type);
+            if (symbol == nullptr || !symbol->body.has_pair_fields()) {
+                return std::nullopt;
+            }
+            const auto& field_type = field == "left" ? *symbol->body.left
+                                                     : *symbol->body.right;
             loaded = value_from_type(field_type);
         }
 
@@ -298,11 +420,66 @@ private:
 
     bool value_conforms_to_type(const TypedValue& value, const TypeSpec& target,
                                 const FlowState& state) const {
+        std::set<std::string> assumptions;
+        return value_conforms_to_type(value, target, state, assumptions);
+    }
+
+    std::string conformance_key(const TypedValue& value,
+                                const TypeSpec& target) const {
+        std::ostringstream out;
+        out << type_name(value.type) << "|";
+        for (const auto site : value.object_sites) {
+            out << site << ",";
+        }
+        out << "->" << type_name(target);
+        if (target.named_type_index.has_value()) {
+            out << "#" << *target.named_type_index;
+        }
+        return out.str();
+    }
+
+    bool has_nonnil_evidence(const TypedValue& value) const {
+        return is_pair(value.type) && (value.type.kind == TypeSpec::Kind::Named ||
+                                      value.type.has_pair_fields() ||
+                                      !value.object_sites.empty());
+    }
+
+    bool value_conforms_to_type(const TypedValue& value, const TypeSpec& target,
+                                const FlowState& state,
+                                std::set<std::string>& assumptions) const {
         if (is_invalid(value.type) || is_invalid(target)) {
             return false;
         }
+        if (target.kind == TypeSpec::Kind::Named) {
+            if (value.type.kind == TypeSpec::Kind::Nil) {
+                return true;
+            }
+            if (!is_pair(value.type)) {
+                return false;
+            }
+            if (!has_nonnil_evidence(value)) {
+                return value.includes_nil;
+            }
+            const auto* symbol = find_type(target);
+            if (symbol == nullptr) {
+                return false;
+            }
+            const auto key = conformance_key(value, target);
+            // Termination mirrors the verifier: named recursive types are a finite
+            // graph, and pair allocation-site facts are finite. Re-entering the same
+            // value-shape-to-named-type obligation is the coinductive case.
+            if (!assumptions.insert(key).second) {
+                return true;
+            }
+            auto nonnil = value;
+            nonnil.includes_nil = false;
+            return value_conforms_to_type(nonnil, symbol->body, state, assumptions);
+        }
         if (target.kind == TypeSpec::Kind::Int64 || target.kind == TypeSpec::Kind::Bool) {
-            return value.type == target;
+            return !value.includes_nil && value.type == target;
+        }
+        if (value.includes_nil || value.type.kind == TypeSpec::Kind::Nil) {
+            return false;
         }
         if (!is_pair(value.type)) {
             return false;
@@ -316,8 +493,8 @@ private:
         if (!left.has_value() || !right.has_value()) {
             return false;
         }
-        return value_conforms_to_type(*left, *target.left, state) &&
-               value_conforms_to_type(*right, *target.right, state);
+        return value_conforms_to_type(*left, *target.left, state, assumptions) &&
+               value_conforms_to_type(*right, *target.right, state, assumptions);
     }
 
     void check_statement(Statement& statement, FlowState& state, bool allow_let) {
@@ -426,6 +603,7 @@ private:
 
         auto then_state = state;
         auto else_state = state;
+        refine_is_nil_condition(*statement.condition, then_state, else_state);
         for (auto& inner : statement.then_branch) {
             check_statement(inner, then_state, false);
         }
@@ -460,6 +638,25 @@ private:
         state = std::move(head);
     }
 
+    void refine_is_nil_condition(const Expr& condition, FlowState& then_state,
+                                 FlowState& else_state) {
+        if (condition.kind != Expr::Kind::IsNil ||
+            condition.receiver == nullptr ||
+            condition.receiver->kind != Expr::Kind::Variable) {
+            return;
+        }
+        auto* then_local = find_local(then_state, condition.receiver->name);
+        auto* else_local = find_local(else_state, condition.receiver->name);
+        if (then_local == nullptr || else_local == nullptr ||
+            !is_pair(then_local->declared_type)) {
+            return;
+        }
+
+        then_local->value = value_as_declared_type(nil_value(),
+                                                   then_local->declared_type);
+        else_local->value.includes_nil = false;
+    }
+
     std::size_t max_loop_iterations(const FlowState& state) const {
         return state.fields_by_site.size() + state.locals.size() + 8;
     }
@@ -470,6 +667,8 @@ private:
             return annotate(expression, scalar_value(int64_type()));
         case Expr::Kind::BoolLiteral:
             return annotate(expression, scalar_value(bool_type()));
+        case Expr::Kind::NilLiteral:
+            return annotate(expression, nil_value());
         case Expr::Kind::Variable:
             return check_variable(expression, state);
         case Expr::Kind::PairLiteral:
@@ -480,6 +679,8 @@ private:
             return check_field_access(expression, state);
         case Expr::Kind::Call:
             return check_call(expression, state);
+        case Expr::Kind::IsNil:
+            return check_is_nil(expression, state);
         }
         return annotate(expression, invalid_value());
     }
@@ -548,6 +749,16 @@ private:
         }
         diagnose(expression.operator_position, "unknown binary operator");
         return annotate(expression, invalid_value());
+    }
+
+    TypedValue check_is_nil(Expr& expression, FlowState& state) {
+        const auto value = check_expr(*expression.receiver, state);
+        if (!is_invalid(value.type) && !is_pair(value.type) &&
+            value.type.kind != TypeSpec::Kind::Nil) {
+            diagnose(expression.position, "is_nil requires pair or nil operand");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, scalar_value(bool_type()));
     }
 
     TypedValue check_field_access(Expr& expression, FlowState& state) {
@@ -634,6 +845,11 @@ private:
             diagnose(position, "field access requires pair");
             return invalid_value();
         }
+        if (receiver.includes_nil) {
+            diagnose(position, "field access requires non-nil value of type " +
+                                   type_name(receiver.type));
+            return invalid_value();
+        }
         const auto loaded_field = try_load_field(receiver, field, state);
         if (!loaded_field.has_value()) {
             diagnose(position, "pair field type is unknown");
@@ -658,6 +874,7 @@ private:
 
     std::size_t pair_site_count_{0};
     FlowState state_;
+    std::vector<TypeSymbol> types_;
     std::vector<FunctionSymbol> functions_;
     std::vector<Diagnostic> diagnostics_;
 };

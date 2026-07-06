@@ -42,8 +42,14 @@ void VM::assert_stack_matches_map(const ModuleVerificationResult& verification,
     assert(map.object_slots.size() == frame.stack.size() &&
            "verifier invariant violated: runtime stack height differs from stack map");
     for (std::size_t i = 0; i < frame.stack.size(); ++i) {
-        assert(map.object_slots[i] == frame.stack[i].is_object() &&
-               "verifier invariant violated: runtime stack tag differs from stack map");
+        if (map.object_slots[i]) {
+            assert((frame.stack[i].is_object() ||
+                    frame.stack[i].tag() == Value::Tag::Nil) &&
+                   "verifier invariant violated: runtime stack reference slot differs from stack map");
+        } else {
+            assert(!frame.stack[i].is_object() &&
+                   "verifier invariant violated: runtime stack object tag differs from stack map");
+        }
     }
 }
 
@@ -140,6 +146,19 @@ Value VM::execute(const Module& module) {
             push(frame, Value::int64(ins.operand));
             ++frame.pc;
             break;
+        case OpCode::Nil:
+            push(frame, Value::nil());
+            ++frame.pc;
+            break;
+        case OpCode::IsNil: {
+            const auto value = pop(frame);
+            assert((value.tag() == Value::Tag::Object ||
+                    value.tag() == Value::Tag::Nil) &&
+                   "verifier invariant violated: IsNil operand must be a reference slot");
+            push(frame, Value::boolean(value.tag() == Value::Tag::Nil));
+            ++frame.pc;
+            break;
+        }
         case OpCode::AddI64: {
             const auto rhs_value = pop(frame);
             const auto lhs_value = pop(frame);

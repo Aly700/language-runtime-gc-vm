@@ -154,6 +154,8 @@ private:
         TokenKind kind = TokenKind::Identifier;
         if (text == "let") {
             kind = TokenKind::Let;
+        } else if (text == "type") {
+            kind = TokenKind::Type;
         } else if (text == "fn") {
             kind = TokenKind::Fn;
         } else if (text == "if") {
@@ -166,6 +168,10 @@ private:
             kind = TokenKind::True;
         } else if (text == "false") {
             kind = TokenKind::False;
+        } else if (text == "nil") {
+            kind = TokenKind::Nil;
+        } else if (text == "is_nil") {
+            kind = TokenKind::IsNil;
         } else if (text == "i64") {
             kind = TokenKind::I64;
         } else if (text == "bool") {

@@ -26,6 +26,8 @@ enum class OpCode {
     Collect,
     Call,
     Return,
+    Nil,
+    IsNil,
 };
 
 struct Instruction {
@@ -44,9 +46,15 @@ struct SignatureValue {
     ValueKind kind{ValueKind::Nil};
     std::shared_ptr<SignatureValue> left;
     std::shared_ptr<SignatureValue> right;
+    std::optional<std::size_t> named_type;
 
     [[nodiscard]] bool has_pair_fields() const {
-        return kind == ValueKind::Object && left != nullptr && right != nullptr;
+        return kind == ValueKind::Object && !named_type.has_value() &&
+               left != nullptr && right != nullptr;
+    }
+
+    [[nodiscard]] bool is_named_type_reference() const {
+        return kind == ValueKind::Object && named_type.has_value();
     }
 };
 
@@ -63,6 +71,18 @@ inline SignatureValue pair_signature(SignatureValue left, SignatureValue right) 
     value.right = std::make_shared<SignatureValue>(std::move(right));
     return value;
 }
+
+inline SignatureValue named_type_signature(std::size_t index) {
+    SignatureValue value;
+    value.kind = ValueKind::Object;
+    value.named_type = index;
+    return value;
+}
+
+struct NamedTypeSignature {
+    std::string name;
+    SignatureValue body;
+};
 
 struct FunctionSignature {
     std::vector<ValueKind> parameters;
@@ -87,6 +107,7 @@ struct Function {
 struct Module {
     std::vector<Function> functions;
     std::size_t entry_function{0};
+    std::vector<NamedTypeSignature> named_types;
 };
 
 struct VerificationResult {

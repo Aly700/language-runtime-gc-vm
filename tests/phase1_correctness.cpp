@@ -44,6 +44,10 @@ const char* op_name(lang::OpCode op) {
         return "Call";
     case lang::OpCode::Return:
         return "Return";
+    case lang::OpCode::Nil:
+        return "Nil";
+    case lang::OpCode::IsNil:
+        return "IsNil";
     }
     return "<unknown>";
 }
