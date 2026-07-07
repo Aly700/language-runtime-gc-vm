@@ -23,6 +23,7 @@ public:
 
     Value execute(const Function& function);
     Value execute(const Module& module);
+    Value execute(const VerifiedModule& module);
     void set_max_call_depth(std::size_t max_call_depth) { max_call_depth_ = max_call_depth; }
     void set_gc_stress(gc::StressConfig config);
     [[nodiscard]] gc::StressConfig gc_stress_config() const { return gc_stress_; }
@@ -46,6 +47,8 @@ private:
                                                    const Frame& frame);
     void assert_stack_matches_map(const ModuleVerificationResult& verification,
                                   const Frame& frame) const;
+    Value execute_verified(const Module& module,
+                           const ModuleVerificationResult& verification);
     Value pop(Frame& frame);
     void push(Frame& frame, Value value);
     void push_frame(const Module& module, std::size_t function_index,

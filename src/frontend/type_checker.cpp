@@ -62,6 +62,7 @@ CompileResult compile_program(std::string_view source) {
     CompileResult result;
     result.result_type = coarse_result_type;
     result.module = std::move(*compiled.module);
+    result.verified_module = std::move(compiled.verified_module);
     result.function = result.module->functions.at(result.module->entry_function);
     return result;
 }

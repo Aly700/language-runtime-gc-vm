@@ -112,7 +112,8 @@ lang::frontend::CompileResult require_compiles(const std::string& source) {
         }
         throw std::runtime_error(out.str());
     }
-    require(compiled.module.has_value(), "successful compile did not return a module");
+    require(compiled.module.has_value() && compiled.verified_module.has_value(),
+            "successful compile did not return module forms");
     return compiled;
 }
 
@@ -143,7 +144,8 @@ void require_same_observable_under_stress(const std::string& source,
 
     lang::VM baseline_vm;
     baseline_vm.set_gc_stress(schedules.front().stress);
-    const auto baseline = observable(baseline_vm, baseline_vm.execute(*compiled.module));
+    const auto baseline =
+        observable(baseline_vm, baseline_vm.execute(*compiled.verified_module));
     require(baseline == expected,
             "baseline observable mismatch\nexpected:\n" + expected +
                 "\nobserved:\n" + baseline + "\n" + source_listing(source));
@@ -153,7 +155,8 @@ void require_same_observable_under_stress(const std::string& source,
         vm.set_gc_stress(schedule.stress);
         const auto observed = schedule.name == std::string(schedules.front().name)
                                   ? baseline
-                                  : observable(vm, vm.execute(*compiled.module));
+                                  : observable(vm,
+                                               vm.execute(*compiled.verified_module));
         require(observed == baseline,
                 std::string("observable mismatch under ") + schedule.name +
                     "\nbaseline:\n" + baseline + "\nobserved:\n" + observed +

@@ -211,4 +211,15 @@ inline Outcome execute_once(const lang::Module& module, const Schedule& schedule
     }
 }
 
+inline Outcome execute_once(const lang::VerifiedModule& module, const Schedule& schedule) {
+    try {
+        lang::VM vm;
+        vm.set_gc_stress(schedule.stress);
+        const auto value = vm.execute(module);
+        return Outcome{true, observable_for(vm, value), {}};
+    } catch (const std::exception& e) {
+        return Outcome{false, {}, e.what()};
+    }
+}
+
 } // namespace fuzz

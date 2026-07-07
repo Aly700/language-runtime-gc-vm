@@ -117,7 +117,10 @@ void require_diagnostic(const std::string& source, std::size_t line, std::size_t
 
 lang::Value execute_source(const std::string& source, lang::VM& vm) {
     auto compiled = require_compiles(source);
-    return vm.execute(*compiled.function);
+    require(compiled.verified_module.has_value(),
+            "successful compile did not return a verified module\n" +
+                source_listing(source));
+    return vm.execute(*compiled.verified_module);
 }
 
 void rejects_undefined_variable_with_position() {
@@ -315,10 +318,11 @@ std::vector<Schedule> stress_schedules() {
     return schedules;
 }
 
-std::string execute_observable(const lang::Function& function, const Schedule& schedule) {
+std::string execute_observable(const lang::VerifiedModule& module,
+                               const Schedule& schedule) {
     lang::VM vm;
     vm.set_gc_stress(schedule.stress);
-    const auto result = vm.execute(function);
+    const auto result = vm.execute(module);
     return observable(vm, result);
 }
 
@@ -357,11 +361,16 @@ a
     const auto schedules = stress_schedules();
     for (const auto& source : sources) {
         const auto compiled = require_compiles(source);
-        const auto baseline = execute_observable(*compiled.function, schedules.front());
+        require(compiled.verified_module.has_value(),
+                "successful compile did not return a verified module\n" +
+                    source_listing(source));
+        const auto baseline =
+            execute_observable(*compiled.verified_module, schedules.front());
         for (const auto& schedule : schedules) {
             const auto observed = schedule.name == std::string(schedules.front().name)
                                       ? baseline
-                                      : execute_observable(*compiled.function, schedule);
+                                      : execute_observable(*compiled.verified_module,
+                                                           schedule);
             require(observed == baseline,
                     std::string("source-level GC timing mismatch under ") + schedule.name +
                         "\n" + source_listing(source) + "baseline:\n" + baseline +

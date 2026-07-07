@@ -9,9 +9,10 @@ source -> lexer -> parser -> AST -> type checker -> compiler -> verifier -> VM -
 ## Frontend surface
 
 `lang::frontend::compile_program` is the narrow public entry point. It returns either a
-`lang::Module` with verifier-generated per-function stack maps attached, or deterministic
-diagnostics with byte offsets plus 1-based line/column positions. For compatibility with
-single-entry tests, the result also exposes a copy of the entry `lang::Function`.
+verifier-produced `lang::VerifiedModule` plus a compatibility `lang::Module` copy with
+verifier-generated per-function stack maps attached, or deterministic diagnostics with
+byte offsets plus 1-based line/column positions. For compatibility with single-entry
+tests, the result also exposes a copy of the entry `lang::Function`.
 
 Frontend implementation files are split by pipeline stage while keeping
 `include/lang/frontend/type_checker.hpp` as the only public frontend API:
@@ -62,6 +63,12 @@ check. This preserves the old non-nil guarantees for anonymous `pair<T, U>` and 
   bodies, and a finite named-type table. Each function carries a `FunctionSignature` of
   coarse parameter/return kinds, optional detailed `SignatureValue` pair-field types or
   named-type back-references, bytecode, local count, and optional stack maps.
+- `lang::VerifiedModule` is the immutable execution proof for module bytecode. It is
+  constructible only through `verify_module_with_diagnostics`, `verify_module`, or the
+  frontend compiler path, all of which first run the module verifier, attach the generated
+  stack maps, and store the accepted bytecode in an owned `shared_ptr<const Module>` with
+  the matching `ModuleVerificationResult`. Callers can inspect only `const` module data,
+  so mutating a raw `Module` after verification cannot alter the certified code.
 - `lang::verify` is the bytecode safety gate. It runs a per-function worklist dataflow
   analysis over reachable bytecode, proving stack depth before every instruction,
   `LoadLocal` initialization over all incoming paths, branch target validity, call
@@ -80,6 +87,12 @@ check. This preserves the old non-nil guarantees for anonymous `pair<T, U>` and 
   Each frame owns its own operand stack and locals. Root tracing visits mutable `Value`
   slots in every live frame, not copied root values, so moving collection can update
   active and suspended frames before mutator execution resumes.
+- `VM::execute(const Module&)` and `VM::execute(const Function&)` remain the unverified
+  public entry points and always verify before bytecode dispatch. `VM::execute(const
+  VerifiedModule&)` skips only that redundant verifier pass and reuses the stored
+  verification result for the same instruction loop. The per-pc stack-map assertions,
+  collection-boundary assertions, call-depth checks, heap validators, and agreement
+  invariants remain active and unchanged.
 - `lang::gc::Heap` implements deterministic major and minor mark-compact collection over
   generation-tagged object IDs. The low bits identify the storage slot and the high bits
   identify that slot's current generation, so a swept or moved ID cannot alias a later
@@ -106,6 +119,11 @@ VM/heap counters separately from median wall-clock timings; wall-clock values ar
 only in this measurement tool and are documented as machine-specific. The current baseline
 and observed cost centers live in `docs/perf-baseline.md` as the ADR-0001 anchor for future
 optimization work.
+
+Rejected alternative for verified execution: VM-side verification caching keyed by
+`Module` identity. Raw `Module` remains a mutable value type, so an identity cache would
+need invalidation rules or content hashing to avoid certifying stale bytecode. Carrying the
+proof in an immutable `VerifiedModule` keeps the public safety boundary explicit.
 
 ## Functions and frames
 
@@ -149,9 +167,10 @@ stack.
 
 Well-typed source must compile to a module accepted by `verify_with_stack_maps`. A verifier
 rejection of type-checked compiler output is a compiler bug, not a user error.
-`compile_program` enforces this by running module-level `verify_with_stack_maps`, asserting
-success, then attaching the generated maps to every emitted function and asserting the maps
-round-trip through the verifier.
+`compile_program` enforces this by running module-level
+`verify_module_with_diagnostics`, asserting success, attaching the generated maps to every
+emitted function inside the immutable `VerifiedModule`, and asserting the maps round-trip
+through the verifier.
 
 Compiler accommodations for verifier strictness:
 
@@ -318,6 +337,8 @@ remembered-set entries.
   the VM/heap continue to trace, barrier, forward, and validate by runtime `Value` tags.
 - Source agreement: `compile_program` does not return bytecode for rejected source, and
   every returned module has passed `verify_with_stack_maps` with generated stack maps.
+  The returned `VerifiedModule` carries that same proof into VM execution without allowing
+  the verified bytecode to be mutated after acceptance.
 
 ## Verifier join lattice
 

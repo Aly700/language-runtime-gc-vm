@@ -370,6 +370,14 @@ std::string execute_observable(const lang::Module& module, const Schedule& sched
     return observable(vm, result);
 }
 
+std::string execute_observable(const lang::VerifiedModule& module,
+                               const Schedule& schedule) {
+    lang::VM vm;
+    vm.set_gc_stress(schedule.stress);
+    const auto result = vm.execute(module);
+    return observable(vm, result);
+}
+
 void recursion_matches_across_gc_stress_modes() {
     const auto schedules = stress_schedules();
     {
@@ -509,7 +517,8 @@ lang::frontend::CompileResult require_compiles(const std::string& source) {
         }
         throw std::runtime_error(out.str());
     }
-    require(compiled.module.has_value(), "successful compile did not return a module");
+    require(compiled.module.has_value() && compiled.verified_module.has_value(),
+            "successful compile did not return module forms");
     return compiled;
 }
 
@@ -573,9 +582,11 @@ build(12, seed)
     const auto schedules = stress_schedules();
     for (const auto& source : sources) {
         const auto compiled = require_compiles(source);
-        const auto baseline = execute_observable(*compiled.module, schedules.front());
+        const auto baseline =
+            execute_observable(*compiled.verified_module, schedules.front());
         for (const auto& schedule : schedules) {
-            const auto observed = execute_observable(*compiled.module, schedule);
+            const auto observed =
+                execute_observable(*compiled.verified_module, schedule);
             require(observed == baseline,
                     std::string("source recursive stress mismatch under ") + schedule.name +
                         "\nsource:\n" + source + "\nbaseline:\n" + baseline +

@@ -11,6 +11,7 @@ namespace lang::frontend::detail {
 
 struct CompileModuleResult {
     std::optional<Module> module;
+    std::optional<VerifiedModule> verified_module;
     std::vector<Diagnostic> diagnostics;
 };
 

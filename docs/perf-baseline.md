@@ -157,3 +157,33 @@ claims.
 - `survivor_heavy` moves 1,814 objects with a 908-slot retained heap peak and
   takes about 25ms. Candidate future investigation: mark/compact rewrite and
   validation cost under retained-graph pressure.
+
+## Iteration 17: Verified Execution Reuse (2026-07-07)
+
+Captured on the same machine/debug-build configuration as the baseline above,
+with assertions active and source revision `b793363` plus local iteration-17
+changes. Same protocol as the baseline:
+
+- Timing command: `build/lang_bench --repetitions 7`
+- Counter command: `build/lang_bench --counters-only`
+- Counter check: the full deterministic counter output was byte-identical to
+  the iteration-16 machine-readable baseline above; only wall time changed.
+
+The optimization adds an immutable `VerifiedModule` execution path so benchmark
+runtime workloads verify once when the workload is built, then reuse that proof
+for each timed repetition. Raw `Module` execution still verifies at entry.
+
+| bench | before median ms | after median ms | change |
+| --- | ---: | ---: | ---: |
+| `alloc_churn` | 2.836 | 2.365 | -16.6% |
+| `survivor_heavy` | 24.902 | 24.199 | -2.8% |
+| `mutation_heavy` | 4038.181 | 1.504 | -99.96% |
+| `deep_recursion_alloc` | 8.070 | 8.047 | -0.3% |
+| `verifier_compile` | 54.209 | 55.467 | +2.3% |
+
+`mutation_heavy` improves because it no longer pays a full verifier pass for
+each timed execution of the same 4,803-instruction generated module. The smaller
+runtime workloads improve modestly or stay effectively flat because execution
+and GC costs dominate once redundant verification is removed. `verifier_compile`
+does not improve; it intentionally still measures frontend plus explicit
+verification work and was slightly slower in this run.
