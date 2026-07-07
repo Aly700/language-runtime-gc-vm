@@ -3,6 +3,7 @@
 #include "lang/gc/heap.hpp"
 #include "lang/value.hpp"
 #include "lang/vm.hpp"
+#include "test_support.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -112,8 +113,8 @@ lang::frontend::CompileResult require_compiles(const std::string& source) {
         }
         throw std::runtime_error(out.str());
     }
-    require(compiled.module.has_value() && compiled.verified_module.has_value(),
-            "successful compile did not return module forms");
+    require(compiled.verified_module.has_value(),
+            "successful compile did not return a verified module");
     return compiled;
 }
 
@@ -336,12 +337,11 @@ void verifier_accepts_nil_checked_recursive_signature() {
         {lang::OpCode::Return, 0},
     };
 
-    const auto report = lang::verify_with_diagnostics(module);
-    require(report.result.has_value(),
-            "verifier rejected nil-checked recursive signature");
+    const auto verified = test_support::verify_module_or_throw(
+        module, "verifier rejected nil-checked recursive signature");
 
     lang::VM vm;
-    const auto result = vm.execute(module);
+    const auto result = vm.execute(verified);
     require(result.as_i64() == 0, "nil-checked recursive bytecode returned wrong value");
 }
 

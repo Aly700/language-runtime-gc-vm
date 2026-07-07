@@ -3,6 +3,7 @@
 #include "lang/gc/heap.hpp"
 #include "lang/value.hpp"
 #include "lang/vm.hpp"
+#include "test_support.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -203,10 +204,10 @@ void direct_call_executes_with_signature_checked_return() {
     };
     module.functions[1] = add2_function();
 
-    require(lang::verify(module), "verifier rejected valid direct call\n" +
-                                      describe_module(module));
+    const auto verified = test_support::verify_module_or_throw(module,
+                                                               describe_module(module));
     lang::VM vm;
-    const auto result = vm.execute(module);
+    const auto result = vm.execute(verified);
     require(result.as_i64() == 42, "direct call returned wrong value\n" +
                                        describe_module(module));
 }
@@ -366,7 +367,8 @@ std::string observable(lang::VM& vm, lang::Value value) {
 std::string execute_observable(const lang::Module& module, const Schedule& schedule) {
     lang::VM vm;
     vm.set_gc_stress(schedule.stress);
-    const auto result = vm.execute(module);
+    const auto result =
+        test_support::execute_verified(vm, module, describe_module(module));
     return observable(vm, result);
 }
 
@@ -459,14 +461,14 @@ lang::Module suspended_frame_forwarding_module() {
 
 void collection_in_callee_rewrites_suspended_caller_stack_and_locals() {
     const auto module = suspended_frame_forwarding_module();
-    require(lang::verify(module), "verifier rejected suspended-frame forwarding module\n" +
-                                      describe_module(module));
+    const auto verified = test_support::verify_module_or_throw(module,
+                                                               describe_module(module));
 
     lang::VM vm;
     lang::gc::StressConfig stress;
     stress.collect_before_every_allocation = true;
     vm.set_gc_stress(stress);
-    const auto result = vm.execute(module);
+    const auto result = vm.execute(verified);
 
     require(result.is_object(), "suspended-frame program returned non-object");
     require(slot_of(result.as_object()) == 0,
@@ -497,12 +499,12 @@ void call_depth_overflow_traps_deterministically() {
         {lang::OpCode::Call, 1},
         {lang::OpCode::Return, 0},
     };
-    require(lang::verify(module), "verifier rejected depth-overflow module\n" +
-                                      describe_module(module));
+    const auto verified = test_support::verify_module_or_throw(module,
+                                                               describe_module(module));
 
     lang::VM vm;
     vm.set_max_call_depth(8);
-    require_throws_message([&] { (void)vm.execute(module); }, "call depth",
+    require_throws_message([&] { (void)vm.execute(verified); }, "call depth",
                            "recursive module did not trap at configured call-depth limit");
 }
 
@@ -517,8 +519,8 @@ lang::frontend::CompileResult require_compiles(const std::string& source) {
         }
         throw std::runtime_error(out.str());
     }
-    require(compiled.module.has_value() && compiled.verified_module.has_value(),
-            "successful compile did not return module forms");
+    require(compiled.verified_module.has_value(),
+            "successful compile did not return a verified module");
     return compiled;
 }
 

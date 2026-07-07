@@ -129,7 +129,7 @@ std::string compile_error(const std::string& source,
 
 lang::VerifiedModule compile_module_or_throw(const std::string& source) {
     auto compiled = lang::frontend::compile_program(source);
-    if (!compiled.ok() || !compiled.verified_module.has_value()) {
+    if (!compiled.ok()) {
         throw std::runtime_error(compile_error(source, compiled));
     }
     return *compiled.verified_module;
@@ -172,6 +172,9 @@ CounterSnapshot run_module(const lang::VerifiedModule& module, lang::gc::StressC
     (void)result;
 
     const auto metrics = vm.metrics();
+    if (metrics.raw_module_executions != 0 || metrics.raw_function_executions != 0) {
+        throw std::runtime_error("verified benchmark workload entered raw VM execution");
+    }
     base.instructions_executed = metrics.instructions_executed;
     base.allocations = metrics.heap.allocations;
     base.major_collections = metrics.heap.major_collections;
@@ -351,19 +354,16 @@ Workload verifier_compile_workload(std::uint64_t seed, std::string source,
         "verifier_compile", seed, std::move(description),
         [source = std::move(source)] {
             auto compiled = lang::frontend::compile_program(source);
-            if (!compiled.ok() || !compiled.module.has_value()) {
+            if (!compiled.ok()) {
                 throw std::runtime_error(compile_error(source, compiled));
             }
-            const auto verified = lang::verify_with_stack_maps(*compiled.module);
-            if (!verified.has_value()) {
-                throw std::runtime_error("verify_with_stack_maps rejected generated module");
-            }
+            const auto& verified = *compiled.verified_module;
 
             CounterSnapshot counters;
             counters.source_bytes = source.size();
-            counters.module_functions = compiled.module->functions.size();
-            counters.bytecode_instructions = bytecode_instruction_count(*compiled.module);
-            for (const auto& function : verified->functions) {
+            counters.module_functions = verified.module().functions.size();
+            counters.bytecode_instructions = bytecode_instruction_count(verified.module());
+            for (const auto& function : verified.verification().functions) {
                 counters.stack_map_entries += function.stack_maps.size();
             }
             return counters;

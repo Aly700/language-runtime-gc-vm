@@ -2,6 +2,7 @@
 #include "lang/gc/heap.hpp"
 #include "lang/value.hpp"
 #include "lang/vm.hpp"
+#include "test_support.hpp"
 
 #include <exception>
 #include <iostream>
@@ -221,7 +222,7 @@ void gc_stress_before_every_allocation_keeps_popped_operands_alive() {
     vm.set_gc_stress(stress);
 
     const auto function = nested_pair_program();
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function, describe(function));
     collect_returned_value(vm, result);
 
     std::ostringstream message;
@@ -236,7 +237,7 @@ void gc_stress_after_every_allocation_keeps_new_object_alive() {
     vm.set_gc_stress(stress);
 
     const auto function = single_pair_program();
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function, describe(function));
     collect_returned_value(vm, result);
 
     std::ostringstream message;
@@ -253,7 +254,7 @@ void gc_stress_every_instruction_keeps_stack_roots_alive() {
     vm.set_gc_stress(stress);
 
     const auto function = single_pair_program();
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function, describe(function));
     collect_returned_value(vm, result);
 
     std::ostringstream message;

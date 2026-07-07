@@ -138,8 +138,8 @@ lang::frontend::CompileResult require_compiles(const std::string& source) {
         }
         throw std::runtime_error(out.str());
     }
-    require(compiled.module.has_value() && compiled.verified_module.has_value(),
-            "successful compile did not return module forms");
+    require(compiled.verified_module.has_value(),
+            "successful compile did not return a verified module");
     return compiled;
 }
 

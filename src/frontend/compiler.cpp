@@ -270,7 +270,6 @@ CompileModuleResult compile_checked_program(const Program& program,
            "compiler bug: verifier-generated stack maps did not round-trip");
 
     CompileModuleResult result;
-    result.module = verified_module.module();
     result.verified_module = std::move(verified_module);
     return result;
 }

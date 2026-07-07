@@ -12,6 +12,8 @@ namespace lang {
 
 struct VMMetrics {
     std::uint64_t instructions_executed{0};
+    std::uint64_t raw_module_executions{0};
+    std::uint64_t raw_function_executions{0};
     gc::HeapMetrics heap;
 };
 
@@ -21,6 +23,9 @@ public:
     VM(const VM&) = delete;
     VM& operator=(const VM&) = delete;
 
+    // Raw bytecode entry points are compatibility paths for hand-built modules and
+    // verifier-rejection tests. They always verify before dispatch and increment the
+    // raw_*_executions metrics so accidental use is visible.
     Value execute(const Function& function);
     Value execute(const Module& module);
     Value execute(const VerifiedModule& module);
@@ -32,7 +37,8 @@ public:
     [[nodiscard]] const gc::Heap& heap() const { return heap_; }
     [[nodiscard]] gc::Heap& heap() { return heap_; }
     [[nodiscard]] VMMetrics metrics() const {
-        return VMMetrics{instructions_executed_, heap_.metrics()};
+        return VMMetrics{instructions_executed_, raw_module_executions_,
+                         raw_function_executions_, heap_.metrics()};
     }
 
 private:
@@ -47,6 +53,7 @@ private:
                                                    const Frame& frame);
     void assert_stack_matches_map(const ModuleVerificationResult& verification,
                                   const Frame& frame) const;
+    Value execute_unverified_module(const Module& module);
     Value execute_verified(const Module& module,
                            const ModuleVerificationResult& verification);
     Value pop(Frame& frame);
@@ -57,6 +64,8 @@ private:
     gc::Heap heap_;
     gc::StressConfig gc_stress_{};
     std::uint64_t instructions_executed_{0};
+    std::uint64_t raw_module_executions_{0};
+    std::uint64_t raw_function_executions_{0};
     std::size_t max_call_depth_{1024};
 };
 
