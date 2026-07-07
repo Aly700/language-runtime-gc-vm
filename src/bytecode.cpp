@@ -1252,6 +1252,23 @@ ModuleVerifierReport verify_with_diagnostics(const Module& module) {
     return report;
 }
 
+VerifiedModuleReport verify_module_with_diagnostics(Module module) {
+    auto verification_report = verify_with_diagnostics(module);
+
+    VerifiedModuleReport report;
+    report.diagnostics = std::move(verification_report.diagnostics);
+    if (!verification_report.result.has_value()) {
+        return report;
+    }
+
+    auto verification = std::move(*verification_report.result);
+    for (std::size_t i = 0; i < module.functions.size(); ++i) {
+        module.functions[i].stack_maps = verification.functions[i].stack_maps;
+    }
+    report.module = VerifiedModule(std::move(module), std::move(verification));
+    return report;
+}
+
 std::optional<VerificationResult> verify_with_stack_maps(const Function& function) {
     auto report = verify_with_diagnostics(function);
     if (!report.result.has_value()) {
@@ -1266,6 +1283,14 @@ std::optional<ModuleVerificationResult> verify_with_stack_maps(const Module& mod
         return std::nullopt;
     }
     return std::move(report.result);
+}
+
+std::optional<VerifiedModule> verify_module(Module module) {
+    auto report = verify_module_with_diagnostics(std::move(module));
+    if (!report.module.has_value()) {
+        return std::nullopt;
+    }
+    return std::move(report.module);
 }
 
 bool verify(const Function& function) {

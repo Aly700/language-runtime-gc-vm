@@ -242,27 +242,24 @@ CompileModuleResult compile_checked_program(const Program& program,
             function_compiler.compile(declaration.statements, *declaration.result));
     }
 
-    auto verification_report = verify_with_diagnostics(module);
-    if (!verification_report.result.has_value()) {
+    auto verification_report = verify_module_with_diagnostics(std::move(module));
+    if (!verification_report.module.has_value()) {
         for (const auto& diagnostic : verification_report.diagnostics) {
             std::cerr << "compiler verifier diagnostic: "
                       << format_verifier_diagnostic(diagnostic) << "\n";
         }
     }
-    assert(verification_report.result.has_value() &&
+    assert(verification_report.module.has_value() &&
            "compiler bug: type-checked source emitted verifier-rejected module");
-    if (!verification_report.result.has_value()) {
+    if (!verification_report.module.has_value()) {
         CompileModuleResult result;
         result.diagnostics = {
             Diagnostic{SourcePosition{}, "compiler emitted verifier-rejected module"}};
         return result;
     }
-    auto verification = std::move(*verification_report.result);
+    auto verified_module = std::move(*verification_report.module);
 
-    for (std::size_t i = 0; i < module.functions.size(); ++i) {
-        module.functions[i].stack_maps = verification.functions[i].stack_maps;
-    }
-    auto roundtrip = verify_with_diagnostics(module);
+    auto roundtrip = verify_with_diagnostics(verified_module.module());
     if (!roundtrip.result.has_value()) {
         for (const auto& diagnostic : roundtrip.diagnostics) {
             std::cerr << "compiler stack-map round-trip diagnostic: "
@@ -273,7 +270,8 @@ CompileModuleResult compile_checked_program(const Program& program,
            "compiler bug: verifier-generated stack maps did not round-trip");
 
     CompileModuleResult result;
-    result.module = std::move(module);
+    result.module = verified_module.module();
+    result.verified_module = std::move(verified_module);
     return result;
 }
 

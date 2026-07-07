@@ -25,6 +25,7 @@ struct Diagnostic {
 
 struct CompileResult {
     std::optional<Module> module;
+    std::optional<VerifiedModule> verified_module;
     std::optional<Function> function;
     Type result_type{Type::Invalid};
     std::vector<Diagnostic> diagnostics;

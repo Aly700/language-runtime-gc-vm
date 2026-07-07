@@ -127,12 +127,12 @@ std::string compile_error(const std::string& source,
     return out.str();
 }
 
-lang::Module compile_module_or_throw(const std::string& source) {
+lang::VerifiedModule compile_module_or_throw(const std::string& source) {
     auto compiled = lang::frontend::compile_program(source);
-    if (!compiled.ok() || !compiled.module.has_value()) {
+    if (!compiled.ok() || !compiled.verified_module.has_value()) {
         throw std::runtime_error(compile_error(source, compiled));
     }
-    return *compiled.module;
+    return *compiled.verified_module;
 }
 
 std::uint64_t bytecode_instruction_count(const lang::Module& module) {
@@ -164,7 +164,7 @@ std::uint64_t verified_stack_map_count(const lang::Module& module) {
     return count;
 }
 
-CounterSnapshot run_module(const lang::Module& module, lang::gc::StressConfig stress,
+CounterSnapshot run_module(const lang::VerifiedModule& module, lang::gc::StressConfig stress,
                            CounterSnapshot base) {
     lang::VM vm;
     vm.set_gc_stress(stress);
@@ -325,8 +325,9 @@ lang::Module mutation_heavy_module(std::size_t owners, std::size_t rounds,
 Workload source_runtime_workload(std::string name, std::uint64_t seed, std::string source,
                                  lang::gc::StressConfig stress,
                                  std::string description) {
-    auto module = std::make_shared<const lang::Module>(compile_module_or_throw(source));
-    const auto base = module_base_counters(*module, source.size());
+    auto module =
+        std::make_shared<const lang::VerifiedModule>(compile_module_or_throw(source));
+    const auto base = module_base_counters(module->module(), source.size());
     return Workload{std::move(name), seed, std::move(description),
                     [module, stress, base] { return run_module(*module, stress, base); }};
 }
@@ -334,8 +335,12 @@ Workload source_runtime_workload(std::string name, std::uint64_t seed, std::stri
 Workload module_runtime_workload(std::string name, std::uint64_t seed, lang::Module module,
                                  lang::gc::StressConfig stress,
                                  std::string description) {
-    auto shared = std::make_shared<const lang::Module>(std::move(module));
-    const auto base = module_base_counters(*shared, 0);
+    auto verified = lang::verify_module(std::move(module));
+    if (!verified.has_value()) {
+        throw std::runtime_error("benchmark module failed bytecode verification");
+    }
+    auto shared = std::make_shared<const lang::VerifiedModule>(std::move(*verified));
+    const auto base = module_base_counters(shared->module(), 0);
     return Workload{std::move(name), seed, std::move(description),
                     [shared, stress, base] { return run_module(*shared, stress, base); }};
 }

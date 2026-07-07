@@ -118,6 +118,31 @@ struct ModuleVerificationResult {
     std::vector<VerificationResult> functions;
 };
 
+struct VerifiedModuleReport;
+
+class VerifiedModule {
+public:
+    VerifiedModule(const VerifiedModule&) = default;
+    VerifiedModule(VerifiedModule&&) noexcept = default;
+    VerifiedModule& operator=(const VerifiedModule&) = default;
+    VerifiedModule& operator=(VerifiedModule&&) noexcept = default;
+
+    [[nodiscard]] const Module& module() const { return *module_; }
+    [[nodiscard]] const ModuleVerificationResult& verification() const {
+        return verification_;
+    }
+
+private:
+    friend VerifiedModuleReport verify_module_with_diagnostics(Module module);
+
+    VerifiedModule(Module module, ModuleVerificationResult verification)
+        : module_(std::make_shared<const Module>(std::move(module))),
+          verification_(std::move(verification)) {}
+
+    std::shared_ptr<const Module> module_;
+    ModuleVerificationResult verification_;
+};
+
 // Stable verifier rejection categories. Keep names append-only when possible:
 // callers and fuzz failures use these as machine-readable diagnostics.
 enum class VerifierReason {
@@ -161,13 +186,20 @@ struct ModuleVerifierReport {
     std::vector<VerifierDiagnostic> diagnostics;
 };
 
+struct VerifiedModuleReport {
+    std::optional<VerifiedModule> module;
+    std::vector<VerifierDiagnostic> diagnostics;
+};
+
 const char* verifier_reason_name(VerifierReason reason);
 std::string format_verifier_diagnostic(const VerifierDiagnostic& diagnostic);
 
 FunctionVerifierReport verify_with_diagnostics(const Function& function);
 ModuleVerifierReport verify_with_diagnostics(const Module& module);
+VerifiedModuleReport verify_module_with_diagnostics(Module module);
 std::optional<VerificationResult> verify_with_stack_maps(const Function& function);
 std::optional<ModuleVerificationResult> verify_with_stack_maps(const Module& module);
+std::optional<VerifiedModule> verify_module(Module module);
 bool verify(const Function& function);
 bool verify(const Module& module);
 

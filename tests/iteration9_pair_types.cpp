@@ -138,7 +138,8 @@ lang::frontend::CompileResult require_compiles(const std::string& source) {
         }
         throw std::runtime_error(out.str());
     }
-    require(compiled.module.has_value(), "successful compile did not return a module");
+    require(compiled.module.has_value() && compiled.verified_module.has_value(),
+            "successful compile did not return module forms");
     return compiled;
 }
 
@@ -146,7 +147,7 @@ lang::Value execute_source(const std::string& source, const Schedule& schedule,
                            lang::VM& vm) {
     const auto compiled = require_compiles(source);
     vm.set_gc_stress(schedule.stress);
-    return vm.execute(*compiled.module);
+    return vm.execute(*compiled.verified_module);
 }
 
 void require_i64_result_under_stress(const std::string& source, std::int64_t expected) {

@@ -495,13 +495,7 @@ lang::Function generate_program(std::uint64_t seed) {
     }
     b.return_top();
 
-    auto function = b.finish();
-    const auto verification = lang::verify_with_diagnostics(function);
-    require(verification.result.has_value(),
-            "generator emitted verifier-rejected function for seed " +
-                std::to_string(seed) + "\nverifier diagnostics:\n" +
-                diagnostics_listing(verification.diagnostics) + describe(function));
-    return function;
+    return b.finish();
 }
 
 lang::FunctionSignature make_signature(std::vector<lang::ValueKind> parameters,
@@ -855,12 +849,35 @@ lang::Module generate_call_module(std::uint64_t seed) {
         module.functions.push_back(generate_i64_helper(rng, signatures));
     }
 
-    const auto verification = lang::verify_with_diagnostics(module);
-    require(verification.result.has_value(),
+    return module;
+}
+
+lang::Module module_from_function(const lang::Function& function) {
+    lang::Module module;
+    module.entry_function = 0;
+    module.functions.push_back(function);
+    return module;
+}
+
+lang::VerifiedModule verified_module_for_function(const lang::Function& function,
+                                                  std::uint64_t seed) {
+    auto verification = lang::verify_module_with_diagnostics(
+        module_from_function(function));
+    require(verification.module.has_value(),
+            "generator emitted verifier-rejected function for seed " +
+                std::to_string(seed) + "\nverifier diagnostics:\n" +
+                diagnostics_listing(verification.diagnostics) + describe(function));
+    return std::move(*verification.module);
+}
+
+lang::VerifiedModule verified_module_for_module(const lang::Module& module,
+                                                std::uint64_t seed) {
+    auto verification = lang::verify_module_with_diagnostics(module);
+    require(verification.module.has_value(),
             "call generator emitted verifier-rejected module for seed " +
                 std::to_string(seed) + "\nverifier diagnostics:\n" +
                 diagnostics_listing(verification.diagnostics) + describe(module));
-    return module;
+    return std::move(*verification.module);
 }
 
 const char* grammar_name(Grammar grammar) {
@@ -942,12 +959,13 @@ std::string repro_command(Grammar grammar, std::uint64_t seed,
 
 void run_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
     const auto function = generate_program(seed);
+    const auto verified = verified_module_for_function(function, seed);
     const auto all_schedules = schedules();
     const auto& baseline_schedule = find_schedule(all_schedules, "no_stress");
-    const auto baseline = execute_once(function, baseline_schedule);
+    const auto baseline = execute_once(verified, baseline_schedule);
     const auto observed = schedule.name == std::string("no_stress")
                               ? baseline
-                              : execute_once(function, schedule);
+                              : execute_once(verified, schedule);
 
     if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
         report_failure(seed, schedule, function, baseline, observed);
@@ -956,12 +974,13 @@ void run_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
 
 void run_call_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
     const auto module = generate_call_module(seed);
+    const auto verified = verified_module_for_module(module, seed);
     const auto all_schedules = schedules();
     const auto& baseline_schedule = find_schedule(all_schedules, "no_stress");
-    const auto baseline = execute_once(module, baseline_schedule);
+    const auto baseline = execute_once(verified, baseline_schedule);
     const auto observed = schedule.name == std::string("no_stress")
                               ? baseline
-                              : execute_once(module, schedule);
+                              : execute_once(verified, schedule);
 
     if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
         report_failure(seed, schedule, module, baseline, observed);
@@ -970,11 +989,12 @@ void run_call_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
 
 void run_seed_all_schedules(std::uint64_t seed, const std::vector<Schedule>& all_schedules) {
     const auto function = generate_program(seed);
-    const auto baseline = execute_once(function, all_schedules.front());
+    const auto verified = verified_module_for_function(function, seed);
+    const auto baseline = execute_once(verified, all_schedules.front());
     for (const auto& schedule : all_schedules) {
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
-                                  : execute_once(function, schedule);
+                                  : execute_once(verified, schedule);
         if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
             report_failure(seed, schedule, function, baseline, observed);
         }
@@ -984,11 +1004,12 @@ void run_seed_all_schedules(std::uint64_t seed, const std::vector<Schedule>& all
 void run_call_seed_all_schedules(std::uint64_t seed,
                                  const std::vector<Schedule>& all_schedules) {
     const auto module = generate_call_module(seed);
-    const auto baseline = execute_once(module, all_schedules.front());
+    const auto verified = verified_module_for_module(module, seed);
+    const auto baseline = execute_once(verified, all_schedules.front());
     for (const auto& schedule : all_schedules) {
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
-                                  : execute_once(module, schedule);
+                                  : execute_once(verified, schedule);
         if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
             report_failure(seed, schedule, module, baseline, observed);
         }

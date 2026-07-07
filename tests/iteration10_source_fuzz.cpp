@@ -589,8 +589,8 @@ lang::frontend::CompileResult require_compiles(const GeneratedProgram& generated
             << "diagnostics:\n" << diagnostics_listing(compiled.diagnostics);
         throw std::runtime_error(out.str());
     }
-    require(compiled.module.has_value(),
-            "successful source compile did not return a module\n" +
+    require(compiled.module.has_value() && compiled.verified_module.has_value(),
+            "successful source compile did not return module forms\n" +
                 source_listing(generated.source));
     return compiled;
 }
@@ -666,10 +666,10 @@ void run_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
     const auto compiled = require_compiles(generated);
     const auto all_schedules = schedules();
     const auto& baseline_schedule = find_schedule(all_schedules, "no_stress");
-    const auto baseline = execute_once(*compiled.module, baseline_schedule);
+    const auto baseline = execute_once(*compiled.verified_module, baseline_schedule);
     const auto observed = schedule.name == std::string("no_stress")
                               ? baseline
-                              : execute_once(*compiled.module, schedule);
+                              : execute_once(*compiled.verified_module, schedule);
 
     if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
         report_failure(generated, schedule, baseline, observed);
@@ -682,10 +682,10 @@ void run_seed_schedule(SourceGrammar grammar, std::uint64_t seed,
     const auto compiled = require_compiles(generated);
     const auto all_schedules = schedules();
     const auto& baseline_schedule = find_schedule(all_schedules, "no_stress");
-    const auto baseline = execute_once(*compiled.module, baseline_schedule);
+    const auto baseline = execute_once(*compiled.verified_module, baseline_schedule);
     const auto observed = schedule.name == std::string("no_stress")
                               ? baseline
-                              : execute_once(*compiled.module, schedule);
+                              : execute_once(*compiled.verified_module, schedule);
 
     if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
         report_failure(generated, schedule, baseline, observed, grammar);
@@ -696,11 +696,12 @@ void run_seed_all_schedules(std::uint64_t seed,
                             const std::vector<Schedule>& all_schedules) {
     const auto generated = generate_source_program(seed);
     const auto compiled = require_compiles(generated);
-    const auto baseline = execute_once(*compiled.module, all_schedules.front());
+    const auto baseline = execute_once(*compiled.verified_module,
+                                       all_schedules.front());
     for (const auto& schedule : all_schedules) {
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
-                                  : execute_once(*compiled.module, schedule);
+                                  : execute_once(*compiled.verified_module, schedule);
         if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
             report_failure(generated, schedule, baseline, observed);
         }
@@ -711,11 +712,12 @@ void run_seed_all_schedules(SourceGrammar grammar, std::uint64_t seed,
                             const std::vector<Schedule>& all_schedules) {
     const auto generated = generate_program(grammar, seed);
     const auto compiled = require_compiles(generated);
-    const auto baseline = execute_once(*compiled.module, all_schedules.front());
+    const auto baseline = execute_once(*compiled.verified_module,
+                                       all_schedules.front());
     for (const auto& schedule : all_schedules) {
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
-                                  : execute_once(*compiled.module, schedule);
+                                  : execute_once(*compiled.verified_module, schedule);
         if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
             report_failure(generated, schedule, baseline, observed, grammar);
         }
