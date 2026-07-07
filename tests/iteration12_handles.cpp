@@ -1,6 +1,7 @@
 #include "lang/bytecode.hpp"
 #include "lang/gc/heap.hpp"
 #include "lang/vm.hpp"
+#include "test_support.hpp"
 
 #include <csignal>
 #include <cstdint>
@@ -261,7 +262,8 @@ void handles_survive_heap_and_vm_stress_modes() {
         stress.collect_every_n_instructions = 1;
         vm.set_gc_stress(stress);
 
-        const auto result = vm.execute(int_result_program(7));
+        const auto result =
+            test_support::execute_verified(vm, int_result_program(7), "major handle stress");
         require(result.as_i64() == 7, "major instruction stress program returned wrong value");
         const auto moved = handle.object();
         require(moved != survivor && slot_of(moved) == slot_of(dead),
@@ -284,7 +286,8 @@ void handles_survive_heap_and_vm_stress_modes() {
         stress.collect_minor_every_n_instructions = 1;
         vm.set_gc_stress(stress);
 
-        const auto result = vm.execute(int_result_program(8));
+        const auto result =
+            test_support::execute_verified(vm, int_result_program(8), "minor handle stress");
         require(result.as_i64() == 8, "minor instruction stress program returned wrong value");
         const auto moved_young = young_handle.object();
         require(moved_young != young && slot_of(moved_young) == slot_of(dead_young),

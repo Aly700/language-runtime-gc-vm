@@ -52,7 +52,7 @@ CompileResult compile_program(std::string_view source) {
 
     auto compiled =
         detail::compile_checked_program(*parsed.program, checked.result_type);
-    if (!compiled.module.has_value()) {
+    if (!compiled.verified_module.has_value()) {
         CompileResult result;
         result.result_type = coarse_result_type;
         result.diagnostics = std::move(compiled.diagnostics);
@@ -61,9 +61,7 @@ CompileResult compile_program(std::string_view source) {
 
     CompileResult result;
     result.result_type = coarse_result_type;
-    result.module = std::move(*compiled.module);
     result.verified_module = std::move(compiled.verified_module);
-    result.function = result.module->functions.at(result.module->entry_function);
     return result;
 }
 

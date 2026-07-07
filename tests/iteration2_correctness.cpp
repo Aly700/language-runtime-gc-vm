@@ -1,5 +1,6 @@
 #include "lang/bytecode.hpp"
 #include "lang/vm.hpp"
+#include "test_support.hpp"
 
 #include <exception>
 #include <iostream>
@@ -189,7 +190,8 @@ void verifier_accepts_loop_that_builds_linked_structure() {
     lang::gc::StressConfig stress;
     stress.collect_every_n_instructions = 1;
     vm.set_gc_stress(stress);
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
     require(result.is_object(), "linked-structure loop did not return an object");
     require(vm.heap().live_count() == 5,
             "linked-structure loop should keep all five linked pairs reachable\n" +
@@ -220,7 +222,8 @@ void field_load_reads_object_field_with_generated_stack_map() {
     lang::gc::StressConfig stress;
     stress.collect_every_n_instructions = 1;
     vm.set_gc_stress(stress);
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
     require(result.is_object(), "GetLeft did not return the inner object");
     require(vm.heap().live_count() == 1,
             "every-instruction stress should keep only the loaded object reachable\n" +
@@ -255,7 +258,8 @@ void gc_collects_unreachable_cycle_created_by_mutation() {
     };
 
     lang::VM vm;
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
     require(result.as_i64() == 7, "cycle collection program returned wrong value");
     require(vm.heap().live_count() == 0,
             "unreachable cycle created by SetLeft/SetRight leaked after Collect\n" +
@@ -297,7 +301,8 @@ void gc_instruction_stress_sweeps_replaced_object_after_it_becomes_unreachable()
     lang::gc::StressConfig stress;
     stress.collect_every_n_instructions = 1;
     vm.set_gc_stress(stress);
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
     require(result.is_object(), "replacement loop did not return final object");
     require(vm.heap().live_count() == 1,
             "every-instruction stress did not sweep replaced objects promptly\n" +
@@ -322,7 +327,8 @@ void gc_self_referential_pair_survives_while_rooted() {
     };
 
     lang::VM vm;
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
     require(result.is_object(), "self-reference program did not return an object");
     require(vm.heap().live_count() == 1,
             "rooted self-referential pair was swept\n" + describe(function, 7));

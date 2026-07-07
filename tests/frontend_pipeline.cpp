@@ -90,8 +90,9 @@ lang::frontend::CompileResult require_compiles(const std::string& source) {
         }
         throw std::runtime_error(out.str());
     }
-    require(compiled.function.has_value(),
-            "successful compile did not return bytecode\n" + source_listing(source));
+    require(compiled.verified_module.has_value(),
+            "successful compile did not return verified bytecode\n" +
+                source_listing(source));
     return compiled;
 }
 
@@ -277,11 +278,31 @@ a
 void compiled_type_checked_programs_pass_verifier_with_stack_maps() {
     for (const auto& source : agreement_corpus()) {
         const auto compiled = require_compiles(source);
-        require(lang::verify_with_stack_maps(*compiled.function).has_value(),
-                "compiled function failed verifier agreement test\n" + source_listing(source));
-        require(compiled.function->stack_maps.size() == compiled.function->code.size(),
-                "compiler did not attach verifier-generated stack maps\n" +
+        const auto& verified = *compiled.verified_module;
+        const auto& module = verified.module();
+        const auto& verification = verified.verification();
+        require(verification.functions.size() == module.functions.size(),
+                "verified module proof/function count mismatch\n" +
                     source_listing(source));
+        for (std::size_t function_index = 0;
+             function_index < module.functions.size(); ++function_index) {
+            const auto& function = module.functions[function_index];
+            const auto& function_verification =
+                verification.functions[function_index];
+            require(function.stack_maps.size() == function.code.size(),
+                    "compiler did not attach verifier-generated stack maps\n" +
+                        source_listing(source));
+            require(function.stack_maps.size() ==
+                        function_verification.stack_maps.size(),
+                    "attached stack maps differ from verified proof\n" +
+                        source_listing(source));
+            for (std::size_t pc = 0; pc < function.stack_maps.size(); ++pc) {
+                require(function.stack_maps[pc].object_slots ==
+                            function_verification.stack_maps[pc].object_slots,
+                        "attached stack map bits differ from verified proof\n" +
+                            source_listing(source));
+            }
+        }
     }
 }
 

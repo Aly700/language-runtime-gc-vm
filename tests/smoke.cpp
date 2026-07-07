@@ -1,5 +1,6 @@
 #include "lang/gc/heap.hpp"
 #include "lang/vm.hpp"
+#include "test_support.hpp"
 
 #include <cassert>
 #include <vector>
@@ -28,7 +29,7 @@ int main() {
     };
 
     lang::VM vm;
-    auto value = vm.execute(add);
+    auto value = test_support::execute_verified(vm, add, "smoke add");
     assert(value.as_i64() == 42);
 
     lang::gc::Heap heap;

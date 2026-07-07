@@ -589,8 +589,8 @@ lang::frontend::CompileResult require_compiles(const GeneratedProgram& generated
             << "diagnostics:\n" << diagnostics_listing(compiled.diagnostics);
         throw std::runtime_error(out.str());
     }
-    require(compiled.module.has_value() && compiled.verified_module.has_value(),
-            "successful source compile did not return module forms\n" +
+    require(compiled.verified_module.has_value(),
+            "successful source compile did not return a verified module\n" +
                 source_listing(generated.source));
     return compiled;
 }

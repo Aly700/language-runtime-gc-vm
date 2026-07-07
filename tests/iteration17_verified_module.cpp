@@ -84,6 +84,11 @@ void verified_module_executes_through_verified_overload() {
     lang::VM vm;
     const auto result = vm.execute(*verified);
     require(result.as_i64() == 42, "verified module returned wrong value");
+    const auto metrics = vm.metrics();
+    require(metrics.raw_module_executions == 0,
+            "verified module execution should not enter the raw Module path");
+    require(metrics.raw_function_executions == 0,
+            "verified module execution should not enter the raw Function path");
 }
 
 void verified_module_owns_immutable_copy_after_verification() {
@@ -124,6 +129,23 @@ void compile_program_returns_executable_verified_module() {
     const auto result = vm.execute(*compiled.verified_module);
     require(result.as_i64() == 42,
             "compiled verified module returned wrong value\n" + source_listing(source));
+    const auto metrics = vm.metrics();
+    require(metrics.raw_module_executions == 0,
+            "compiled verified module should not re-enter raw Module execution");
+    require(metrics.raw_function_executions == 0,
+            "compiled verified module should not re-enter raw Function execution");
+}
+
+void raw_module_execution_is_counted_for_review_visibility() {
+    lang::VM vm;
+    const auto result = vm.execute(valid_i64_module(9));
+    require(result.as_i64() == 9, "raw module execution returned wrong value");
+
+    const auto metrics = vm.metrics();
+    require(metrics.raw_module_executions == 1,
+            "raw Module execution should be visible in VM metrics");
+    require(metrics.raw_function_executions == 0,
+            "raw Module execution should not be counted as raw Function execution");
 }
 
 static_assert(!std::is_constructible_v<lang::VerifiedModule, lang::Module>,
@@ -133,6 +155,25 @@ static_assert(!std::is_constructible_v<lang::VerifiedModule, const lang::Module&
 static_assert(std::is_same_v<decltype(std::declval<const lang::VerifiedModule&>().module()),
                              const lang::Module&>,
               "VerifiedModule must expose only const module access");
+
+template <typename Result>
+concept HasRawCompileResultModule = requires(Result result) {
+    result.module;
+};
+
+template <typename Result>
+concept HasRawCompileResultFunction = requires(Result result) {
+    result.function;
+};
+
+static_assert(std::is_same_v<decltype((std::declval<lang::frontend::CompileResult&>()
+                                           .verified_module)),
+                             std::optional<lang::VerifiedModule>&>,
+              "compile_program should expose a single verified module product");
+static_assert(!HasRawCompileResultModule<lang::frontend::CompileResult>,
+              "CompileResult must not expose a parallel raw Module");
+static_assert(!HasRawCompileResultFunction<lang::frontend::CompileResult>,
+              "CompileResult must not expose a parallel raw Function");
 
 struct TestCase {
     const char* name;
@@ -161,6 +202,10 @@ int main() {
          "compile_program carries its existing verifier proof to the VM without raw re-entry",
          "BASELINE-RED on b793363: CompileResult has no verified_module field",
          compile_program_returns_executable_verified_module},
+        {"raw_module_execution_is_counted_for_review_visibility",
+         "deliberate raw Module execution remains possible but visible in VM metrics",
+         "BASELINE-RED: raw Module execution metrics do not exist",
+         raw_module_execution_is_counted_for_review_visibility},
     };
 
     for (const auto& test : tests) {

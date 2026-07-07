@@ -1,6 +1,7 @@
 #include "lang/bytecode.hpp"
 #include "lang/gc/heap.hpp"
 #include "lang/vm.hpp"
+#include "test_support.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -356,7 +357,8 @@ void bytecode_loop_mutates_old_object_under_after_every_barrier_stress() {
     stress.collect_minor_every_n_instructions = 3;
     vm.set_gc_stress(stress);
 
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
     require(vm.heap().TEST_ONLY_validation_count() >= 6,
             "after-every-barrier/minor-every-N stress did not run collection validators\n" +
                 describe(function, 17));

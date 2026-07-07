@@ -87,10 +87,11 @@ void VM::push(Frame& frame, Value value) {
 }
 
 Value VM::execute(const Function& function) {
+    ++raw_function_executions_;
     Module module;
     module.entry_function = 0;
     module.functions.push_back(function);
-    return execute(module);
+    return execute_unverified_module(module);
 }
 
 void VM::push_frame(const Module& module, std::size_t function_index,
@@ -121,6 +122,11 @@ void VM::push_frame(const Module& module, std::size_t function_index,
 }
 
 Value VM::execute(const Module& module) {
+    ++raw_module_executions_;
+    return execute_unverified_module(module);
+}
+
+Value VM::execute_unverified_module(const Module& module) {
     auto verification_report = verify_module_with_diagnostics(module);
     if (!verification_report.module.has_value()) {
         std::string message = "bytecode verifier rejected module";

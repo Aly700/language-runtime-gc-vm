@@ -191,9 +191,16 @@ struct Outcome {
 
 inline Outcome execute_once(const lang::Function& function, const Schedule& schedule) {
     try {
+        lang::Module module;
+        module.entry_function = 0;
+        module.functions.push_back(function);
+        auto verified = lang::verify_module(std::move(module));
+        if (!verified.has_value()) {
+            return Outcome{false, {}, "bytecode verifier rejected generated function"};
+        }
         lang::VM vm;
         vm.set_gc_stress(schedule.stress);
-        const auto value = vm.execute(function);
+        const auto value = vm.execute(*verified);
         return Outcome{true, observable_for(vm, value), {}};
     } catch (const std::exception& e) {
         return Outcome{false, {}, e.what()};
@@ -202,9 +209,13 @@ inline Outcome execute_once(const lang::Function& function, const Schedule& sche
 
 inline Outcome execute_once(const lang::Module& module, const Schedule& schedule) {
     try {
+        auto verified = lang::verify_module(module);
+        if (!verified.has_value()) {
+            return Outcome{false, {}, "bytecode verifier rejected generated module"};
+        }
         lang::VM vm;
         vm.set_gc_stress(schedule.stress);
-        const auto value = vm.execute(module);
+        const auto value = vm.execute(*verified);
         return Outcome{true, observable_for(vm, value), {}};
     } catch (const std::exception& e) {
         return Outcome{false, {}, e.what()};

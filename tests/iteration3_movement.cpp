@@ -1,6 +1,7 @@
 #include "lang/bytecode.hpp"
 #include "lang/gc/heap.hpp"
 #include "lang/vm.hpp"
+#include "test_support.hpp"
 
 #include <cstdint>
 #include <exception>
@@ -223,7 +224,8 @@ lang::Function local_root_movement_program() {
 void vm_collect_rewrites_local_root_after_movement() {
     const auto function = local_root_movement_program();
     lang::VM vm;
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
 
     require(result.is_object(), "local-root movement program did not return an object\n" +
                                     describe(function, 10));
@@ -258,7 +260,8 @@ lang::Function stack_root_movement_program() {
 void vm_collect_rewrites_stack_root_after_movement() {
     const auto function = stack_root_movement_program();
     lang::VM vm;
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
 
     require(result.is_object(), "stack-root movement program did not return an object\n" +
                                     describe(function, 9));
@@ -313,7 +316,8 @@ void gc_every_instruction_compacts_interleaved_loop_and_preserves_live_chain() {
     stress.collect_every_n_instructions = 1;
     vm.set_gc_stress(stress);
 
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
     require(result.is_object(), "interleaved loop did not return an object\n" +
                                     describe(function, 26));
     require(slot_of(result.as_object()) == 3,
@@ -437,7 +441,8 @@ void before_alloc_stress_rewrites_popped_alloc_pair_operands() {
     stress.collect_before_every_allocation = true;
     vm.set_gc_stress(stress);
 
-    const auto result = vm.execute(function);
+    const auto result = test_support::execute_verified(vm, function,
+                                                       describe(function, 0));
     require(result.is_object(), "before-allocation operand movement program returned non-object\n" +
                                     describe(function, 20));
 
