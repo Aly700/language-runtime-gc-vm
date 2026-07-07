@@ -187,3 +187,49 @@ runtime workloads improve modestly or stay effectively flat because execution
 and GC costs dominate once redundant verification is removed. `verifier_compile`
 does not improve; it intentionally still measures frontend plus explicit
 verification work and was slightly slower in this run.
+
+## Iteration 19: Verifier Transfer Copy Reduction (2026-07-07)
+
+Captured on the same machine/debug-build configuration, with assertions active
+and source revision `aa30151` plus local iteration-19 changes. Same timing
+protocol as above:
+
+- Timing command: `build/lang_bench --repetitions 7`
+- Counter command: `build/lang_bench --counters-only`
+- Counter check: the full deterministic counter output was byte-identical before
+  and after the change; only wall time changed.
+
+Pre-optimization profiling of `verifier_compile` used temporary timing
+instrumentation inside the benchmark/frontend path and was removed before the
+optimization. Median split for the 8,409-byte generated source module:
+
+| phase | median ms | share |
+| --- | ---: | ---: |
+| lex | 0.774 | 1.9% |
+| parse | 0.693 | 1.7% |
+| type check | 3.301 | 8.2% |
+| codegen | 0.181 | 0.4% |
+| initial verification | 17.764 | 43.9% |
+| stack-map round-trip verification | 17.534 | 43.3% |
+| total | 40.493 | 100.0% |
+
+The optimization reduces verifier constant factors without changing the
+abstract lattice representation: successor states are moved instead of copied,
+the worklist reuses its successor buffer, first-arrival states are moved into the
+state table, and successful stack pops no longer allocate context strings. The
+compile-time stack-map round-trip assertion remains active; it was not weakened
+or made release-only.
+
+| bench | before median ms | after median ms | change |
+| --- | ---: | ---: | ---: |
+| `alloc_churn` | 4.206 | 2.743 | -34.8% |
+| `survivor_heavy` | 37.191 | 28.180 | -24.2% |
+| `mutation_heavy` | 1.723 | 1.577 | -8.5% |
+| `deep_recursion_alloc` | 9.216 | 8.393 | -8.9% |
+| `verifier_compile` | 44.564 | 26.115 | -41.4% |
+
+`verifier_compile` is the meaningful target workload for this change and drops
+by about 18.4ms. The runtime workloads are still reported for the full protocol;
+their medians moved favorably in this capture, but they do not pay verifier work
+inside the timed execution path after iteration 17, so those changes should be
+treated as informational host-run variance rather than the design justification.

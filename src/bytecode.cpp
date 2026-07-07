@@ -9,6 +9,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -135,7 +136,7 @@ bool reject(std::vector<VerifierDiagnostic>& diagnostics,
 }
 
 std::string instruction_message(const Function& function, std::size_t pc,
-                                const std::string& detail) {
+                                std::string_view detail) {
     std::ostringstream out;
     out << op_name(function.code[pc].op) << " at pc " << pc << ": " << detail;
     return out.str();
@@ -461,23 +462,25 @@ bool pop_any_or_report(AbstractState& state,
                        std::size_t function_index,
                        std::size_t pc,
                        VerifierReason underflow_reason,
-                       const std::string& context,
+                       std::string_view context,
                        AbstractValue* out = nullptr) {
     if (state.stack.empty()) {
+        std::ostringstream message;
+        message << context << " requires a stack value";
         return reject(diagnostics, function_index, pc, underflow_reason,
-                      instruction_message(function, pc, context +
-                                                       " requires a stack value"));
+                      instruction_message(function, pc, message.str()));
     }
-    const auto value = state.stack.back();
+    const auto& value = state.stack.back();
     if (is_poison(value)) {
+        std::ostringstream message;
+        message << context << " consumed a poison value";
         return reject(diagnostics, function_index, pc, VerifierReason::PoisonUse,
-                      instruction_message(function, pc, context +
-                                                       " consumed a poison value"));
+                      instruction_message(function, pc, message.str()));
+    }
+    if (out != nullptr) {
+        *out = std::move(state.stack.back());
     }
     state.stack.pop_back();
-    if (out != nullptr) {
-        *out = value;
-    }
     return true;
 }
 
@@ -489,7 +492,7 @@ bool pop_expect_or_report(AbstractState& state,
                           AbstractKind expected,
                           VerifierReason underflow_reason,
                           VerifierReason mismatch_reason,
-                          const std::string& context,
+                          std::string_view context,
                           AbstractValue* out = nullptr) {
     AbstractValue actual;
     if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
@@ -504,14 +507,14 @@ bool pop_expect_or_report(AbstractState& state,
                       instruction_message(function, pc, message.str()));
     }
     if (out != nullptr) {
-        *out = actual;
+        *out = std::move(actual);
     }
     return true;
 }
 
 bool push_fallthrough_or_report(
     std::size_t pc, const Function& function, std::size_t function_index,
-    const AbstractState& state,
+    AbstractState&& state,
     std::vector<std::pair<std::size_t, AbstractState>>& successors,
     std::vector<VerifierDiagnostic>& diagnostics) {
     const auto next_pc = pc + 1;
@@ -520,7 +523,7 @@ bool push_fallthrough_or_report(
                       instruction_message(function, pc,
                                           "instruction would fall through past function end"));
     }
-    successors.push_back({next_pc, state});
+    successors.emplace_back(next_pc, std::move(state));
     return true;
 }
 
@@ -748,11 +751,11 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
     switch (ins.op) {
     case OpCode::ConstantI64:
         state.stack.push_back(int64_value());
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     case OpCode::Nil:
         state.stack.push_back(nil_object_value());
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     case OpCode::IsNil: {
         AbstractValue value;
@@ -765,7 +768,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         auto result = bool_value();
         result.nil_test_local = value.source_local;
         state.stack.push_back(result);
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
     case OpCode::AddI64:
@@ -778,7 +781,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             return false;
         }
         state.stack.push_back(int64_value());
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     case OpCode::LessI64:
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
@@ -790,7 +793,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             return false;
         }
         state.stack.push_back(bool_value());
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     case OpCode::AllocPair: {
         AbstractValue right;
@@ -808,7 +811,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             (void)join_value_into(it->second.right, allocated.right);
         }
         state.stack.push_back(object_value(pc));
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
     case OpCode::GetLeft:
@@ -833,8 +836,8 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                           instruction_message(function, pc,
                                               "pair field read produced a poison value"));
         }
-        state.stack.push_back(loaded);
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        state.stack.push_back(std::move(loaded));
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
     case OpCode::SetLeft:
@@ -857,7 +860,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                           instruction_message(function, pc,
                                               "stored value does not satisfy pair field facts"));
         }
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
     case OpCode::LoadLocal: {
@@ -887,8 +890,8 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         auto loaded = *state.locals[local_index];
         loaded.source_local = local_index;
         loaded.nil_test_local.reset();
-        state.stack.push_back(loaded);
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        state.stack.push_back(std::move(loaded));
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
     case OpCode::StoreLocal: {
@@ -908,7 +911,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         }
         state.locals[static_cast<std::size_t>(ins.operand)] =
             without_provenance(stored);
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
     case OpCode::Jump:
@@ -920,7 +923,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                           VerifierReason::BadJumpTarget,
                           instruction_message(function, pc, message.str()));
         }
-        successors.push_back({static_cast<std::size_t>(ins.operand), state});
+        successors.emplace_back(static_cast<std::size_t>(ins.operand), std::move(state));
         return true;
     case OpCode::JumpIfFalse: {
         if (!is_valid_target(ins.operand, function.code.size())) {
@@ -950,12 +953,14 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                 false_state.locals[local]->includes_nil = false;
             }
         }
-        successors.push_back({static_cast<std::size_t>(ins.operand), false_state});
-        return push_fallthrough_or_report(pc, function, function_index, true_state,
+        successors.emplace_back(static_cast<std::size_t>(ins.operand),
+                                std::move(false_state));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(true_state),
                                           successors, diagnostics);
     }
     case OpCode::Collect:
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     case OpCode::Call: {
         if (ins.operand < 0 ||
@@ -994,7 +999,7 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             }
         }
         state.stack.push_back(value_from_signature(return_signature(callee)));
-        return push_fallthrough_or_report(pc, function, function_index, state,
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
     case OpCode::Return: {
@@ -1062,11 +1067,13 @@ std::optional<VerificationResult> verify_function_with_stack_maps(
     states[0] = initial;
     worklist.push_back(0);
 
+    std::vector<std::pair<std::size_t, AbstractState>> successors;
+    successors.reserve(2);
     while (!worklist.empty()) {
         const auto pc = worklist.front();
         worklist.pop_front();
 
-        std::vector<std::pair<std::size_t, AbstractState>> successors;
+        successors.clear();
         if (!transfer_instruction(module, function_index, pc, *states[pc], successors,
                                   diagnostics)) {
             return std::nullopt;
@@ -1074,7 +1081,7 @@ std::optional<VerificationResult> verify_function_with_stack_maps(
 
         for (auto& [target, state] : successors) {
             if (!states[target].has_value()) {
-                states[target] = state;
+                states[target] = std::move(state);
                 worklist.push_back(target);
                 continue;
             }
