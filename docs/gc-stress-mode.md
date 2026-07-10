@@ -58,11 +58,12 @@ at most `7` recursive frames plus the entry frame, well below the VM's default c
 limit of `1024`.
 
 The array grammar is isolated from the legacy bytecode grammars. It emits bytecode-only
-scalar-array programs that promote an anchor pair, publish a young `ScalarArray` through
-that old pair, drop the direct reference, retrieve the array through pair field facts, and
-exercise `ArrayLen`, `ArraySet`, and `ArrayGet` around deterministic collections. Its
-seed-17 bytecode listing is pinned separately from the original single-function and call
-snapshots.
+mixed array programs that promote an anchor pair, publish young `ScalarArray` and
+`RefArray` objects through that old pair, retrieve them through pair field facts, exercise
+`ArrayLen`, `ArraySet`, `ArrayGet`, `AllocRefArray`, `RefArraySet`, and `RefArrayGet`,
+and then stores young pair/scalar-array/self references through old RefArray elements
+around deterministic collections. Its seed-17 bytecode listing is pinned separately from
+the original single-function and call snapshots.
 
 CTest runs three corpora, each across these schedules:
 
@@ -84,11 +85,12 @@ The oracle executes the same generated program under every schedule and compares
 observable return value to `no_stress`. Scalar returns compare by tag and value. Object
 returns compare a canonical deep graph serialization from the returned object: traversal
 assigns schedule-local node numbers in descriptor order, records pair fields and scalar
-array raw elements, and preserves sharing and cycles through repeated node references
-instead of comparing `ObjectId` values. Raw array elements are printed as integers only;
-they are never interpreted as references by the oracle or collector. Any divergence,
-verifier rejection, unexpected trap, stale id, or GC validator failure prints the seed,
-schedule, full bytecode listing, and a one-line replay command.
+array raw elements, records RefArray element references, and preserves sharing and cycles
+through repeated node references instead of comparing `ObjectId` values. Raw array
+elements are printed as integers only; they are never interpreted as references by the
+oracle or collector. Any divergence, verifier rejection, unexpected trap, stale id, or GC
+validator failure prints the seed, schedule, full bytecode listing, and a one-line replay
+command.
 
 Replay a single-function finding with:
 

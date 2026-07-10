@@ -105,18 +105,22 @@ check. This preserves the old non-nil guarantees for anonymous `pair<T, U>` and 
 - Heap object headers carry an `ObjectKind` plus descriptor length. `Pair` keeps the
   existing pair behavior and pair-only slot accounting: its descriptor length is two
   tagged `Value` fields and its logical storage width remains one base slot. `ScalarArray`
-  is bytecode-only in this iteration; it reserves a descriptor-sized logical storage run
-  and stores a raw contiguous `std::int64_t` payload that is not a `Value` sequence.
+  reserves a descriptor-sized logical storage run and stores a raw contiguous
+  `std::int64_t` payload that is not a `Value` sequence. `RefArray` reserves the same
+  variable-width storage shape but stores a contiguous tagged `Value` payload whose every
+  element is a non-null, descriptor-declared object-reference slot.
 - All heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two tagged
-  fields and scans zero `ScalarArray` payload slots, so raw array elements are never
-  marked, forwarded, validated as references, or entered into the remembered-set logic.
+  fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
+  Raw scalar array elements are never marked, forwarded, validated as references, or
+  entered into the remembered-set logic.
 - Pair field types and named recursive types are verification-time metadata only. They do
   not change `Value`, object layout, stack-map format, root tracing, write barriers,
   forwarding, movement, or heap validation.
-- Pair field mutation is routed through `Heap::store_pair_field`. That method is the
-  single hook point where the generational old-to-young write barrier runs before the new
-  field value is published. `ArraySet` writes raw scalar payload and therefore does not run
-  the write barrier.
+- Pair field mutation is routed through `Heap::store_pair_field`, and RefArray element
+  mutation is routed through `Heap::store_ref_array_element`. Those methods are the only
+  reference-publishing mutation hook points exposed to bytecode, and each runs the
+  generational old-to-young write barrier before the new reference is published.
+  `ArraySet` writes raw scalar payload and therefore does not run the write barrier.
 - Deterministic GC stress is configured with explicit counters: before every allocation,
   after every allocation, after every barrier-triggering old-to-young store, every N
   major-collection bytecode instructions, and every N minor-collection bytecode
@@ -269,7 +273,9 @@ Collection is mark, forward, rewrite, install, validate:
 4. Before installing the compacted slot vector, the collector rewrites all roots
    (`RootProvider` roots from every VM frame, heap handle slots, plus allocation extra
    roots) and every descriptor-declared reference slot in every copied live object through
-   the forwarding table while the old layout can still validate old IDs.
+   the forwarding table while the old layout can still validate old IDs. RefArray element
+   rewriting is not a separate collector path; it is the variable-length case of the same
+   descriptor visitor used by pairs.
 5. After installation, validation walks all roots and all descriptor-declared live-object
    reference slots, checks that every object reference resolves through the current
    generation table, and verifies variable-size storage runs do not overlap.
@@ -302,12 +308,12 @@ The heap has two logical object generations on top of the same slot vector:
 - A dead old object in the remembered set can conservatively keep a young referent alive
   during a minor collection, but never forever: major collection traces only mutator roots,
   so the dead old graph is swept and remembered-set pruning drops the entry.
-- `Heap::store_pair_field` is the only reference-publishing mutation hook exposed to
-  bytecode. On every store of a young object into an old pair field it records the old
-  object before publishing the value. The public heap API does not expose mutable pair
-  fields directly, protecting the barrier-completeness invariant. Scalar arrays do not
-  contain reference slots in this iteration, so `ArraySet` cannot publish an object
-  reference.
+- `Heap::store_pair_field` and `Heap::store_ref_array_element` are the only
+  reference-publishing mutation hooks exposed to bytecode. On every store of a young
+  object into an old pair field or old RefArray element they record the old owner before
+  publishing the value. The public heap API does not expose mutable pair fields or
+  RefArray elements directly, protecting the barrier-completeness invariant. Scalar arrays
+  do not contain reference slots, so `ArraySet` cannot publish an object reference.
 
 Rejected alternative: keep old objects fixed during minor collection and compact only young
 slots. That would reduce forwarding work, but it would leave minor collection unable to
@@ -324,10 +330,11 @@ remembered-set entries.
   `LoadLocal` requires a known initialized kind on every incoming path.
 - Root precision: `verify_with_stack_maps` emits per-function per-pc stack reference maps
   from the verifier's abstract states. A true bit means the slot may contain an object
-  reference, including pair objects and scalar arrays; nullable named-pair slots may
-  contain `nil` in the same reference-capable slot. Hand-written maps, when present, must
-  match the verifier state, and VM-controlled collection points assert that the active
-  frame's runtime stack tags agree with the generated map for the current function and pc.
+  reference, including pair objects, scalar arrays, and RefArrays; nullable named-pair
+  slots may contain `nil` in the same reference-capable slot. Hand-written maps, when
+  present, must match the verifier state, and VM-controlled collection points assert that
+  the active frame's runtime stack tags agree with the generated map for the current
+  function and pc.
 - Frame-root precision: every live frame's locals and operand stack slots are traced as
   mutable roots. A collection triggered in a deep callee rewrites references held by
   suspended callers before the callee or caller can resume.
@@ -343,19 +350,21 @@ remembered-set entries.
   traced and rewritten by major collection, minor collection, stress collection, and
   post-collection validation; destroying or moving a handle removes or transfers exactly
   that slot registration.
-- Generational barrier safety: old-to-young stores are recorded in `Heap::store_pair_field`,
-  minor collection traces young objects from mutator roots plus remembered old objects,
-  remembered-set entries are rewritten/pruned after movement, and validation traps any
-  valid old-to-young field absent from the remembered set.
+- Generational barrier safety: old-to-young stores are recorded in
+  `Heap::store_pair_field` and `Heap::store_ref_array_element`, minor collection traces
+  young objects from mutator roots plus remembered old objects, remembered-set entries are
+  rewritten/pruned after movement, and validation traps any valid old-to-young
+  descriptor-declared field or RefArray element absent from the remembered set.
 - Signature safety: call sites are checked against the callee signature only; returns are
   checked against the current function signature. This keeps bytecode verification
   modular and rejects out-of-range calls, wrong arity, wrong argument kind, wrong
   pair-field kind, malformed named-type references, infinite-unfolding misuse, and wrong
   return kind.
 - GC neutrality: pair-field types and named recursive types never participate in heap
-  layout. Scalar arrays add a bytecode-only reference kind, but stack maps keep the same
-  single reference/non-reference bit per stack slot, and the VM/heap continue to trace,
-  barrier, forward, and validate by runtime `Value` tags plus heap object descriptors.
+  layout. Scalar arrays and RefArrays are bytecode-only reference-capable values, but
+  stack maps keep the same single reference/non-reference bit per stack slot, and the
+  VM/heap continue to trace, barrier, forward, and validate by runtime `Value` tags plus
+  heap object descriptors.
 - Source agreement: `compile_program` does not return bytecode for rejected source, and
   every returned `VerifiedModule` has passed module verification with generated stack
   maps. The returned proof is the single blessed execution product and carries that same

@@ -81,6 +81,12 @@ const char* op_name(lang::OpCode op) {
         return "Nil";
     case lang::OpCode::IsNil:
         return "IsNil";
+    case lang::OpCode::AllocRefArray:
+        return "AllocRefArray";
+    case lang::OpCode::RefArrayGet:
+        return "RefArrayGet";
+    case lang::OpCode::RefArraySet:
+        return "RefArraySet";
     }
     return "<unknown>";
 }
@@ -186,6 +192,7 @@ enum class Kind {
     Bool,
     Object,
     Array,
+    RefArray,
 };
 
 Kind kind_from_value_kind(lang::ValueKind kind) {
@@ -268,6 +275,13 @@ public:
         stack_.push_back(Kind::Array);
     }
 
+    void alloc_ref_array() {
+        pop_reference();
+        pop_expect(Kind::Int64);
+        emit(lang::OpCode::AllocRefArray, 0);
+        stack_.push_back(Kind::RefArray);
+    }
+
     void load_local(std::uint32_t local) {
         assert(local < locals_.size());
         assert(locals_[local].has_value());
@@ -294,6 +308,12 @@ public:
         stack_.push_back(Kind::Array);
     }
 
+    void get_left_ref_array() {
+        pop_expect(Kind::Object);
+        emit(lang::OpCode::GetLeft, 0);
+        stack_.push_back(Kind::RefArray);
+    }
+
     void get_right_object() {
         pop_expect(Kind::Object);
         emit(lang::OpCode::GetRight, 0);
@@ -304,6 +324,12 @@ public:
         pop_expect(Kind::Object);
         emit(lang::OpCode::GetRight, 0);
         stack_.push_back(Kind::Int64);
+    }
+
+    void get_right_ref_array() {
+        pop_expect(Kind::Object);
+        emit(lang::OpCode::GetRight, 0);
+        stack_.push_back(Kind::RefArray);
     }
 
     void set_left() {
@@ -336,6 +362,20 @@ public:
         pop_expect(Kind::Array);
         emit(lang::OpCode::ArrayLen, 0);
         stack_.push_back(Kind::Int64);
+    }
+
+    void ref_array_get_object() {
+        pop_expect(Kind::Int64);
+        pop_expect(Kind::RefArray);
+        emit(lang::OpCode::RefArrayGet, 0);
+        stack_.push_back(Kind::Object);
+    }
+
+    void ref_array_set() {
+        pop_reference();
+        pop_expect(Kind::Int64);
+        pop_expect(Kind::RefArray);
+        emit(lang::OpCode::RefArraySet, 0);
     }
 
     void collect() { emit(lang::OpCode::Collect, 0); }
@@ -381,6 +421,12 @@ private:
         const auto kind = stack_.back();
         stack_.pop_back();
         return kind;
+    }
+
+    void pop_reference() {
+        const auto actual = pop_any();
+        assert(actual == Kind::Object || actual == Kind::Array ||
+               actual == Kind::RefArray);
     }
 
     void pop_expect(Kind expected) {
@@ -554,9 +600,12 @@ lang::Function generate_array_program(std::uint64_t seed) {
     constexpr std::uint32_t kScratch = 2;
     constexpr std::uint32_t kDead = 3;
     constexpr std::uint32_t kObservedLength = 4;
-    constexpr std::uint32_t kLocalCount = 5;
+    constexpr std::uint32_t kRefArray = 5;
+    constexpr std::uint32_t kRefScratch = 6;
+    constexpr std::uint32_t kLocalCount = 7;
 
     const auto length = static_cast<std::int64_t>(1 + rng.bounded(6));
+    const auto ref_length = static_cast<std::int64_t>(2 + rng.bounded(4));
     const auto old_init = rng.small_i64();
     const auto new_init = rng.small_i64();
     const bool collect_after_barrier = rng.bounded(2) == 0;
@@ -570,8 +619,18 @@ lang::Function generate_array_program(std::uint64_t seed) {
     b.alloc_array();
     b.store_local(kArray);
 
-    b.load_local(kArray);
     b.constant_i64(rng.small_i64());
+    b.constant_i64(rng.small_i64());
+    b.alloc_pair();
+    b.store_local(kRefScratch);
+
+    b.constant_i64(ref_length);
+    b.load_local(kRefScratch);
+    b.alloc_ref_array();
+    b.store_local(kRefArray);
+
+    b.load_local(kArray);
+    b.load_local(kRefArray);
     b.alloc_pair();
     b.store_local(kAnchor);
     b.collect();
@@ -617,6 +676,49 @@ lang::Function generate_array_program(std::uint64_t seed) {
         b.constant_i64(index);
         b.array_get_i64();
         b.store_local(kScratch);
+
+        if (rng.bounded(3) == 0) {
+            b.collect();
+        }
+    }
+
+    b.constant_i64(rng.small_i64());
+    b.constant_i64(rng.small_i64());
+    b.alloc_pair();
+    b.store_local(kRefScratch);
+
+    b.constant_i64(ref_length);
+    b.load_local(kRefScratch);
+    b.alloc_ref_array();
+    b.store_local(kRefArray);
+
+    b.load_local(kAnchor);
+    b.load_local(kRefArray);
+    b.set_right();
+    b.collect();
+
+    b.load_local(kAnchor);
+    b.get_right_ref_array();
+    b.store_local(kRefArray);
+
+    for (std::int64_t index = 0; index < ref_length; ++index) {
+        b.load_local(kRefArray);
+        b.constant_i64(index);
+        if (index == 0) {
+            b.load_local(kArray);
+        } else if (index == ref_length - 1) {
+            b.load_local(kRefArray);
+        } else {
+            b.constant_i64(rng.small_i64() + index);
+            b.load_local(kObservedLength);
+            b.alloc_pair();
+        }
+        b.ref_array_set();
+
+        b.load_local(kRefArray);
+        b.constant_i64(index);
+        b.ref_array_get_object();
+        b.store_local(kRefScratch);
 
         if (rng.bounded(3) == 0) {
             b.collect();
@@ -1419,80 +1521,152 @@ function=4 signature=(i64,bool,object)->i64 locals=4
 
 void arrays_pinned_seed_snapshot() {
     const auto function = generate_array_program(kArraySnapshotSeed);
-    const std::string expected = R"SNAPSHOT(locals=5
+    const std::string expected = R"SNAPSHOT(locals=7
   #0 ConstantI64 5
-  #1 ConstantI64 29
+  #1 ConstantI64 -3
   #2 AllocArray 0
   #3 StoreLocal 1
-  #4 LoadLocal 1
-  #5 ConstantI64 26
+  #4 ConstantI64 -35
+  #5 ConstantI64 22
   #6 AllocPair 0
-  #7 StoreLocal 0
-  #8 Collect 0
-  #9 ConstantI64 -35
-  #10 ConstantI64 22
-  #11 AllocPair 0
-  #12 StoreLocal 3
-  #13 ConstantI64 0
-  #14 StoreLocal 3
-  #15 ConstantI64 5
-  #16 ConstantI64 -3
-  #17 AllocArray 0
-  #18 StoreLocal 1
-  #19 LoadLocal 0
-  #20 LoadLocal 1
-  #21 SetLeft 0
-  #22 ConstantI64 0
-  #23 StoreLocal 1
-  #24 LoadLocal 0
-  #25 GetLeft 0
+  #7 StoreLocal 6
+  #8 ConstantI64 5
+  #9 LoadLocal 6
+  #10 AllocRefArray 0
+  #11 StoreLocal 5
+  #12 LoadLocal 1
+  #13 LoadLocal 5
+  #14 AllocPair 0
+  #15 StoreLocal 0
+  #16 Collect 0
+  #17 ConstantI64 -4
+  #18 ConstantI64 36
+  #19 AllocPair 0
+  #20 StoreLocal 3
+  #21 ConstantI64 0
+  #22 StoreLocal 3
+  #23 ConstantI64 5
+  #24 ConstantI64 25
+  #25 AllocArray 0
   #26 StoreLocal 1
-  #27 LoadLocal 1
-  #28 ArrayLen 0
-  #29 StoreLocal 4
-  #30 LoadLocal 1
-  #31 ConstantI64 0
-  #32 ConstantI64 -4
-  #33 ArraySet 0
-  #34 LoadLocal 1
-  #35 ConstantI64 0
-  #36 ArrayGet 0
-  #37 StoreLocal 2
+  #27 LoadLocal 0
+  #28 LoadLocal 1
+  #29 SetLeft 0
+  #30 ConstantI64 0
+  #31 StoreLocal 1
+  #32 LoadLocal 0
+  #33 GetLeft 0
+  #34 StoreLocal 1
+  #35 LoadLocal 1
+  #36 ArrayLen 0
+  #37 StoreLocal 4
   #38 LoadLocal 1
-  #39 ConstantI64 1
-  #40 ConstantI64 -25
+  #39 ConstantI64 0
+  #40 ConstantI64 -26
   #41 ArraySet 0
   #42 LoadLocal 1
-  #43 ConstantI64 1
+  #43 ConstantI64 0
   #44 ArrayGet 0
   #45 StoreLocal 2
   #46 LoadLocal 1
-  #47 ConstantI64 2
-  #48 ConstantI64 17
+  #47 ConstantI64 1
+  #48 ConstantI64 16
   #49 ArraySet 0
   #50 LoadLocal 1
-  #51 ConstantI64 2
+  #51 ConstantI64 1
   #52 ArrayGet 0
   #53 StoreLocal 2
   #54 Collect 0
   #55 LoadLocal 1
-  #56 ConstantI64 3
-  #57 ConstantI64 -35
+  #56 ConstantI64 2
+  #57 ConstantI64 -36
   #58 ArraySet 0
   #59 LoadLocal 1
-  #60 ConstantI64 3
+  #60 ConstantI64 2
   #61 ArrayGet 0
   #62 StoreLocal 2
   #63 LoadLocal 1
-  #64 ConstantI64 4
-  #65 ConstantI64 -11
+  #64 ConstantI64 3
+  #65 ConstantI64 -12
   #66 ArraySet 0
   #67 LoadLocal 1
-  #68 ConstantI64 4
+  #68 ConstantI64 3
   #69 ArrayGet 0
   #70 StoreLocal 2
-  #71 LoadLocal 0
-  #72 Return 0
+  #71 LoadLocal 1
+  #72 ConstantI64 4
+  #73 ConstantI64 23
+  #74 ArraySet 0
+  #75 LoadLocal 1
+  #76 ConstantI64 4
+  #77 ArrayGet 0
+  #78 StoreLocal 2
+  #79 ConstantI64 7
+  #80 ConstantI64 40
+  #81 AllocPair 0
+  #82 StoreLocal 6
+  #83 ConstantI64 5
+  #84 LoadLocal 6
+  #85 AllocRefArray 0
+  #86 StoreLocal 5
+  #87 LoadLocal 0
+  #88 LoadLocal 5
+  #89 SetRight 0
+  #90 Collect 0
+  #91 LoadLocal 0
+  #92 GetRight 0
+  #93 StoreLocal 5
+  #94 LoadLocal 5
+  #95 ConstantI64 0
+  #96 LoadLocal 1
+  #97 RefArraySet 0
+  #98 LoadLocal 5
+  #99 ConstantI64 0
+  #100 RefArrayGet 0
+  #101 StoreLocal 6
+  #102 Collect 0
+  #103 LoadLocal 5
+  #104 ConstantI64 1
+  #105 ConstantI64 -24
+  #106 LoadLocal 4
+  #107 AllocPair 0
+  #108 RefArraySet 0
+  #109 LoadLocal 5
+  #110 ConstantI64 1
+  #111 RefArrayGet 0
+  #112 StoreLocal 6
+  #113 LoadLocal 5
+  #114 ConstantI64 2
+  #115 ConstantI64 22
+  #116 LoadLocal 4
+  #117 AllocPair 0
+  #118 RefArraySet 0
+  #119 LoadLocal 5
+  #120 ConstantI64 2
+  #121 RefArrayGet 0
+  #122 StoreLocal 6
+  #123 Collect 0
+  #124 LoadLocal 5
+  #125 ConstantI64 3
+  #126 ConstantI64 -2
+  #127 LoadLocal 4
+  #128 AllocPair 0
+  #129 RefArraySet 0
+  #130 LoadLocal 5
+  #131 ConstantI64 3
+  #132 RefArrayGet 0
+  #133 StoreLocal 6
+  #134 LoadLocal 5
+  #135 ConstantI64 4
+  #136 LoadLocal 5
+  #137 RefArraySet 0
+  #138 LoadLocal 5
+  #139 ConstantI64 4
+  #140 RefArrayGet 0
+  #141 StoreLocal 6
+  #142 Collect 0
+  #143 LoadLocal 0
+  #144 Return 0
 )SNAPSHOT";
     require(describe(function) == expected,
             "array generator snapshot changed for seed " +

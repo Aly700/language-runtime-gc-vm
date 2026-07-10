@@ -32,6 +32,9 @@ enum class OpCode {
     Return,
     Nil,
     IsNil,
+    AllocRefArray,
+    RefArrayGet,
+    RefArraySet,
 };
 
 struct Instruction {

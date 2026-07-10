@@ -21,7 +21,12 @@
 - The collector must never treat non-reference values as references.
 - Every heap object has a descriptor derived from its header kind and length. The
   collector may inspect only descriptor-declared reference slots: `Pair` scans its two
-  tagged `Value` fields, while `ScalarArray` scans zero payload slots.
+  tagged `Value` fields, `RefArray` scans every tagged `Value` object-reference payload
+  slot, and `ScalarArray` scans zero payload slots.
+- Reference-bearing variable-length payloads must be expressed through the same
+  descriptor visitor as fixed-size objects. Marking, forwarding, remembered-set
+  validation, and post-collection validation may not add one-off object-kind scans
+  outside that descriptor path.
 - `ScalarArray` payload elements are raw `i64` values, not tagged `Value`s. Even if a raw
   element's bit pattern equals a valid or stale `ObjectId`, marking, forwarding,
   remembered-set validation, and post-collection validation must not interpret it as a
@@ -32,7 +37,9 @@
 - No object may be swept while reachable.
 - If a moving collector is introduced, every root and heap reference must be updated before mutator execution resumes.
 - Every live embedder handle is a precise mutable root slot; handle destruction removes that slot before the next collection, and the heap must outlive all handles.
-- Write barriers must run on every old-to-young reference store once generations exist.
+- Write barriers must run on every old-to-young reference store once generations exist,
+  including `Pair` field stores and `RefArray` element stores. Raw `ScalarArray` stores
+  are not reference-publishing mutations and must not enter the remembered set.
 
 ## Testing
 
