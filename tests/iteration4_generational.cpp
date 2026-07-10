@@ -63,6 +63,12 @@ const char* op_name(lang::OpCode op) {
         return "Nil";
     case lang::OpCode::IsNil:
         return "IsNil";
+    case lang::OpCode::AllocRefArray:
+        return "AllocRefArray";
+    case lang::OpCode::RefArrayGet:
+        return "RefArrayGet";
+    case lang::OpCode::RefArraySet:
+        return "RefArraySet";
     }
     return "<unknown>";
 }

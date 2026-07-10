@@ -22,6 +22,7 @@ enum class AbstractKind {
     Bool,
     Object,
     Array,
+    RefArray,
     Nil,
     Poison,
 };
@@ -100,6 +101,12 @@ const char* op_name(OpCode op) {
         return "Nil";
     case OpCode::IsNil:
         return "IsNil";
+    case OpCode::AllocRefArray:
+        return "AllocRefArray";
+    case OpCode::RefArrayGet:
+        return "RefArrayGet";
+    case OpCode::RefArraySet:
+        return "RefArraySet";
     }
     return "<invalid>";
 }
@@ -130,6 +137,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "Object";
     case AbstractKind::Array:
         return "Array";
+    case AbstractKind::RefArray:
+        return "RefArray";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -164,6 +173,7 @@ AbstractValue value_with_kind(AbstractKind kind) {
 AbstractValue int64_value() { return value_with_kind(AbstractKind::Int64); }
 AbstractValue bool_value() { return value_with_kind(AbstractKind::Bool); }
 AbstractValue array_value() { return value_with_kind(AbstractKind::Array); }
+AbstractValue ref_array_value() { return value_with_kind(AbstractKind::RefArray); }
 AbstractValue poison_value() { return value_with_kind(AbstractKind::Poison); }
 
 AbstractValue nil_object_value() {
@@ -245,7 +255,8 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
 }
 
 bool is_reference_kind(AbstractKind kind) {
-    return kind == AbstractKind::Object || kind == AbstractKind::Array;
+    return kind == AbstractKind::Object || kind == AbstractKind::Array ||
+           kind == AbstractKind::RefArray;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -532,6 +543,34 @@ bool pop_expect_or_report(AbstractState& state,
     return true;
 }
 
+bool pop_reference_or_report(AbstractState& state,
+                             std::vector<VerifierDiagnostic>& diagnostics,
+                             const Function& function,
+                             std::size_t function_index,
+                             std::size_t pc,
+                             VerifierReason underflow_reason,
+                             VerifierReason mismatch_reason,
+                             std::string_view context,
+                             AbstractValue* out = nullptr) {
+    AbstractValue actual;
+    if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                           underflow_reason, context, &actual)) {
+        return false;
+    }
+    if (!is_reference_kind(actual.kind) ||
+        (actual.kind == AbstractKind::Object && actual.includes_nil)) {
+        std::ostringstream message;
+        message << context << " expected a non-nil reference but found "
+                << abstract_kind_name(actual.kind);
+        return reject(diagnostics, function_index, pc, mismatch_reason,
+                      instruction_message(function, pc, message.str()));
+    }
+    if (out != nullptr) {
+        *out = std::move(actual);
+    }
+    return true;
+}
+
 bool push_fallthrough_or_report(
     std::size_t pc, const Function& function, std::size_t function_index,
     AbstractState&& state,
@@ -660,7 +699,14 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
                                 const AbstractValue& value,
                                 const AbstractValue& expected,
                                 std::set<ConformanceAssumption>& assumptions) {
-    if (is_poison(value) || is_poison(expected) || value.kind != expected.kind) {
+    if (is_poison(value) || is_poison(expected)) {
+        return false;
+    }
+    if (value.kind == AbstractKind::RefArray && expected.kind == AbstractKind::Object) {
+        return !expected.includes_nil && !expected.signature_named_type.has_value() &&
+               expected.signature_fields == nullptr;
+    }
+    if (value.kind != expected.kind) {
         return false;
     }
     if (expected.kind != AbstractKind::Object) {
@@ -881,6 +927,51 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         state.stack.push_back(int64_value());
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    case OpCode::AllocRefArray:
+        if (!pop_reference_or_report(state, diagnostics, function, function_index, pc,
+                                     VerifierReason::StackUnderflow,
+                                     VerifierReason::BadArrayOperation,
+                                     "ref array init value") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation,
+                                  "ref array length")) {
+            return false;
+        }
+        state.stack.push_back(ref_array_value());
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
+                                          successors, diagnostics);
+    case OpCode::RefArrayGet:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation,
+                                  "ref array index") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::RefArray, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation,
+                                  "ref array receiver")) {
+            return false;
+        }
+        state.stack.push_back(opaque_object_value());
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
+                                          successors, diagnostics);
+    case OpCode::RefArraySet:
+        if (!pop_reference_or_report(state, diagnostics, function, function_index, pc,
+                                     VerifierReason::StackUnderflow,
+                                     VerifierReason::BadArrayOperation,
+                                     "ref array stored value") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation,
+                                  "ref array index") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::RefArray, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation,
+                                  "ref array receiver")) {
+            return false;
+        }
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
+                                          successors, diagnostics);
     case OpCode::GetLeft:
     case OpCode::GetRight: {
         AbstractValue receiver;
@@ -1046,11 +1137,9 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             const auto parameter_index = i - 1;
             std::ostringstream context;
             context << "argument " << parameter_index;
-            if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
-                                      abstract_kind(callee.parameters[parameter_index]),
-                                      VerifierReason::BadCallArity,
-                                      VerifierReason::BadCallArgKind,
-                                      context.str(), &argument)) {
+            if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                                   VerifierReason::BadCallArity, context.str(),
+                                   &argument)) {
                 return false;
             }
             if (!value_conforms_to_signature(module, state, argument,

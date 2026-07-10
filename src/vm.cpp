@@ -268,6 +268,57 @@ Value VM::execute_verified(const Module& module,
             ++frame.pc;
             break;
         }
+        case OpCode::AllocRefArray: {
+            const auto init_value = pop(frame);
+            const auto length_value = pop(frame);
+            assert(init_value.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: AllocRefArray init must be an object reference");
+            assert(length_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: AllocRefArray length must be i64");
+            const auto length = length_value.as_i64();
+            if (length < 0) {
+                throw std::out_of_range("ref array length out of bounds");
+            }
+            push(frame, Value::object(heap_.allocate_ref_array(
+                            static_cast<std::size_t>(length), init_value)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::RefArrayGet: {
+            const auto index_value = pop(frame);
+            const auto receiver = pop(frame);
+            assert(index_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: RefArrayGet index must be i64");
+            assert(receiver.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: RefArrayGet receiver must be object");
+            const auto index = index_value.as_i64();
+            if (index < 0) {
+                throw std::out_of_range("ref array index out of bounds");
+            }
+            push(frame, heap_.ref_array_get(receiver.as_object(),
+                                            static_cast<std::size_t>(index)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::RefArraySet: {
+            const auto stored_value = pop(frame);
+            const auto index_value = pop(frame);
+            const auto receiver = pop(frame);
+            assert(stored_value.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: RefArraySet value must be an object reference");
+            assert(index_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: RefArraySet index must be i64");
+            assert(receiver.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: RefArraySet receiver must be object");
+            const auto index = index_value.as_i64();
+            if (index < 0) {
+                throw std::out_of_range("ref array index out of bounds");
+            }
+            heap_.ref_array_set(receiver.as_object(), static_cast<std::size_t>(index),
+                                stored_value);
+            ++frame.pc;
+            break;
+        }
         case OpCode::GetLeft: {
             const auto receiver = pop(frame);
             assert(receiver.tag() == Value::Tag::Object &&

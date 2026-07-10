@@ -169,6 +169,18 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             }
             rendered << ")";
             break;
+        case lang::gc::ObjectKind::RefArray:
+            rendered << "refarray[" << heap.ref_array_length(order[i]) << "](";
+            for (std::size_t element = 0; element < heap.ref_array_length(order[i]);
+                 ++element) {
+                if (element != 0) {
+                    rendered << ", ";
+                }
+                rendered << value_token(heap, heap.ref_array_get(order[i], element),
+                                        indexes, order);
+            }
+            rendered << ")";
+            break;
         }
         objects.push_back(rendered.str());
     }

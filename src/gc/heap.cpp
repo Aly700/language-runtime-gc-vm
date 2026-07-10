@@ -7,6 +7,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -55,6 +56,8 @@ std::size_t storage_slot_count(const Object& object) {
         return 1;
     case ObjectKind::ScalarArray:
         return object.length == 0 ? 1 : object.length;
+    case ObjectKind::RefArray:
+        return object.length == 0 ? 1 : object.length;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -62,17 +65,30 @@ std::size_t storage_slot_count(const Object& object) {
 void validate_descriptor_shape(const Object& object) {
     switch (object.kind) {
     case ObjectKind::Pair:
-        if (object.length != 2 || !object.scalar_elements.empty()) {
+        if (object.length != 2 || !object.scalar_elements.empty() ||
+            !object.ref_elements.empty()) {
             throw std::logic_error("pair object descriptor does not match pair payload");
         }
         return;
     case ObjectKind::ScalarArray:
-        if (object.scalar_elements.size() != object.length) {
+        if (object.scalar_elements.size() != object.length ||
+            !object.ref_elements.empty()) {
             throw std::logic_error("scalar array descriptor length does not match payload");
+        }
+        return;
+    case ObjectKind::RefArray:
+        if (!object.scalar_elements.empty() || object.ref_elements.size() != object.length) {
+            throw std::logic_error("ref array descriptor length does not match payload");
         }
         return;
     }
     throw std::logic_error("unknown object kind");
+}
+
+void require_object_reference_value(Value value, const char* context) {
+    if (!value.is_object()) {
+        throw std::logic_error(std::string(context) + " must be an object reference");
+    }
 }
 
 template <typename Fn>
@@ -84,6 +100,11 @@ void visit_reference_fields(Object& object, Fn&& fn) {
         fn(object.right);
         return;
     case ObjectKind::ScalarArray:
+        return;
+    case ObjectKind::RefArray:
+        for (auto& element : object.ref_elements) {
+            fn(element);
+        }
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -98,6 +119,11 @@ void visit_reference_fields(const Object& object, Fn&& fn) {
         fn(object.right);
         return;
     case ObjectKind::ScalarArray:
+        return;
+    case ObjectKind::RefArray:
+        for (const auto& element : object.ref_elements) {
+            fn(element);
+        }
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -114,6 +140,13 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
         fn(object.left);
         return;
     case ObjectKind::ScalarArray:
+        return;
+    case ObjectKind::RefArray:
+        // Push in reverse because the mark worklist is LIFO; this preserves
+        // ascending element trace order while keeping scan shape descriptor-owned.
+        for (std::size_t i = object.ref_elements.size(); i > 0; --i) {
+            fn(object.ref_elements[i - 1]);
+        }
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -140,6 +173,20 @@ Object Object::scalar_array(std::size_t length, std::int64_t init) {
     object.left = Value::nil();
     object.right = Value::nil();
     object.scalar_elements.assign(length, init);
+    return object;
+}
+
+Object Object::ref_array(std::size_t length, Value init) {
+    if (length > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("ref array length exceeds object header limit");
+    }
+    require_object_reference_value(init, "ref array init value");
+    Object object;
+    object.kind = ObjectKind::RefArray;
+    object.length = static_cast<std::uint32_t>(length);
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.ref_elements.assign(length, init);
     return object;
 }
 
@@ -304,6 +351,25 @@ ObjectId Heap::allocate_scalar_array(std::size_t length, std::int64_t init) {
     return id;
 }
 
+ObjectId Heap::allocate_ref_array(std::size_t length, Value init) {
+    require_object_reference_value(init, "ref array init value");
+    if (stress_config_.collect_before_every_allocation) {
+        std::array<Value*, 1> operand_roots{&init};
+        collect_with_extra_roots(operand_roots);
+    }
+
+    auto id = allocate_object(Object::ref_array(length, init));
+
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+
+    return id;
+}
+
 Handle Heap::make_handle(Value value) {
     if (value.is_object()) {
         (void)checked_slot(value.as_object());
@@ -441,6 +507,24 @@ Object& Heap::checked_scalar_array(ObjectId id) {
     return object;
 }
 
+const Object& Heap::checked_ref_array(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::RefArray) {
+        throw std::logic_error("object is not a ref array");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object& Heap::checked_ref_array(ObjectId id) {
+    auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::RefArray) {
+        throw std::logic_error("object is not a ref array");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
 void Heap::register_handle_root(Value* slot) {
     assert(slot != nullptr && "cannot register a null GC handle root slot");
     handle_roots_.push_back(slot);
@@ -512,6 +596,22 @@ void Heap::array_set(ObjectId id, std::size_t index, std::int64_t value) {
     object.scalar_elements[index] = value;
 }
 
+std::size_t Heap::ref_array_length(ObjectId id) const {
+    return checked_ref_array(id).length;
+}
+
+Value Heap::ref_array_get(ObjectId id, std::size_t index) const {
+    const auto& object = checked_ref_array(id);
+    if (index >= object.ref_elements.size()) {
+        throw std::out_of_range("ref array index out of bounds");
+    }
+    return object.ref_elements[index];
+}
+
+void Heap::ref_array_set(ObjectId id, std::size_t index, Value value) {
+    store_ref_array_element(id, index, value);
+}
+
 void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     // Barrier hook: every pair field mutation must flow through this method. The public
     // heap API intentionally exposes only const object inspection plus set_left/set_right,
@@ -524,6 +624,21 @@ void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     } else {
         obj.right = value;
     }
+
+    if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
+        collect_minor();
+    }
+}
+
+void Heap::store_ref_array_element(ObjectId id, std::size_t index, Value value) {
+    require_object_reference_value(value, "ref array stored value");
+    auto& obj = checked_ref_array(id);
+    if (index >= obj.ref_elements.size()) {
+        throw std::out_of_range("ref array index out of bounds");
+    }
+
+    const bool barrier_triggered = record_write_barrier_if_needed(id, value);
+    obj.ref_elements[index] = value;
 
     if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
         collect_minor();
@@ -927,6 +1042,10 @@ bool Heap::TEST_ONLY_is_old_object(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_scalar_array(ObjectId id) const {
     return object(id).kind == ObjectKind::ScalarArray;
+}
+
+bool Heap::TEST_ONLY_is_ref_array(ObjectId id) const {
+    return object(id).kind == ObjectKind::RefArray;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {
