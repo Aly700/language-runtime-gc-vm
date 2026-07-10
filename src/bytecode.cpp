@@ -32,9 +32,11 @@ struct PairFields;
 struct AbstractValue {
     AbstractKind kind{AbstractKind::Poison};
     std::set<std::size_t> object_sites;
+    std::set<std::size_t> ref_array_sites;
     bool includes_opaque_object{false};
     bool includes_nil{false};
     std::shared_ptr<const PairFields> signature_fields;
+    std::shared_ptr<const AbstractValue> signature_array_element;
     std::optional<std::size_t> signature_named_type;
     std::optional<std::size_t> source_local;
     std::optional<std::size_t> nil_test_local;
@@ -49,6 +51,7 @@ struct AbstractState {
     std::vector<AbstractValue> stack;
     std::vector<std::optional<AbstractValue>> locals;
     std::map<std::size_t, PairFields> fields_by_site;
+    std::map<std::size_t, AbstractValue> ref_array_elements_by_site;
 };
 
 enum class JoinOutcome {
@@ -174,6 +177,13 @@ AbstractValue int64_value() { return value_with_kind(AbstractKind::Int64); }
 AbstractValue bool_value() { return value_with_kind(AbstractKind::Bool); }
 AbstractValue array_value() { return value_with_kind(AbstractKind::Array); }
 AbstractValue ref_array_value() { return value_with_kind(AbstractKind::RefArray); }
+
+AbstractValue ref_array_value(std::size_t site) {
+    AbstractValue value;
+    value.kind = AbstractKind::RefArray;
+    value.ref_array_sites.insert(site);
+    return value;
+}
 AbstractValue poison_value() { return value_with_kind(AbstractKind::Poison); }
 
 AbstractValue nil_object_value() {
@@ -215,6 +225,10 @@ std::shared_ptr<const PairFields> fields_ptr(PairFields fields) {
     return std::make_shared<const PairFields>(std::move(fields));
 }
 
+std::shared_ptr<const AbstractValue> abstract_value_ptr(AbstractValue value) {
+    return std::make_shared<const AbstractValue>(std::move(value));
+}
+
 AbstractKind abstract_kind(ValueKind kind) {
     switch (kind) {
     case ValueKind::Int64:
@@ -238,6 +252,12 @@ AbstractValue value_from_signature(ValueKind kind) {
     return value_with_kind(abstract_kind(kind));
 }
 
+bool signature_array_uses_ref_payload(const SignatureValue& signature) {
+    return signature.has_array_element() &&
+           (signature.element->kind == ValueKind::Object ||
+            signature.element->kind == ValueKind::Array);
+}
+
 AbstractValue value_from_signature(const SignatureValue& signature) {
     if (signature.is_named_type_reference()) {
         return named_signature_object_value(*signature.named_type);
@@ -249,6 +269,18 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
             value_from_signature(*signature.left),
             value_from_signature(*signature.right),
         });
+        return value;
+    }
+    if (signature.has_array_element()) {
+        if (!signature_array_uses_ref_payload(signature)) {
+            return array_value();
+        }
+        auto value = ref_array_value();
+        auto element = value_from_signature(*signature.element);
+        if (element.kind == AbstractKind::Object) {
+            element.includes_nil = false;
+        }
+        value.signature_array_element = abstract_value_ptr(std::move(element));
         return value;
     }
     return value_from_signature(signature.kind);
@@ -290,7 +322,13 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature_shape_matches_kind(*signature.right, signature.right->kind,
                                             module);
     }
+    if (signature.has_array_element()) {
+        return signature.kind == ValueKind::Array &&
+               signature_shape_matches_kind(*signature.element,
+                                            signature.element->kind, module);
+    }
     return signature.left == nullptr && signature.right == nullptr &&
+           signature.element == nullptr &&
            !signature.named_type.has_value();
 }
 
@@ -328,12 +366,17 @@ bool signature_is_well_formed(const FunctionSignature& signature,
 
 bool fields_equal(const std::shared_ptr<const PairFields>& lhs,
                   const std::shared_ptr<const PairFields>& rhs);
+bool abstract_value_ptr_equal(const std::shared_ptr<const AbstractValue>& lhs,
+                              const std::shared_ptr<const AbstractValue>& rhs);
 
 bool operator==(const AbstractValue& lhs, const AbstractValue& rhs) {
     return lhs.kind == rhs.kind && lhs.object_sites == rhs.object_sites &&
+           lhs.ref_array_sites == rhs.ref_array_sites &&
            lhs.includes_opaque_object == rhs.includes_opaque_object &&
            lhs.includes_nil == rhs.includes_nil &&
            fields_equal(lhs.signature_fields, rhs.signature_fields) &&
+           abstract_value_ptr_equal(lhs.signature_array_element,
+                                    rhs.signature_array_element) &&
            lhs.signature_named_type == rhs.signature_named_type &&
            lhs.source_local == rhs.source_local &&
            lhs.nil_test_local == rhs.nil_test_local;
@@ -345,6 +388,14 @@ bool operator==(const PairFields& lhs, const PairFields& rhs) {
 
 bool fields_equal(const std::shared_ptr<const PairFields>& lhs,
                   const std::shared_ptr<const PairFields>& rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return lhs == rhs;
+    }
+    return *lhs == *rhs;
+}
+
+bool abstract_value_ptr_equal(const std::shared_ptr<const AbstractValue>& lhs,
+                              const std::shared_ptr<const AbstractValue>& rhs) {
     if (lhs == nullptr || rhs == nullptr) {
         return lhs == rhs;
     }
@@ -395,6 +446,19 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
         } else {
             joined.signature_fields = rhs.signature_fields;
         }
+    } else if (joined.kind == AbstractKind::RefArray) {
+        joined.ref_array_sites.insert(rhs.ref_array_sites.begin(),
+                                      rhs.ref_array_sites.end());
+        if (lhs.signature_array_element != nullptr &&
+            rhs.signature_array_element != nullptr) {
+            joined.signature_array_element = abstract_value_ptr(
+                join_values(*lhs.signature_array_element,
+                            *rhs.signature_array_element));
+        } else if (lhs.signature_array_element != nullptr) {
+            joined.signature_array_element = lhs.signature_array_element;
+        } else {
+            joined.signature_array_element = rhs.signature_array_element;
+        }
     }
     if (lhs.source_local == rhs.source_local) {
         joined.source_local = lhs.source_local;
@@ -411,6 +475,28 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
 
 bool join_value_into(AbstractValue& destination, const AbstractValue& incoming) {
     const auto joined = join_values(destination, incoming);
+    if (joined == destination) {
+        return false;
+    }
+    destination = joined;
+    return true;
+}
+
+AbstractValue join_ref_array_element_values(const AbstractValue& lhs,
+                                            const AbstractValue& rhs) {
+    const auto joined = join_values(lhs, rhs);
+    if (!is_poison(joined)) {
+        return joined;
+    }
+    if (is_reference_kind(lhs.kind) && is_reference_kind(rhs.kind)) {
+        return opaque_object_value();
+    }
+    return joined;
+}
+
+bool join_ref_array_element_into(AbstractValue& destination,
+                                 const AbstractValue& incoming) {
+    const auto joined = join_ref_array_element_values(destination, incoming);
     if (joined == destination) {
         return false;
     }
@@ -454,6 +540,16 @@ JoinOutcome join_state_into(AbstractState& destination, const AbstractState& inc
         }
         changed = join_value_into(it->second.left, incoming_fields.left) || changed;
         changed = join_value_into(it->second.right, incoming_fields.right) || changed;
+    }
+
+    for (const auto& [site, incoming_element] : incoming.ref_array_elements_by_site) {
+        auto [it, inserted] =
+            destination.ref_array_elements_by_site.emplace(site, incoming_element);
+        if (inserted) {
+            changed = true;
+            continue;
+        }
+        changed = join_ref_array_element_into(it->second, incoming_element) || changed;
     }
 
     return changed ? JoinOutcome::Changed : JoinOutcome::Unchanged;
@@ -687,6 +783,30 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
                                 const AbstractValue& expected,
                                 std::set<ConformanceAssumption>& assumptions);
 
+bool load_ref_array_element(const AbstractState& state, const AbstractValue& receiver,
+                            AbstractValue& out) {
+    std::optional<AbstractValue> loaded;
+    if (receiver.signature_array_element != nullptr) {
+        loaded = *receiver.signature_array_element;
+    }
+    for (const auto site : receiver.ref_array_sites) {
+        const auto it = state.ref_array_elements_by_site.find(site);
+        if (it == state.ref_array_elements_by_site.end()) {
+            return false;
+        }
+        if (!loaded.has_value()) {
+            loaded = it->second;
+        } else {
+            *loaded = join_ref_array_element_values(*loaded, it->second);
+        }
+    }
+    if (!loaded.has_value() || is_poison(*loaded)) {
+        return false;
+    }
+    out = *loaded;
+    return true;
+}
+
 bool value_conforms_to_signature(const Module& module, const AbstractState& state,
                                  const AbstractValue& value,
                                  const SignatureValue& signature) {
@@ -708,6 +828,28 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
     }
     if (value.kind != expected.kind) {
         return false;
+    }
+    if (expected.kind == AbstractKind::RefArray) {
+        if (expected.signature_array_element == nullptr) {
+            return true;
+        }
+        if (value.signature_array_element != nullptr &&
+            !value_conforms_to_expected(module, state, *value.signature_array_element,
+                                        *expected.signature_array_element,
+                                        assumptions)) {
+            return false;
+        }
+        for (const auto site : value.ref_array_sites) {
+            const auto it = state.ref_array_elements_by_site.find(site);
+            if (it == state.ref_array_elements_by_site.end() ||
+                !value_conforms_to_expected(module, state, it->second,
+                                            *expected.signature_array_element,
+                                            assumptions)) {
+                return false;
+            }
+        }
+        return value.signature_array_element != nullptr ||
+               !value.ref_array_sites.empty();
     }
     if (expected.kind != AbstractKind::Object) {
         return true;
@@ -804,6 +946,28 @@ bool store_pair_field(const Module& module, AbstractState& state,
     return receiver.signature_fields != nullptr ||
            receiver.signature_named_type.has_value() || !receiver.object_sites.empty() ||
            receiver.includes_opaque_object;
+}
+
+bool store_ref_array_element(const Module& module, AbstractState& state,
+                             const AbstractValue& receiver,
+                             const AbstractValue& value) {
+    if (receiver.signature_array_element != nullptr) {
+        std::set<ConformanceAssumption> assumptions;
+        if (!value_conforms_to_expected(module, state, value,
+                                        *receiver.signature_array_element,
+                                        assumptions)) {
+            return false;
+        }
+    }
+    for (const auto site : receiver.ref_array_sites) {
+        const auto it = state.ref_array_elements_by_site.find(site);
+        if (it == state.ref_array_elements_by_site.end()) {
+            return false;
+        }
+        (void)join_ref_array_element_into(it->second, value);
+    }
+    return receiver.signature_array_element != nullptr ||
+           !receiver.ref_array_sites.empty();
 }
 
 bool transfer_instruction(const Module& module, std::size_t function_index, std::size_t pc,
@@ -919,29 +1083,48 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     case OpCode::ArrayLen:
-        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
-                                  AbstractKind::Array, VerifierReason::StackUnderflow,
-                                  VerifierReason::BadArrayOperation, "array receiver")) {
+    {
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "array receiver",
+                               &receiver)) {
             return false;
+        }
+        if (receiver.kind != AbstractKind::Array &&
+            receiver.kind != AbstractKind::RefArray) {
+            std::ostringstream message;
+            message << "array receiver expected Array or RefArray but found "
+                    << abstract_kind_name(receiver.kind);
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadArrayOperation,
+                          instruction_message(function, pc, message.str()));
         }
         state.stack.push_back(int64_value());
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    }
     case OpCode::AllocRefArray:
+    {
+        AbstractValue init;
         if (!pop_reference_or_report(state, diagnostics, function, function_index, pc,
                                      VerifierReason::StackUnderflow,
                                      VerifierReason::BadArrayOperation,
-                                     "ref array init value") ||
+                                     "ref array init value", &init) ||
             !pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64, VerifierReason::StackUnderflow,
                                   VerifierReason::BadArrayOperation,
                                   "ref array length")) {
             return false;
         }
-        state.stack.push_back(ref_array_value());
+        state.ref_array_elements_by_site[pc] = without_provenance(init);
+        state.stack.push_back(ref_array_value(pc));
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    }
     case OpCode::RefArrayGet:
+    {
+        AbstractValue receiver;
+        AbstractValue loaded;
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64, VerifierReason::StackUnderflow,
                                   VerifierReason::BadArrayOperation,
@@ -949,17 +1132,27 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             !pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::RefArray, VerifierReason::StackUnderflow,
                                   VerifierReason::BadArrayOperation,
-                                  "ref array receiver")) {
+                                  "ref array receiver", &receiver)) {
             return false;
         }
-        state.stack.push_back(opaque_object_value());
+        if (!load_ref_array_element(state, receiver, loaded)) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadArrayOperation,
+                          instruction_message(function, pc,
+                                              "ref array element facts are unavailable or incompatible"));
+        }
+        state.stack.push_back(std::move(loaded));
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    }
     case OpCode::RefArraySet:
+    {
+        AbstractValue value;
+        AbstractValue receiver;
         if (!pop_reference_or_report(state, diagnostics, function, function_index, pc,
                                      VerifierReason::StackUnderflow,
                                      VerifierReason::BadArrayOperation,
-                                     "ref array stored value") ||
+                                     "ref array stored value", &value) ||
             !pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64, VerifierReason::StackUnderflow,
                                   VerifierReason::BadArrayOperation,
@@ -967,11 +1160,19 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             !pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::RefArray, VerifierReason::StackUnderflow,
                                   VerifierReason::BadArrayOperation,
-                                  "ref array receiver")) {
+                                  "ref array receiver", &receiver)) {
             return false;
+        }
+        if (!store_ref_array_element(module, state, receiver,
+                                     without_provenance(value))) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadArrayOperation,
+                          instruction_message(function, pc,
+                                              "stored value does not satisfy ref array element facts"));
         }
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    }
     case OpCode::GetLeft:
     case OpCode::GetRight: {
         AbstractValue receiver;

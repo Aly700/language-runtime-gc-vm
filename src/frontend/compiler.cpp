@@ -19,6 +19,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
     case TypeSpec::Kind::Pair:
     case TypeSpec::Kind::Named:
         return ValueKind::Object;
+    case TypeSpec::Kind::Array:
+        return ValueKind::Array;
     case TypeSpec::Kind::Nil:
         return ValueKind::Nil;
     case TypeSpec::Kind::Invalid:
@@ -35,7 +37,202 @@ SignatureValue signature_value_from_type(const TypeSpec& type) {
         return pair_signature(signature_value_from_type(*type.left),
                               signature_value_from_type(*type.right));
     }
+    if (type.kind == TypeSpec::Kind::Array && type.element != nullptr) {
+        return array_signature(signature_value_from_type(*type.element));
+    }
     return signature_value(bytecode_kind(type));
+}
+
+bool is_scalar_array_element_type(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Int64 || type.kind == TypeSpec::Kind::Bool;
+}
+
+bool is_ref_array_type(const TypeSpec& array_type) {
+    return array_type.kind == TypeSpec::Kind::Array &&
+           array_type.element != nullptr &&
+           !is_scalar_array_element_type(*array_type.element);
+}
+
+struct ArrayOpcodeCounts {
+    std::size_t alloc_scalar{0};
+    std::size_t alloc_ref{0};
+    std::size_t get_scalar{0};
+    std::size_t get_ref{0};
+    std::size_t set_scalar{0};
+    std::size_t set_ref{0};
+};
+
+bool operator==(const ArrayOpcodeCounts& lhs, const ArrayOpcodeCounts& rhs) {
+    return lhs.alloc_scalar == rhs.alloc_scalar &&
+           lhs.alloc_ref == rhs.alloc_ref &&
+           lhs.get_scalar == rhs.get_scalar &&
+           lhs.get_ref == rhs.get_ref &&
+           lhs.set_scalar == rhs.set_scalar &&
+           lhs.set_ref == rhs.set_ref;
+}
+
+void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts);
+
+void add_lvalue_prefix_array_counts(const LValue& lvalue,
+                                    std::size_t step_count,
+                                    ArrayOpcodeCounts& counts) {
+    for (std::size_t i = 0; i < step_count; ++i) {
+        const auto& step = lvalue.steps[i];
+        if (step.kind == LValueStep::Kind::Index) {
+            add_expr_array_counts(*step.index, counts);
+            if (is_ref_array_type(step.receiver_type)) {
+                ++counts.get_ref;
+            } else {
+                ++counts.get_scalar;
+            }
+        }
+    }
+}
+
+void add_statement_array_counts(const Statement& statement,
+                                ArrayOpcodeCounts& counts) {
+    switch (statement.kind) {
+    case Statement::Kind::Let:
+        add_expr_array_counts(*statement.initializer, counts);
+        break;
+    case Statement::Kind::Assign:
+        add_expr_array_counts(*statement.value, counts);
+        if (!statement.target.steps.empty()) {
+            const auto& final_step = statement.target.steps.back();
+            add_lvalue_prefix_array_counts(statement.target,
+                                           statement.target.steps.size() - 1,
+                                           counts);
+            if (final_step.kind == LValueStep::Kind::Index) {
+                add_expr_array_counts(*final_step.index, counts);
+                if (is_ref_array_type(statement.target.receiver_type)) {
+                    ++counts.set_ref;
+                } else {
+                    ++counts.set_scalar;
+                }
+            }
+        }
+        break;
+    case Statement::Kind::If:
+        add_expr_array_counts(*statement.condition, counts);
+        for (const auto& inner : statement.then_branch) {
+            add_statement_array_counts(inner, counts);
+        }
+        for (const auto& inner : statement.else_branch) {
+            add_statement_array_counts(inner, counts);
+        }
+        break;
+    case Statement::Kind::While:
+        add_expr_array_counts(*statement.condition, counts);
+        for (const auto& inner : statement.body) {
+            add_statement_array_counts(inner, counts);
+        }
+        break;
+    }
+}
+
+void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
+    switch (expression.kind) {
+    case Expr::Kind::IntLiteral:
+    case Expr::Kind::BoolLiteral:
+    case Expr::Kind::NilLiteral:
+    case Expr::Kind::Variable:
+        return;
+    case Expr::Kind::PairLiteral:
+    case Expr::Kind::Binary:
+        add_expr_array_counts(*expression.left, counts);
+        add_expr_array_counts(*expression.right, counts);
+        return;
+    case Expr::Kind::ArrayLiteral:
+        for (const auto& argument : expression.arguments) {
+            add_expr_array_counts(*argument, counts);
+        }
+        if (is_ref_array_type(expression.inferred_type)) {
+            ++counts.alloc_ref;
+            counts.set_ref += expression.arguments.empty() ? 0
+                                                           : expression.arguments.size() - 1;
+        } else {
+            ++counts.alloc_scalar;
+            counts.set_scalar += expression.arguments.empty() ? 0
+                                                              : expression.arguments.size() - 1;
+        }
+        return;
+    case Expr::Kind::ArraySized:
+        add_expr_array_counts(*expression.left, counts);
+        add_expr_array_counts(*expression.right, counts);
+        if (is_scalar_array_element_type(expression.array_element_type)) {
+            ++counts.alloc_scalar;
+        } else {
+            ++counts.alloc_ref;
+        }
+        return;
+    case Expr::Kind::ArrayIndex:
+        add_expr_array_counts(*expression.receiver, counts);
+        add_expr_array_counts(*expression.left, counts);
+        if (is_ref_array_type(expression.receiver->inferred_type)) {
+            ++counts.get_ref;
+        } else {
+            ++counts.get_scalar;
+        }
+        return;
+    case Expr::Kind::ArrayLen:
+        add_expr_array_counts(*expression.receiver, counts);
+        return;
+    case Expr::Kind::Field:
+    case Expr::Kind::IsNil:
+        add_expr_array_counts(*expression.receiver, counts);
+        return;
+    case Expr::Kind::Call:
+        for (const auto& argument : expression.arguments) {
+            add_expr_array_counts(*argument, counts);
+        }
+        return;
+    }
+}
+
+ArrayOpcodeCounts expected_array_opcode_counts(const Program& program) {
+    ArrayOpcodeCounts counts;
+    for (const auto& statement : program.statements) {
+        add_statement_array_counts(statement, counts);
+    }
+    add_expr_array_counts(*program.result, counts);
+    for (const auto& function : program.functions) {
+        for (const auto& statement : function.statements) {
+            add_statement_array_counts(statement, counts);
+        }
+        add_expr_array_counts(*function.result, counts);
+    }
+    return counts;
+}
+
+ArrayOpcodeCounts actual_array_opcode_counts(const Module& module) {
+    ArrayOpcodeCounts counts;
+    for (const auto& function : module.functions) {
+        for (const auto& instruction : function.code) {
+            switch (instruction.op) {
+            case OpCode::AllocArray:
+                ++counts.alloc_scalar;
+                break;
+            case OpCode::AllocRefArray:
+                ++counts.alloc_ref;
+                break;
+            case OpCode::ArrayGet:
+                ++counts.get_scalar;
+                break;
+            case OpCode::RefArrayGet:
+                ++counts.get_ref;
+                break;
+            case OpCode::ArraySet:
+                ++counts.set_scalar;
+                break;
+            case OpCode::RefArraySet:
+                ++counts.set_ref;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    return counts;
 }
 
 FunctionSignature signature_from_types(const std::vector<Parameter>& parameters,
@@ -87,6 +284,10 @@ private:
 
     std::size_t pc() const { return function_.code.size(); }
 
+    std::uint32_t allocate_temp_local() {
+        return function_.local_count++;
+    }
+
     void compile_statement(const Statement& statement) {
         switch (statement.kind) {
         case Statement::Kind::Let:
@@ -109,18 +310,29 @@ private:
     }
 
     void compile_assignment(const Statement& statement) {
-        if (statement.target.fields.empty()) {
+        if (statement.target.steps.empty()) {
             compile_expr(*statement.value);
             emit(OpCode::StoreLocal, statement.target.local_index);
             return;
         }
 
+        const auto& final_step = statement.target.steps.back();
+        compile_lvalue_receiver(statement.target);
+        if (final_step.kind == LValueStep::Kind::Index) {
+            compile_expr(*final_step.index);
+            compile_expr_as_array_storage(*statement.value,
+                                          statement.target.element_type);
+            emit(is_ref_array_type(statement.target.receiver_type)
+                     ? OpCode::RefArraySet
+                     : OpCode::ArraySet,
+                 0);
+            return;
+        }
+
         // Verifier accommodation: SetLeft/SetRight consumes receiver then value and leaves
         // no stack result, so field-assignment statements compile as stack-neutral blocks.
-        compile_lvalue_receiver(statement.target);
         compile_expr(*statement.value);
-        const auto& field = statement.target.fields.back();
-        emit(field.name == "left" ? OpCode::SetLeft : OpCode::SetRight, 0);
+        emit(final_step.name == "left" ? OpCode::SetLeft : OpCode::SetRight, 0);
     }
 
     void compile_if(const Statement& statement) {
@@ -173,6 +385,19 @@ private:
             compile_expr(*expression.right);
             emit(OpCode::AllocPair, 0);
             break;
+        case Expr::Kind::ArrayLiteral:
+            compile_array_literal(expression);
+            break;
+        case Expr::Kind::ArraySized:
+            compile_array_sized(expression);
+            break;
+        case Expr::Kind::ArrayIndex:
+            compile_array_index(expression);
+            break;
+        case Expr::Kind::ArrayLen:
+            compile_expr(*expression.receiver);
+            emit(OpCode::ArrayLen, 0);
+            break;
         case Expr::Kind::Binary:
             compile_expr(*expression.left);
             compile_expr(*expression.right);
@@ -204,10 +429,93 @@ private:
         emit(OpCode::LessI64, 0);
     }
 
+    void compile_bool_as_scalar_storage(const Expr& expression) {
+        compile_expr(expression);
+        const auto jump_to_false = emit(OpCode::JumpIfFalse, -1);
+        emit(OpCode::ConstantI64, 0);
+        const auto jump_to_end = emit(OpCode::Jump, -1);
+        patch(jump_to_false, pc());
+        emit(OpCode::ConstantI64, 1);
+        patch(jump_to_end, pc());
+    }
+
+    void compile_expr_as_array_storage(const Expr& expression,
+                                       const TypeSpec& element_type) {
+        if (element_type.kind == TypeSpec::Kind::Bool) {
+            compile_bool_as_scalar_storage(expression);
+            return;
+        }
+        compile_expr(expression);
+    }
+
+    void compile_array_sized(const Expr& expression) {
+        compile_expr(*expression.left);
+        compile_expr_as_array_storage(*expression.right,
+                                      expression.array_element_type);
+        emit(is_scalar_array_element_type(expression.array_element_type)
+                 ? OpCode::AllocArray
+                 : OpCode::AllocRefArray,
+             0);
+    }
+
+    void compile_array_literal(const Expr& expression) {
+        assert(!expression.arguments.empty() &&
+               "type checker rejects empty array literals before codegen");
+        assert(expression.inferred_type.kind == TypeSpec::Kind::Array &&
+               expression.inferred_type.element != nullptr);
+        const auto& element_type = *expression.inferred_type.element;
+        emit(OpCode::ConstantI64,
+             static_cast<std::int64_t>(expression.arguments.size()));
+        compile_expr_as_array_storage(*expression.arguments.front(), element_type);
+        emit(is_scalar_array_element_type(element_type) ? OpCode::AllocArray
+                                                        : OpCode::AllocRefArray,
+             0);
+        if (expression.arguments.size() == 1) {
+            return;
+        }
+
+        const auto temp = allocate_temp_local();
+        emit(OpCode::StoreLocal, temp);
+        for (std::size_t i = 1; i < expression.arguments.size(); ++i) {
+            emit(OpCode::LoadLocal, temp);
+            emit(OpCode::ConstantI64, static_cast<std::int64_t>(i));
+            compile_expr_as_array_storage(*expression.arguments[i], element_type);
+            emit(is_scalar_array_element_type(element_type) ? OpCode::ArraySet
+                                                            : OpCode::RefArraySet,
+                 0);
+        }
+        emit(OpCode::LoadLocal, temp);
+    }
+
+    void compile_array_index(const Expr& expression) {
+        assert(expression.receiver != nullptr &&
+               expression.receiver->inferred_type.kind == TypeSpec::Kind::Array &&
+               expression.receiver->inferred_type.element != nullptr);
+        compile_expr(*expression.receiver);
+        compile_expr(*expression.left);
+        const auto& element_type = *expression.receiver->inferred_type.element;
+        emit(is_scalar_array_element_type(element_type) ? OpCode::ArrayGet
+                                                        : OpCode::RefArrayGet,
+             0);
+        if (element_type.kind == TypeSpec::Kind::Bool) {
+            emit(OpCode::ConstantI64, 1);
+            emit(OpCode::LessI64, 0);
+        }
+    }
+
     void compile_lvalue_receiver(const LValue& lvalue) {
         emit(OpCode::LoadLocal, lvalue.local_index);
-        for (std::size_t i = 0; i + 1 < lvalue.fields.size(); ++i) {
-            emit(lvalue.fields[i].name == "left" ? OpCode::GetLeft : OpCode::GetRight, 0);
+        for (std::size_t i = 0; i + 1 < lvalue.steps.size(); ++i) {
+            const auto& step = lvalue.steps[i];
+            if (step.kind == LValueStep::Kind::Field) {
+                emit(step.name == "left" ? OpCode::GetLeft : OpCode::GetRight, 0);
+            } else {
+                compile_expr(*step.index);
+                emit(is_ref_array_type(step.receiver_type)
+                         ? OpCode::RefArrayGet
+                         : OpCode::ArrayGet,
+                     0);
+            }
         }
     }
 
@@ -241,6 +549,9 @@ CompileModuleResult compile_checked_program(const Program& program,
         module.functions.push_back(
             function_compiler.compile(declaration.statements, *declaration.result));
     }
+
+    assert(expected_array_opcode_counts(program) == actual_array_opcode_counts(module) &&
+           "compiler bug: source array element types disagreed with scalar/ref array opcodes");
 
     auto verification_report = verify_module_with_diagnostics(std::move(module));
     if (!verification_report.module.has_value()) {

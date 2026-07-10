@@ -260,7 +260,11 @@ Value VM::execute_verified(const Module& module,
             const auto receiver = pop(frame);
             assert(receiver.tag() == Value::Tag::Object &&
                    "verifier invariant violated: ArrayLen receiver must be object");
-            const auto length = heap_.array_length(receiver.as_object());
+            const auto object = receiver.as_object();
+            const auto length =
+                heap_.object(object).kind == gc::ObjectKind::RefArray
+                    ? heap_.ref_array_length(object)
+                    : heap_.array_length(object);
             if (length > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
                 throw std::length_error("scalar array length exceeds i64 result range");
             }

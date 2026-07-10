@@ -18,6 +18,8 @@ const char* type_name(Type type) {
         return "bool";
     case Type::Pair:
         return "pair";
+    case Type::Array:
+        return "array";
     case Type::Invalid:
         return "invalid";
     }

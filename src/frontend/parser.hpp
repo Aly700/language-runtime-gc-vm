@@ -16,6 +16,7 @@ struct TypeSpec {
         Int64,
         Bool,
         Pair,
+        Array,
         Named,
         Nil,
         Invalid,
@@ -24,6 +25,7 @@ struct TypeSpec {
     Kind kind{Kind::Invalid};
     std::shared_ptr<TypeSpec> left;
     std::shared_ptr<TypeSpec> right;
+    std::shared_ptr<TypeSpec> element;
     std::string name;
     SourcePosition position;
     std::optional<std::size_t> named_type_index;
@@ -40,6 +42,7 @@ TypeSpec named_type(std::string name, SourcePosition position);
 TypeSpec nil_type();
 TypeSpec invalid_type();
 TypeSpec pair_type(TypeSpec left, TypeSpec right);
+TypeSpec array_type(TypeSpec element);
 
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs);
 bool operator!=(const TypeSpec& lhs, const TypeSpec& rhs);
@@ -56,6 +59,10 @@ struct Expr {
         NilLiteral,
         Variable,
         PairLiteral,
+        ArrayLiteral,
+        ArraySized,
+        ArrayIndex,
+        ArrayLen,
         Binary,
         Field,
         Call,
@@ -74,6 +81,7 @@ struct Expr {
     std::unique_ptr<Expr> left;
     std::unique_ptr<Expr> right;
     std::unique_ptr<Expr> receiver;
+    TypeSpec array_element_type{invalid_type()};
     std::vector<std::unique_ptr<Expr>> arguments;
     TypeSpec inferred_type{invalid_type()};
     std::set<std::size_t> object_sites;
@@ -87,16 +95,27 @@ struct Parameter {
     std::uint32_t local_index{0};
 };
 
-struct FieldStep {
+struct LValueStep {
+    enum class Kind {
+        Field,
+        Index,
+    };
+
+    Kind kind{Kind::Field};
     std::string name;
     SourcePosition position;
+    std::unique_ptr<Expr> index;
+    TypeSpec receiver_type{invalid_type()};
+    TypeSpec element_type{invalid_type()};
 };
 
 struct LValue {
     std::string base_name;
     SourcePosition base_position;
     std::uint32_t local_index{0};
-    std::vector<FieldStep> fields;
+    std::vector<LValueStep> steps;
+    TypeSpec receiver_type{invalid_type()};
+    TypeSpec element_type{invalid_type()};
 };
 
 struct Statement {

@@ -54,11 +54,17 @@ struct SignatureValue {
     ValueKind kind{ValueKind::Nil};
     std::shared_ptr<SignatureValue> left;
     std::shared_ptr<SignatureValue> right;
+    std::shared_ptr<SignatureValue> element;
     std::optional<std::size_t> named_type;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == ValueKind::Object && !named_type.has_value() &&
-               left != nullptr && right != nullptr;
+               left != nullptr && right != nullptr && element == nullptr;
+    }
+
+    [[nodiscard]] bool has_array_element() const {
+        return kind == ValueKind::Array && element != nullptr &&
+               left == nullptr && right == nullptr && !named_type.has_value();
     }
 
     [[nodiscard]] bool is_named_type_reference() const {
@@ -84,6 +90,13 @@ inline SignatureValue named_type_signature(std::size_t index) {
     SignatureValue value;
     value.kind = ValueKind::Object;
     value.named_type = index;
+    return value;
+}
+
+inline SignatureValue array_signature(SignatureValue element) {
+    SignatureValue value;
+    value.kind = ValueKind::Array;
+    value.element = std::make_shared<SignatureValue>(std::move(element));
     return value;
 }
 

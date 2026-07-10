@@ -41,6 +41,18 @@
   including `Pair` field stores and `RefArray` element stores. Raw `ScalarArray` stores
   are not reference-publishing mutations and must not enter the remembered set.
 
+## Frontend
+
+- A source array type's element type determines its runtime representation at the compile
+  boundary: `[i64]` and `[bool]` must emit only scalar `AllocArray`/`ArrayGet`/`ArraySet`
+  operations, while `[pair<...>]`, named-pair arrays, and nested array elements must emit
+  only `AllocRefArray`/`RefArrayGet`/`RefArraySet`.
+- The frontend must never compile a `nil` or maybe-nil value into a RefArray element.
+  Reference array literals enumerate every element, and sized reference array
+  construction requires a non-nil initializer expression.
+- Indexing a typed reference array must recover the declared element type in frontend and
+  verifier metadata even though the runtime value is a coarse object reference.
+
 ## Testing
 
 - GC stress mode must be deterministic and able to collect before or after any allocation.
