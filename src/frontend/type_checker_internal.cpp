@@ -793,6 +793,17 @@ private:
         case Statement::Kind::ForIn:
             check_for_in(statement, state);
             break;
+        case Statement::Kind::Print: {
+            const auto value = check_expr(*statement.value, state);
+            if (!is_invalid(value.type) &&
+                (value.type != str_type() || value.includes_nil)) {
+                diagnose(statement.value->position,
+                         value.type == str_type()
+                             ? "print requires non-nil str"
+                             : "print expects str");
+            }
+            break;
+        }
         }
     }
 
@@ -1244,6 +1255,9 @@ private:
             return check_weak_construct(expression, state);
         case Expr::Kind::WeakGet:
             return check_weak_get(expression, state);
+        case Expr::Kind::ToStr:
+        case Expr::Kind::ToI64:
+            return check_conversion(expression, state);
         }
         return annotate(expression, invalid_value());
     }
@@ -1538,6 +1552,29 @@ private:
         auto target = value_from_type(*receiver.type.weak_target);
         target.includes_nil = true;
         return annotate(expression, std::move(target));
+    }
+
+    TypedValue check_conversion(Expr& expression, FlowState& state) {
+        const auto operand = check_expr(*expression.receiver, state);
+        if (is_invalid(operand.type)) {
+            return annotate(expression, invalid_value());
+        }
+        if (expression.kind == Expr::Kind::ToStr) {
+            if (operand.type != int64_type() && operand.type != bool_type()) {
+                diagnose(expression.receiver->position,
+                         "to_str expects i64 or bool");
+                return annotate(expression, invalid_value());
+            }
+            return annotate(expression, scalar_value(str_type()));
+        }
+        if (operand.type != str_type() || operand.includes_nil) {
+            diagnose(expression.receiver->position,
+                     operand.type == str_type()
+                         ? "to_i64 requires non-nil str"
+                         : "to_i64 expects str");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, scalar_value(int64_type()));
     }
 
     TypedValue load_array_element(const TypedValue& receiver, SourcePosition position) {

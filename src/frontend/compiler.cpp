@@ -184,6 +184,9 @@ void add_statement_array_counts(const Statement& statement,
             }
         }
         break;
+    case Statement::Kind::Print:
+        add_expr_array_counts(*statement.value, counts);
+        break;
     }
 }
 
@@ -253,6 +256,8 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::IsNil:
     case Expr::Kind::WeakConstruct:
     case Expr::Kind::WeakGet:
+    case Expr::Kind::ToStr:
+    case Expr::Kind::ToI64:
         add_expr_array_counts(*expression.receiver, counts);
         return;
     case Expr::Kind::MapHas:
@@ -405,6 +410,10 @@ private:
             break;
         case Statement::Kind::ForIn:
             compile_for_in(statement);
+            break;
+        case Statement::Kind::Print:
+            compile_expr(*statement.value);
+            emit(OpCode::Print, 0);
             break;
         }
     }
@@ -682,6 +691,17 @@ private:
         case Expr::Kind::WeakGet:
             compile_expr(*expression.receiver);
             emit(OpCode::WeakGet, 0);
+            break;
+        case Expr::Kind::ToStr:
+            compile_expr(*expression.receiver);
+            emit(expression.receiver->inferred_type.kind == TypeSpec::Kind::Bool
+                     ? OpCode::BoolToStr
+                     : OpCode::I64ToStr,
+                 0);
+            break;
+        case Expr::Kind::ToI64:
+            compile_expr(*expression.receiver);
+            emit(OpCode::StrToI64, 0);
             break;
         }
     }

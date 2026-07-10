@@ -12,6 +12,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -272,7 +273,30 @@ struct Outcome {
     bool ok{false};
     std::string observable;
     std::string error;
+    std::string output;
 };
+
+inline std::string output_for(const lang::VM& vm) {
+    return std::string(vm.output().begin(), vm.output().end());
+}
+
+inline std::string render_output_bytes(std::string_view output) {
+    std::ostringstream rendered;
+    for (std::size_t i = 0; i < output.size(); ++i) {
+        if (i != 0) {
+            rendered << " ";
+        }
+        rendered << std::hex << std::setfill('0') << std::setw(2)
+                 << static_cast<unsigned>(
+                        static_cast<unsigned char>(output[i]));
+    }
+    return rendered.str();
+}
+
+inline bool same_observables(const Outcome& baseline, const Outcome& observed) {
+    return baseline.observable == observed.observable &&
+           baseline.output == observed.output;
+}
 
 inline Outcome execute_once(const lang::Function& function, const Schedule& schedule) {
     try {
@@ -286,7 +310,7 @@ inline Outcome execute_once(const lang::Function& function, const Schedule& sche
         lang::VM vm;
         vm.set_gc_stress(schedule.stress);
         const auto value = vm.execute(*verified);
-        return Outcome{true, observable_for(vm, value), {}};
+        return Outcome{true, observable_for(vm, value), {}, output_for(vm)};
     } catch (const std::exception& e) {
         return Outcome{false, {}, e.what()};
     }
@@ -301,7 +325,7 @@ inline Outcome execute_once(const lang::Module& module, const Schedule& schedule
         lang::VM vm;
         vm.set_gc_stress(schedule.stress);
         const auto value = vm.execute(*verified);
-        return Outcome{true, observable_for(vm, value), {}};
+        return Outcome{true, observable_for(vm, value), {}, output_for(vm)};
     } catch (const std::exception& e) {
         return Outcome{false, {}, e.what()};
     }
@@ -312,7 +336,7 @@ inline Outcome execute_once(const lang::VerifiedModule& module, const Schedule& 
         lang::VM vm;
         vm.set_gc_stress(schedule.stress);
         const auto value = vm.execute(module);
-        return Outcome{true, observable_for(vm, value), {}};
+        return Outcome{true, observable_for(vm, value), {}, output_for(vm)};
     } catch (const std::exception& e) {
         return Outcome{false, {}, e.what()};
     }

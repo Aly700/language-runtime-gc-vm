@@ -106,10 +106,14 @@ void require_same_observable_under_stress(const std::string& source,
         require(observed.ok,
                 std::string("execution trapped under ") + schedule.name + ": " +
                     observed.error + "\n" + source_listing(source));
-        require(observed.observable == baseline.observable,
+        require(fuzz::same_observables(baseline, observed),
                 std::string("observable mismatch under ") + schedule.name +
                     "\nbaseline:\n" + baseline.observable +
                     "\nobserved:\n" + observed.observable + "\n" +
+                    "baseline output bytes:\n" +
+                    fuzz::render_output_bytes(baseline.output) +
+                    "\nobserved output bytes:\n" +
+                    fuzz::render_output_bytes(observed.output) + "\n" +
                     source_listing(source));
     }
 }

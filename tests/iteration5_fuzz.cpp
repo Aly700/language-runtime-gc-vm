@@ -1179,11 +1179,15 @@ std::string repro_command(Grammar grammar, std::uint64_t seed,
         out << "baseline trap: " << baseline.error << "\n";
     } else {
         out << "baseline observable:\n" << baseline.observable << "\n";
+        out << "baseline output bytes:\n"
+            << fuzz::render_output_bytes(baseline.output) << "\n";
     }
     if (!observed.ok) {
         out << "observed trap: " << observed.error << "\n";
     } else {
         out << "observed observable:\n" << observed.observable << "\n";
+        out << "observed output bytes:\n"
+            << fuzz::render_output_bytes(observed.output) << "\n";
     }
     throw std::runtime_error(out.str());
 }
@@ -1202,11 +1206,15 @@ std::string repro_command(Grammar grammar, std::uint64_t seed,
         out << "baseline trap: " << baseline.error << "\n";
     } else {
         out << "baseline observable:\n" << baseline.observable << "\n";
+        out << "baseline output bytes:\n"
+            << fuzz::render_output_bytes(baseline.output) << "\n";
     }
     if (!observed.ok) {
         out << "observed trap: " << observed.error << "\n";
     } else {
         out << "observed observable:\n" << observed.observable << "\n";
+        out << "observed output bytes:\n"
+            << fuzz::render_output_bytes(observed.output) << "\n";
     }
     throw std::runtime_error(out.str());
 }
@@ -1221,7 +1229,8 @@ void run_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
                               ? baseline
                               : execute_once(verified, schedule);
 
-    if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+    if (!baseline.ok || !observed.ok ||
+        !fuzz::same_observables(baseline, observed)) {
         report_failure(Grammar::Single, seed, schedule, function, baseline, observed);
     }
 }
@@ -1236,7 +1245,8 @@ void run_array_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
                               ? baseline
                               : execute_once(verified, schedule);
 
-    if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+    if (!baseline.ok || !observed.ok ||
+        !fuzz::same_observables(baseline, observed)) {
         report_failure(Grammar::Arrays, seed, schedule, function, baseline, observed);
     }
 }
@@ -1251,7 +1261,8 @@ void run_call_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
                               ? baseline
                               : execute_once(verified, schedule);
 
-    if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+    if (!baseline.ok || !observed.ok ||
+        !fuzz::same_observables(baseline, observed)) {
         report_failure(seed, schedule, module, baseline, observed);
     }
 }
@@ -1264,7 +1275,8 @@ void run_seed_all_schedules(std::uint64_t seed, const std::vector<Schedule>& all
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
                                   : execute_once(verified, schedule);
-        if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+        if (!baseline.ok || !observed.ok ||
+            !fuzz::same_observables(baseline, observed)) {
             report_failure(Grammar::Single, seed, schedule, function, baseline, observed);
         }
     }
@@ -1279,7 +1291,8 @@ void run_array_seed_all_schedules(std::uint64_t seed,
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
                                   : execute_once(verified, schedule);
-        if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+        if (!baseline.ok || !observed.ok ||
+            !fuzz::same_observables(baseline, observed)) {
             report_failure(Grammar::Arrays, seed, schedule, function, baseline, observed);
         }
     }
@@ -1294,7 +1307,8 @@ void run_call_seed_all_schedules(std::uint64_t seed,
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
                                   : execute_once(verified, schedule);
-        if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+        if (!baseline.ok || !observed.ok ||
+            !fuzz::same_observables(baseline, observed)) {
             report_failure(seed, schedule, module, baseline, observed);
         }
     }

@@ -399,7 +399,7 @@ private:
 
     [[nodiscard]] bool starts_statement() const {
         if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While) ||
-            check(TokenKind::For)) {
+            check(TokenKind::For) || check(TokenKind::Print)) {
             return true;
         }
         return assignment_ahead();
@@ -447,6 +447,9 @@ private:
         }
         if (match(TokenKind::For)) {
             return parse_for_in(previous());
+        }
+        if (match(TokenKind::Print)) {
+            return parse_print(previous());
         }
         if (assignment_ahead()) {
             return parse_assignment();
@@ -620,6 +623,17 @@ private:
             statement.range_upper = parse_expression();
         }
         statement.body = parse_block("expected '{' before for-in body");
+        return statement;
+    }
+
+    std::optional<Statement> parse_print(const Token& print_token) {
+        Statement statement;
+        statement.kind = Statement::Kind::Print;
+        statement.position = print_token.position;
+        expect(TokenKind::LParen, "expected '(' after 'print'");
+        statement.value = parse_expression();
+        expect(TokenKind::RParen, "expected ')' after print operand");
+        expect(TokenKind::Semicolon, "expected ';' after print statement");
         return statement;
     }
 
@@ -902,6 +916,23 @@ private:
             expect(TokenKind::RParen, "expected ')' after weak target");
             return node;
         }
+        if (match(TokenKind::ToStr) || match(TokenKind::ToI64)) {
+            const auto token = previous();
+            auto node = std::make_unique<Expr>();
+            node->kind = token.kind == TokenKind::ToStr ? Expr::Kind::ToStr
+                                                        : Expr::Kind::ToI64;
+            node->position = token.position;
+            expect(TokenKind::LParen,
+                   token.kind == TokenKind::ToStr
+                       ? "expected '(' after 'to_str'"
+                       : "expected '(' after 'to_i64'");
+            node->receiver = parse_expression();
+            expect(TokenKind::RParen,
+                   token.kind == TokenKind::ToStr
+                       ? "expected ')' after to_str operand"
+                       : "expected ')' after to_i64 operand");
+            return node;
+        }
         if (match(TokenKind::Identifier)) {
             auto node = std::make_unique<Expr>();
             node->kind = Expr::Kind::Variable;
@@ -985,7 +1016,8 @@ private:
             }
             if (check(TokenKind::Type) || check(TokenKind::Fn) ||
                 check(TokenKind::Let) || check(TokenKind::If) ||
-                check(TokenKind::While) || check(TokenKind::RBrace)) {
+                check(TokenKind::While) || check(TokenKind::For) ||
+                check(TokenKind::Print) || check(TokenKind::RBrace)) {
                 return;
             }
             ++current_;

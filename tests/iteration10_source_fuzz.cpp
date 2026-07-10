@@ -907,11 +907,15 @@ std::string mutant_repro_command(SourceGrammar grammar, std::uint64_t seed,
         out << "baseline trap: " << baseline.error << "\n";
     } else {
         out << "baseline observable:\n" << baseline.observable << "\n";
+        out << "baseline output bytes:\n"
+            << fuzz::render_output_bytes(baseline.output) << "\n";
     }
     if (!observed.ok) {
         out << "observed trap: " << observed.error << "\n";
     } else {
         out << "observed observable:\n" << observed.observable << "\n";
+        out << "observed output bytes:\n"
+            << fuzz::render_output_bytes(observed.output) << "\n";
     }
     throw std::runtime_error(out.str());
 }
@@ -926,7 +930,8 @@ void run_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
                               ? baseline
                               : execute_once(*compiled.verified_module, schedule);
 
-    if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+    if (!baseline.ok || !observed.ok ||
+        !fuzz::same_observables(baseline, observed)) {
         report_failure(generated, schedule, baseline, observed);
     }
 }
@@ -942,7 +947,8 @@ void run_seed_schedule(SourceGrammar grammar, std::uint64_t seed,
                               ? baseline
                               : execute_once(*compiled.verified_module, schedule);
 
-    if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+    if (!baseline.ok || !observed.ok ||
+        !fuzz::same_observables(baseline, observed)) {
         report_failure(generated, schedule, baseline, observed, grammar);
     }
 }
@@ -957,7 +963,8 @@ void run_seed_all_schedules(std::uint64_t seed,
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
                                   : execute_once(*compiled.verified_module, schedule);
-        if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+        if (!baseline.ok || !observed.ok ||
+            !fuzz::same_observables(baseline, observed)) {
             report_failure(generated, schedule, baseline, observed);
         }
     }
@@ -973,7 +980,8 @@ void run_seed_all_schedules(SourceGrammar grammar, std::uint64_t seed,
         const auto observed = schedule.name == std::string(all_schedules.front().name)
                                   ? baseline
                                   : execute_once(*compiled.verified_module, schedule);
-        if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+        if (!baseline.ok || !observed.ok ||
+            !fuzz::same_observables(baseline, observed)) {
             report_failure(generated, schedule, baseline, observed, grammar);
         }
     }

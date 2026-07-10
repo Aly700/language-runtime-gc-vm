@@ -40,6 +40,8 @@ The source language is intentionally small:
 - `if condition { ... } else { ... }`, `while condition { ... }`, and three `for-in`
   forms are statements. Arrays use `for value in array`, maps use
   `for key, value in map`, and half-open integer ranges use `for i in lo..hi`.
+- `print(e);` is a statement for `str` expressions. `to_str(x)` converts an `i64` or
+  `bool` to canonical text, and `to_i64(s)` parses a canonical decimal `str` or traps.
 - Function declarations use `fn name(a: i64, b: pair<i64, pair>) -> pair<i64, bool> { ... }`.
   Function bodies have the same shape as the top level: statements followed by a final
   expression.
@@ -92,6 +94,14 @@ Source strings are immutable byte sequences. Double-quoted literals decode `\n`,
 returns the unsigned byte widened to `i64`. String indexing traps deterministically when
 out of bounds; indexed assignment is rejected because no string payload-store operation
 exists.
+
+String/integer conversion is explicit. `to_str(i64)` emits the unique optional-minus
+decimal form, including `INT64_MIN` without host signed-negation overflow;
+`to_str(bool)` emits exactly `true` or `false`. `to_i64` accepts only optional `-` followed
+by ASCII digits, with no plus, whitespace, or leading zero, and rejects `-0`; its checked
+accumulator accepts both int64 boundaries and traps with `invalid string for i64
+conversion` for every malformed or overflowing input. String interpolation is deferred;
+source composes output with `+` and `to_str`.
 
 Source maps are mutable insertion-order association containers. Keys are restricted to
 `i64`, `bool`, and `str`; values may use any source type, including nil-able named pairs,
@@ -160,6 +170,12 @@ in a body snapshot that iteration's value. `break` and `continue` are deferred.
   Each frame owns its own operand stack and locals. Root tracing visits mutable `Value`
   slots in every live frame, not copied root values, so moving collection can update
   active and suspended frames before mutator execution resumes.
+- `lang::VM` also owns a deterministic byte output vector exposed read-only through
+  `VM::output()`. Every execution resets it. `Print` copies string bytes and one `\n`; it
+  never writes stdout or a host stream and attaches no time or address data. The fixed
+  `VM::kMaxOutputBytes` limit is 1 MiB, and an append that would exceed it traps at the
+  `Print` pc with `output buffer overflow`. Because the vector contains copied bytes, it is
+  absent from `trace_roots`; no collection path can visit or rewrite it.
 - `VM::execute(const Module&)` and `VM::execute(const Function&)` remain compatibility
   entry points for deliberate raw bytecode tests and always verify before bytecode
   dispatch. They increment `VMMetrics::raw_module_executions` or
@@ -235,6 +251,11 @@ in a body snapshot that iteration's value. `break` and `continue` are deferred.
   instructions. Every stress collection runs the same post-collection reference validation
   as explicit collections. No stress trigger depends on wall-clock time, randomness,
   threads, or host addresses.
+- Differential fuzz outcomes retain both the canonical return value/heap graph and the
+  exact output bytes. Every schedule comparison checks both fields. Iteration 29 owns a
+  separate pinned `output` grammar so the eleven legacy generators and corpus dumps remain
+  byte-identical while programs exercise conversions, containers, closures, concatenation,
+  for-in map recovery, printing, and deterministic runtime traps.
 
 ## Performance measurement
 
@@ -551,6 +572,11 @@ remembered-set entries.
   maps. The returned proof is the single blessed execution product and carries that same
   proof into VM execution without allowing the verified bytecode to be mutated after
   acceptance.
+- Output determinism: `Print` is verified to consume only `Str`, copies bytes while the
+  operand remains a precise frame root, and appends atomically with respect to the cap.
+  Conversion allocations use the ordinary rooted string-allocation path. Output storage
+  is not traced, forwarded, barriered, or validated by the heap, so collection scheduling
+  cannot affect the emitted log.
 
 ## Verifier join lattice
 
