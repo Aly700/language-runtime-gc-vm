@@ -480,13 +480,34 @@ std::string generate_loop_source(std::uint64_t seed) {
         << "groups[\"right\"] = [" << second << ", " << third << "];\n"
         << "groups[\"left\"] = [" << first << "];\n"
         << "let total: i64 = 0;\n"
-        << "for value in values { total = total + value; }\n"
-        << "for key, items in groups {\n"
-        << "  for item in items { total = total + item; }\n"
+        << "let while_step: i64 = 0;\n"
+        << "while while_step < 4 {\n"
+        << "  while_step = while_step + 1;\n"
+        << "  if while_step < 2 { continue; } else { }\n"
+        << "  total = total + while_step;\n"
+        << "  if while_step < 4 { } else { break; }\n"
         << "}\n"
-        << "for index in " << lower << ".." << upper
-        << " { total = total + index; }\n"
-        << "total\n";
+        << "let array_step: i64 = 0;\n"
+        << "for value in values {\n"
+        << "  array_step = array_step + 1;\n"
+        << "  if array_step < 2 { continue; } else { }\n"
+        << "  total = total + value;\n"
+        << "  if array_step < 3 { } else { break; }\n"
+        << "}\n"
+        << "let group_step: i64 = 0;\n"
+        << "for key, items in groups {\n"
+        << "  group_step = group_step + 1;\n"
+        << "  if group_step < 2 { continue; } else { }\n"
+        << "  for item in items { total = total + item; continue; }\n"
+        << "  break;\n"
+        << "}\n"
+        << "for index in " << lower << ".." << upper << " {\n"
+        << "  if index < " << lower + 1 << " { continue; } else { }\n"
+        << "  total = total + index;\n"
+        << "  if index < " << upper - 1 << " { } else { break; }\n"
+        << "}\n"
+        << "print(to_str(total));\n"
+        << "pair(total, values)\n";
     return out.str();
 }
 
@@ -535,6 +556,15 @@ std::vector<std::string> loop_mutants(std::uint64_t seed) {
         "for value in false.." + std::to_string(bound) + " { }\n0\n",
         "let scalar: i64 = " + std::to_string(bound) +
             ";\nfor value in scalar { }\n0\n",
+        "break;\n0\n",
+        "continue;\n0\n",
+        "let values: [i64] = [1];\n"
+        "let weak_values: weak<[i64]> = weak(values);\n"
+        "let maybe: [i64] = weak_values.get();\n"
+        "while true {\n"
+        "  if is_nil(maybe) { break; } else { maybe = values; break; }\n"
+        "}\n"
+        "maybe[0]\n",
     };
 }
 
@@ -549,17 +579,42 @@ void require_loop_mutant_rejected(std::uint64_t seed, std::size_t mutant) {
 }
 
 void loop_source_fuzz_pinned_snapshot() {
+    // Iteration 30 deliberately extends this isolated, non-legacy grammar.
+    // SHA-256: iteration 28 65fa15f9feef21c09a55a182b5049ff1b30bbbff68a8f74905e7c81184427219
+    // SHA-256: iteration 30 82ba21140ada7e7e9ca1f4f38165c086679d24534f790d7c72c9ac1ca1eb0e30
     const std::string expected = R"SRC(let values: [i64] = [2, 4, 6];
 let groups: map<str, [i64]> = map<str, [i64]>();
 groups["right"] = [4, 6];
 groups["left"] = [2];
 let total: i64 = 0;
-for value in values { total = total + value; }
-for key, items in groups {
-  for item in items { total = total + item; }
+let while_step: i64 = 0;
+while while_step < 4 {
+  while_step = while_step + 1;
+  if while_step < 2 { continue; } else { }
+  total = total + while_step;
+  if while_step < 4 { } else { break; }
 }
-for index in 1..4 { total = total + index; }
-total
+let array_step: i64 = 0;
+for value in values {
+  array_step = array_step + 1;
+  if array_step < 2 { continue; } else { }
+  total = total + value;
+  if array_step < 3 { } else { break; }
+}
+let group_step: i64 = 0;
+for key, items in groups {
+  group_step = group_step + 1;
+  if group_step < 2 { continue; } else { }
+  for item in items { total = total + item; continue; }
+  break;
+}
+for index in 1..4 {
+  if index < 2 { continue; } else { }
+  total = total + index;
+  if index < 3 { } else { break; }
+}
+print(to_str(total));
+pair(total, values)
 )SRC";
     require(generate_loop_source(28) == expected,
             "loop source pinned snapshot changed\nactual:\n" +

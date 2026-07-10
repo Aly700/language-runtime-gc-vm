@@ -38,7 +38,8 @@ The source language is intentionally small:
   parentheses. Maps add `map<K, V>()`, indexed get, indexed insert-or-update,
   `.has(key)`, and `.len`.
 - `if condition { ... } else { ... }`, `while condition { ... }`, and three `for-in`
-  forms are statements. Arrays use `for value in array`, maps use
+  forms are statements. Unlabeled `break;` and `continue;` bind the nearest enclosing
+  loop. Arrays use `for value in array`, maps use
   `for key, value in map`, and half-open integer ranges use `for i in lo..hi`.
 - `print(e);` is a statement for `str` expressions. `to_str(x)` converts an `i64` or
   `bool` to canonical text, and `to_i64(s)` parses a canonical decimal `str` or traps.
@@ -127,7 +128,11 @@ the value is loaded at its step. Before every step, lowering compares current le
 the snapshot; growth from a new key takes a deliberate positional OOB path and traps with
 `map entry index out of bounds`. Maps cannot delete entries, so growth is the only count
 mismatch. Loop variables are immutable, lexically scoped ordinary locals; closures created
-in a body snapshot that iteration's value. `break` and `continue` are deferred.
+in a body snapshot that iteration's value. `break` jumps to the first post-loop
+instruction. `continue` jumps to the while condition header or, for every for-in form, the
+hidden-index increment preamble; map continue therefore returns through the entry-count
+mutation check. Literal-true while loops omit a verifier-visible false edge. Labeled loop
+control remains deferred.
 
 ## Runtime scaffold
 
@@ -336,7 +341,9 @@ Compiler accommodations for verifier strictness:
   constant i64 comparisons whose result kind is proven `Bool`.
 - Branches and loops: conditions must type-check as `bool` because `JumpIfFalse` consumes a
   verifier-proven Bool. `if` emits an explicit jump over `else`; `while` emits a reachable
-  header, false exit, stack-neutral body, and backedge.
+  header, false exit, stack-neutral body, and backedge. Fallthrough-aware block emission
+  omits unreachable bridge instructions after break/continue; literal-true while emits an
+  unconditional loop with only explicit break exits.
 - No fall-off-end: the final source expression is followed immediately by `Return`.
 - Reachability: the compiler emits no bytecode after `Return`, and branch targets are
   patched only to emitted instruction boundaries reachable through verifier dataflow.
@@ -377,6 +384,11 @@ Compiler accommodations for verifier strictness:
   Compilation allocates hidden index, bound, and container locals after source locals;
   emits comparisons, local operations, jumps, existing array/map operations, plus the two
   positional map accessors; and returns only the verifier-produced `VerifiedModule`.
+- Loop control: the type checker sends body fallthrough and continue states to the loop
+  header fixed point and sends break states to the post-loop join. The compiler patches
+  ordinary jumps through nearest-loop contexts. For-in continue always reaches the hidden
+  increment before the header; break reaches the post-loop pc. Every target is still
+  checked by the verifier's ordinary worklist joins and receives a generated exact map.
 
 ## Design bias
 
