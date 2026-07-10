@@ -33,6 +33,7 @@ struct LocalState {
     bool initialized{false};
     TypedValue value;
     SourcePosition declaration_position;
+    bool immutable_loop_variable{false};
 };
 
 struct FlowState {
@@ -56,7 +57,8 @@ bool operator==(const FieldState& lhs, const FieldState& rhs) {
 bool operator==(const LocalState& lhs, const LocalState& rhs) {
     return lhs.name == rhs.name && lhs.declared_type == rhs.declared_type &&
            lhs.index == rhs.index && lhs.initialized == rhs.initialized &&
-           lhs.value == rhs.value;
+           lhs.value == rhs.value &&
+           lhs.immutable_loop_variable == rhs.immutable_loop_variable;
 }
 
 bool operator==(const FlowState& lhs, const FlowState& rhs) {
@@ -248,6 +250,9 @@ public:
             check_function(function);
         }
 
+        LocalContext entry_context;
+        auto* previous_local_context = local_context_;
+        local_context_ = &entry_context;
         state_ = initial_state();
         for (auto& statement : program.statements) {
             check_statement(statement, state_, true);
@@ -262,7 +267,9 @@ public:
                      "program result requires non-nil value of type " +
                          type_name(result.type));
         }
-        program.entry_local_count = static_cast<std::uint32_t>(state_.locals.size());
+        program.entry_local_count =
+            static_cast<std::uint32_t>(entry_context.prototypes.size());
+        local_context_ = previous_local_context;
         return result.type;
     }
 
@@ -275,6 +282,10 @@ public:
     }
 
 private:
+    struct LocalContext {
+        std::vector<LocalState> prototypes;
+    };
+
     struct CaptureContext {
         FlowState* outer_state{nullptr};
         LambdaExpr* lambda{nullptr};
@@ -285,6 +296,48 @@ private:
         FlowState state;
         state.fields_by_site.resize(pair_site_count_);
         return state;
+    }
+
+    static std::string hidden_loop_local_name(std::uint32_t index) {
+        return std::string("\x1f") + "for$" + std::to_string(index);
+    }
+
+    void sync_locals(FlowState& state) const {
+        assert(local_context_ != nullptr);
+        while (state.locals.size() < local_context_->prototypes.size()) {
+            state.locals.push_back(
+                local_context_->prototypes[state.locals.size()]);
+        }
+    }
+
+    std::uint32_t allocate_local(FlowState& state, std::string name,
+                                 TypeSpec type, TypedValue value,
+                                 SourcePosition position,
+                                 bool immutable_loop_variable = false) {
+        assert(local_context_ != nullptr);
+        const auto index = static_cast<std::uint32_t>(
+            local_context_->prototypes.size());
+        LocalState local{std::move(name), std::move(type), index, true,
+                         std::move(value), position,
+                         immutable_loop_variable};
+        local_context_->prototypes.push_back(local);
+        sync_locals(state);
+        state.locals[index] = std::move(local);
+        return index;
+    }
+
+    void register_existing_loop_local(std::uint32_t index,
+                                      const TypeSpec& type,
+                                      SourcePosition position) {
+        assert(local_context_ != nullptr);
+        if (index < local_context_->prototypes.size()) {
+            return;
+        }
+        assert(index == local_context_->prototypes.size() &&
+               "loop-local indexes must be allocated in source order");
+        local_context_->prototypes.push_back(LocalState{
+            hidden_loop_local_name(index), type, index, false,
+            value_from_type(type), position, false});
     }
 
     void collect_type_symbols(Program& program) {
@@ -354,6 +407,9 @@ private:
     }
 
     void check_function(FunctionDecl& function) {
+        LocalContext context;
+        auto* previous_local_context = local_context_;
+        local_context_ = &context;
         FlowState state = initial_state();
         for (auto& parameter : function.parameters) {
             if (find_local(state, parameter.name) != nullptr) {
@@ -361,14 +417,9 @@ private:
                          "parameter '" + parameter.name + "' is already defined");
                 continue;
             }
-            const auto index = static_cast<std::uint32_t>(state.locals.size());
-            parameter.local_index = index;
-            state.locals.push_back(LocalState{parameter.name,
-                                              parameter.type,
-                                              index,
-                                              true,
-                                              value_from_type(parameter.type),
-                                              parameter.position});
+            parameter.local_index = allocate_local(
+                state, parameter.name, parameter.type,
+                value_from_type(parameter.type), parameter.position);
         }
 
         for (auto& statement : function.statements) {
@@ -382,7 +433,9 @@ private:
                          type_name(result.type) + " but is declared " +
                          type_name(function.return_type));
         }
-        function.local_count = static_cast<std::uint32_t>(state.locals.size());
+        function.local_count =
+            static_cast<std::uint32_t>(context.prototypes.size());
+        local_context_ = previous_local_context;
     }
 
     FunctionSymbol* find_function(const std::string& name) {
@@ -737,6 +790,9 @@ private:
         case Statement::Kind::While:
             check_while(statement, state);
             break;
+        case Statement::Kind::ForIn:
+            check_for_in(statement, state);
+            break;
         }
     }
 
@@ -766,15 +822,10 @@ private:
             return;
         }
 
-        const auto index = static_cast<std::uint32_t>(state.locals.size());
-        statement.local_index = index;
-        state.locals.push_back(LocalState{statement.name,
-                                          statement.declared_type,
-                                          index,
-                                          true,
-                                          value_as_declared_type(initializer,
-                                                                 statement.declared_type),
-                                          statement.position});
+        statement.local_index = allocate_local(
+            state, statement.name, statement.declared_type,
+            value_as_declared_type(initializer, statement.declared_type),
+            statement.position);
     }
 
     void check_assignment(Statement& statement, FlowState& state) {
@@ -798,6 +849,12 @@ private:
                 return;
             }
             statement.target.local_index = local->index;
+            if (local->immutable_loop_variable) {
+                diagnose(statement.target.base_position,
+                         "cannot assign to immutable loop variable '" +
+                             local->name + "'");
+                return;
+            }
             if (!is_invalid(assigned.type) &&
                 !value_conforms_to_type(assigned, local->declared_type, state)) {
                 diagnose(statement.equals_position,
@@ -913,9 +970,13 @@ private:
         for (auto& inner : statement.then_branch) {
             check_statement(inner, then_state, false);
         }
+        sync_locals(then_state);
+        sync_locals(else_state);
         for (auto& inner : statement.else_branch) {
             check_statement(inner, else_state, false);
         }
+        sync_locals(then_state);
+        sync_locals(else_state);
         state = join_states(then_state, else_state);
     }
 
@@ -933,6 +994,8 @@ private:
                 check_statement(inner, body_output, false);
             }
 
+            sync_locals(head);
+            sync_locals(body_output);
             auto joined = join_states(head, body_output);
             if (joined == head) {
                 state = joined;
@@ -941,6 +1004,180 @@ private:
             head = std::move(joined);
         }
         diagnose(statement.position, "while type state did not reach a fixed point");
+        state = std::move(head);
+    }
+
+    bool loop_name_conflicts(const Statement& statement, std::size_t name_index,
+                             FlowState& state) {
+        const auto& name = statement.loop_names[name_index];
+        const auto position = statement.loop_name_positions[name_index];
+        if (find_local(state, name) != nullptr) {
+            diagnose(position, "loop variable '" + name +
+                                   "' conflicts with an existing local");
+            return true;
+        }
+        for (std::size_t i = 0; i < name_index; ++i) {
+            if (statement.loop_names[i] == name) {
+                diagnose(position, "loop variable '" + name +
+                                       "' conflicts with another loop variable");
+                return true;
+            }
+        }
+        if (capture_context_ != nullptr) {
+            const auto captured = try_ensure_capture(*capture_context_, name,
+                                                     position);
+            if (captured.has_value()) {
+                diagnose(position, "loop variable '" + name +
+                                       "' conflicts with an existing capture");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void activate_loop_locals(Statement& statement, FlowState& state,
+                              const std::vector<TypedValue>& values) {
+        sync_locals(state);
+        assert(statement.loop_local_indices.size() == values.size());
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            const auto index = statement.loop_local_indices[i];
+            assert(index < state.locals.size());
+            auto& local = state.locals[index];
+            local.name = statement.loop_names[i];
+            local.declared_type = values[i].type;
+            local.initialized = true;
+            local.value = values[i];
+            local.declaration_position = statement.loop_name_positions[i];
+            local.immutable_loop_variable = true;
+        }
+    }
+
+    void deactivate_loop_locals(const Statement& statement, FlowState& state) {
+        for (const auto index : statement.loop_local_indices) {
+            assert(index < state.locals.size());
+            auto& local = state.locals[index];
+            local.name = hidden_loop_local_name(index);
+            local.initialized = false;
+            local.immutable_loop_variable = false;
+        }
+    }
+
+    void check_for_in(Statement& statement, FlowState& state) {
+        const auto iterable = check_expr(*statement.iterable, state);
+        std::vector<TypeSpec> variable_types;
+        std::vector<TypedValue> variable_values;
+        if (statement.range_upper == nullptr && iterable.includes_nil &&
+            (iterable.type.kind == TypeSpec::Kind::Array ||
+             iterable.type.kind == TypeSpec::Kind::Map)) {
+            diagnose(statement.iterable->position,
+                     "for-in requires non-nil array or map");
+            return;
+        }
+        if (statement.range_upper != nullptr) {
+            const auto upper = check_expr(*statement.range_upper, state);
+            if (!is_invalid(iterable.type) && iterable.type != int64_type()) {
+                diagnose(statement.iterable->position,
+                         "range lower bound must be i64");
+            }
+            if (!is_invalid(upper.type) && upper.type != int64_type()) {
+                diagnose(statement.range_upper->position,
+                         "range upper bound must be i64");
+            }
+            if (statement.loop_names.size() != 1) {
+                const auto position = statement.loop_name_positions.size() > 1
+                                          ? statement.loop_name_positions[1]
+                                          : statement.position;
+                diagnose(position,
+                         "range iteration requires one loop variable");
+                return;
+            }
+            variable_types.push_back(int64_type());
+            variable_values.push_back(scalar_value(int64_type()));
+        } else if (iterable.type.kind == TypeSpec::Kind::Array &&
+                   iterable.type.element != nullptr) {
+            if (statement.loop_names.size() != 1) {
+                const auto position = statement.loop_name_positions.size() > 1
+                                          ? statement.loop_name_positions[1]
+                                          : statement.position;
+                diagnose(position,
+                         "array iteration requires one loop variable");
+                return;
+            }
+            variable_types.push_back(*iterable.type.element);
+            variable_values.push_back(
+                load_array_element(iterable, statement.iterable->position));
+        } else if (iterable.type.kind == TypeSpec::Kind::Map &&
+                   iterable.type.key != nullptr && iterable.type.value != nullptr) {
+            if (statement.loop_names.size() != 2) {
+                const auto position = statement.loop_name_positions.empty()
+                                          ? statement.position
+                                          : statement.loop_name_positions.front();
+                diagnose(position,
+                         "map iteration requires two loop variables");
+                return;
+            }
+            variable_types.push_back(*iterable.type.key);
+            variable_types.push_back(*iterable.type.value);
+            variable_values.push_back(value_from_type(*iterable.type.key));
+            variable_values.push_back(value_from_type(*iterable.type.value));
+        } else {
+            if (!is_invalid(iterable.type)) {
+                diagnose(statement.iterable->position,
+                         "for-in requires array, map, or range");
+            }
+            return;
+        }
+
+        bool conflict = false;
+        for (std::size_t i = 0; i < statement.loop_names.size(); ++i) {
+            conflict = loop_name_conflicts(statement, i, state) || conflict;
+        }
+        if (conflict) {
+            return;
+        }
+
+        if (!statement.loop_locals_allocated) {
+            for (std::size_t i = 0; i < variable_types.size(); ++i) {
+                const auto index = allocate_local(
+                    state,
+                    hidden_loop_local_name(static_cast<std::uint32_t>(
+                        local_context_->prototypes.size())),
+                    variable_types[i], variable_values[i],
+                    statement.loop_name_positions[i]);
+                state.locals[index].initialized = false;
+                local_context_->prototypes[index].initialized = false;
+                statement.loop_local_indices.push_back(index);
+            }
+            statement.loop_locals_allocated = true;
+        } else {
+            for (std::size_t i = 0; i < variable_types.size(); ++i) {
+                register_existing_loop_local(statement.loop_local_indices[i],
+                                             variable_types[i],
+                                             statement.loop_name_positions[i]);
+            }
+            sync_locals(state);
+        }
+
+        FlowState head = state;
+        for (std::size_t iteration = 0;
+             iteration < max_loop_iterations(state); ++iteration) {
+            auto body_output = head;
+            activate_loop_locals(statement, body_output, variable_values);
+            for (auto& inner : statement.body) {
+                check_statement(inner, body_output, false);
+            }
+            deactivate_loop_locals(statement, body_output);
+            sync_locals(head);
+            sync_locals(body_output);
+            auto joined = join_states(head, body_output);
+            if (joined == head) {
+                state = std::move(joined);
+                return;
+            }
+            head = std::move(joined);
+        }
+        diagnose(statement.position,
+                 "for-in type state did not reach a fixed point");
         state = std::move(head);
     }
 
@@ -1075,6 +1312,9 @@ private:
             resolve_statement_types(statement);
         }
 
+        LocalContext local_context;
+        auto* previous_local_context = local_context_;
+        local_context_ = &local_context;
         FlowState state = initial_state();
         for (auto& parameter : lambda.parameters) {
             if (find_local(state, parameter.name) != nullptr) {
@@ -1082,14 +1322,9 @@ private:
                          "parameter '" + parameter.name + "' is already defined");
                 continue;
             }
-            const auto index = static_cast<std::uint32_t>(state.locals.size());
-            parameter.local_index = index;
-            state.locals.push_back(LocalState{parameter.name,
-                                              parameter.type,
-                                              index,
-                                              true,
-                                              value_from_type(parameter.type),
-                                              parameter.position});
+            parameter.local_index = allocate_local(
+                state, parameter.name, parameter.type,
+                value_from_type(parameter.type), parameter.position);
         }
 
         CaptureContext context{&outer_state, &lambda, capture_context_};
@@ -1107,7 +1342,9 @@ private:
                      "lambda returns " + type_name(result.type) +
                          " but is declared " + type_name(lambda.return_type));
         }
-        lambda.local_count = static_cast<std::uint32_t>(state.locals.size());
+        lambda.local_count =
+            static_cast<std::uint32_t>(local_context.prototypes.size());
+        local_context_ = previous_local_context;
         return annotate(
             expression,
             value_from_type(function_type(
@@ -1643,6 +1880,7 @@ private:
     std::vector<TypeSymbol> types_;
     std::vector<FunctionSymbol> functions_;
     CaptureContext* capture_context_{nullptr};
+    LocalContext* local_context_{nullptr};
     std::vector<Diagnostic> diagnostics_;
 };
 

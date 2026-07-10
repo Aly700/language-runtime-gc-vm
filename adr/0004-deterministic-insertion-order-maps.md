@@ -58,3 +58,12 @@ structural hash caching were deferred because they add resize policy, tombstones
 reference-bearing state, and new determinism obligations before measurements justify them.
 Sorting entries by key was rejected because it discards source-visible insertion order and
 adds comparison semantics not required by the language.
+
+## Iteration semantics
+
+Iteration 28 makes the order guaranteed here directly observable through
+`for key, value in map`. The compiler walks positional entries from index zero to the
+entry-count snapshot, so updates preserve their original position and new entries are never
+silently appended to an in-progress traversal. Existing-value updates remain visible when
+their position is reached; inserting a new key grows the entry count and deterministically
+traps the lowered loop. ADR-0007 specifies the complete mutation semantics.

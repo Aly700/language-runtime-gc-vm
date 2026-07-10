@@ -56,6 +56,18 @@ void VM::assert_stack_matches_map(const ModuleVerificationResult& verification,
                    "verifier invariant violated: runtime stack object tag differs from stack map");
         }
     }
+    assert(map.local_object_slots.size() == frame.locals.size() &&
+           "verifier invariant violated: runtime local count differs from stack map");
+    for (std::size_t i = 0; i < frame.locals.size(); ++i) {
+        if (map.local_object_slots[i]) {
+            assert((frame.locals[i].is_object() ||
+                    frame.locals[i].tag() == Value::Tag::Nil) &&
+                   "verifier invariant violated: runtime local reference slot differs from stack map");
+        } else {
+            assert(!frame.locals[i].is_object() &&
+                   "verifier invariant violated: runtime local object tag differs from stack map");
+        }
+    }
 }
 
 void VM::collect_at_instruction_boundary_if_needed(const ModuleVerificationResult& verification,
@@ -490,6 +502,28 @@ Value VM::execute_verified(const Module& module,
                 throw std::length_error("map length exceeds i64 result range");
             }
             push(frame, Value::int64(static_cast<std::int64_t>(length)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::MapKeyAt:
+        case OpCode::MapValueAt: {
+            const auto index_value = pop(frame);
+            const auto receiver = pop(frame);
+            assert(index_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: map positional index must be i64");
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: map positional receiver must be object");
+            assert(heap_.TEST_ONLY_is_map(receiver.as_object()) &&
+                   "verifier invariant violated: map positional receiver must be map");
+            const auto index = index_value.as_i64();
+            if (index < 0) {
+                throw std::out_of_range("map entry index out of bounds");
+            }
+            push(frame, ins.op == OpCode::MapKeyAt
+                            ? heap_.map_key_at(receiver.as_object(),
+                                               static_cast<std::size_t>(index))
+                            : heap_.map_value_at(receiver.as_object(),
+                                                 static_cast<std::size_t>(index)));
             ++frame.pc;
             break;
         }

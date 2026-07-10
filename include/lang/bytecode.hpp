@@ -50,6 +50,8 @@ enum class OpCode {
     MapLen,
     AllocWeak,
     WeakGet,
+    MapKeyAt,
+    MapValueAt,
 };
 
 struct Instruction {
@@ -211,6 +213,9 @@ struct StackMap {
     // Stack maps describe the abstract stack before executing the instruction at the same pc.
     // Bit i is true only when stack slot i is proven to contain an object reference.
     std::vector<bool> object_slots;
+    // Local bits use the same convention. Uninitialized locals are false; initialized
+    // reference-capable locals are true even when their current runtime value is Nil.
+    std::vector<bool> local_object_slots;
 };
 
 struct Function {
@@ -306,6 +311,7 @@ enum class VerifierReason {
     BadWeakTargetType,        // weak<T>/AllocWeak target is scalar, nil, or malformed.
     WeakOperationOnNonWeak,   // WeakGet receiver is not a typed weak reference.
     WeakTargetMayBeNil,       // WeakGet result was used without IsNil refinement.
+    BadMapPositionAccess,     // MapKeyAt/MapValueAt receiver or i64 index is invalid.
 };
 
 struct VerifierDiagnostic {

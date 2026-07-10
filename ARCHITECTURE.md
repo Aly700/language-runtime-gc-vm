@@ -37,7 +37,9 @@ The source language is intentionally small:
   `array<T>(len, init)` sized array construction, array/string indexing, `.len`, and
   parentheses. Maps add `map<K, V>()`, indexed get, indexed insert-or-update,
   `.has(key)`, and `.len`.
-- `if condition { ... } else { ... }` and `while condition { ... }` are statement forms.
+- `if condition { ... } else { ... }`, `while condition { ... }`, and three `for-in`
+  forms are statements. Arrays use `for value in array`, maps use
+  `for key, value in map`, and half-open integer ranges use `for i in lo..hi`.
 - Function declarations use `fn name(a: i64, b: pair<i64, pair>) -> pair<i64, bool> { ... }`.
   Function bodies have the same shape as the top level: statements followed by a final
   expression.
@@ -100,6 +102,23 @@ place or appends a new entry, `m[k]` traps deterministically when absent, `m.has
 `bool`, and `m.len` returns `i64`. Map types remain complete across parameters, returns,
 pair fields, arrays, closures, and nested map values.
 
+For-in is a compiler-lowered surface, not a runtime iterator representation. Each form
+evaluates its source once and emits an index-based while loop using ordinary locals whose
+internal names contain characters unavailable to the lexer. Array lowering snapshots the
+container reference and `.len`; each iteration loads through that live reference, so a
+moving collection forwards the hidden root and array writes remain visible. Range lowering
+stores the lower bound as its induction value, then evaluates and stores the upper bound,
+preserving one-time left-to-right evaluation and half-open `[lo, hi)` behavior.
+
+Map lowering snapshots the map reference and entry count, then uses `MapKeyAt` and
+`MapValueAt` to load each insertion-order entry by index. ADR-0004 insertion order is
+therefore observable language semantics. Existing-key value updates are visible because
+the value is loaded at its step. Before every step, lowering compares current length with
+the snapshot; growth from a new key takes a deliberate positional OOB path and traps with
+`map entry index out of bounds`. Maps cannot delete entries, so growth is the only count
+mismatch. Loop variables are immutable, lexically scoped ordinary locals; closures created
+in a body snapshot that iteration's value. `break` and `continue` are deferred.
+
 ## Runtime scaffold
 
 - `lang::Module` stores a designated entry function, all callable `lang::Function`
@@ -125,6 +144,11 @@ pair fields, arrays, closures, and nested map values.
   current function signature, and value kinds for generated stack maps. This protects the
   VM invariants for stack depth, initialized local reads, and function boundaries across
   loops and merge points.
+- Stack maps retain the existing operand `object_slots` and add an exact
+  `local_object_slots` vector. Local root category is tracked separately from definite
+  initialization so entry/backedge joins describe runtime slots without making an
+  uninitialized local readable. Legacy hand-written maps may omit local bits; generated
+  maps always include them, and the VM asserts them around instruction-boundary stress.
 - Verifier rejection is structured. The compatibility APIs `verify` and
   `verify_with_stack_maps` still return only bool/optional results, while
   `verify_with_diagnostics` returns the same stack-map result plus deterministic
@@ -327,6 +351,11 @@ Compiler accommodations for verifier strictness:
   nested map results and function-valued map entries recover their exact types after
   lookup. The type checker, compiler boundary assertion, layout validator, and verifier
   all restrict keys to `i64`, `bool`, or `str` and derive the same two reference flags.
+- For-in: type checking applies the same fixed-point body join as `while`, introduces
+  immutable scoped loop locals, and rejects arity/container/range errors before emission.
+  Compilation allocates hidden index, bound, and container locals after source locals;
+  emits comparisons, local operations, jumps, existing array/map operations, plus the two
+  positional map accessors; and returns only the verifier-produced `VerifiedModule`.
 
 ## Design bias
 
@@ -460,13 +489,14 @@ remembered-set entries.
   its push result, rather than checking only net stack effect.
 - Local safety: locals have an explicit verifier state of uninitialized or known value kind;
   `LoadLocal` requires a known initialized kind on every incoming path.
-- Root precision: `verify_with_stack_maps` emits per-function per-pc stack reference maps
-  from the verifier's abstract states. A true bit means the slot may contain an object
+- Root precision: `verify_with_stack_maps` emits per-function per-pc operand and local
+  reference maps from the verifier's abstract states. A true bit means the slot may contain an object
   reference, including pair objects, scalar arrays, RefArrays, strings, and closures;
   nullable named-pair slots may contain `nil` in the same reference-capable slot. Hand-written maps, when
   present, must match the verifier state, and VM-controlled collection points assert that
-  the active frame's runtime stack tags agree with the generated map for the current
-  function and pc.
+  the active frame's runtime operand and local tags agree with the generated map for the
+  current function and pc. Local bits protect hidden for-in container roots across entry
+  and backedge boundaries.
 - Frame-root precision: every live frame's locals and operand stack slots are traced as
   mutable roots. A collection triggered in a deep callee rewrites references held by
   suspended callers before the callee or caller can resume. Closure frames additionally

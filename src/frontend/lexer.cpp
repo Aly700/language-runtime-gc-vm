@@ -53,6 +53,13 @@ public:
                 tokens.push_back(simple(TokenKind::BangEqual, start, "!="));
                 continue;
             }
+            if (c == '.' && offset_ + 1 < source_.size() &&
+                source_[offset_ + 1] == '.') {
+                advance();
+                advance();
+                tokens.push_back(simple(TokenKind::DotDot, start, ".."));
+                continue;
+            }
             if (std::isdigit(static_cast<unsigned char>(c)) ||
                 (c == '-' && offset_ + 1 < source_.size() &&
                  std::isdigit(static_cast<unsigned char>(source_[offset_ + 1])))) {
@@ -188,6 +195,10 @@ private:
             kind = TokenKind::Else;
         } else if (text == "while") {
             kind = TokenKind::While;
+        } else if (text == "for") {
+            kind = TokenKind::For;
+        } else if (text == "in") {
+            kind = TokenKind::In;
         } else if (text == "true") {
             kind = TokenKind::True;
         } else if (text == "false") {

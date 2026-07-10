@@ -398,7 +398,8 @@ private:
     }
 
     [[nodiscard]] bool starts_statement() const {
-        if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While)) {
+        if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While) ||
+            check(TokenKind::For)) {
             return true;
         }
         return assignment_ahead();
@@ -443,6 +444,9 @@ private:
         }
         if (match(TokenKind::While)) {
             return parse_while(previous());
+        }
+        if (match(TokenKind::For)) {
+            return parse_for_in(previous());
         }
         if (assignment_ahead()) {
             return parse_assignment();
@@ -588,6 +592,34 @@ private:
         statement.position = while_token.position;
         statement.condition = parse_expression();
         statement.body = parse_block("expected '{' before while body");
+        return statement;
+    }
+
+    std::optional<Statement> parse_for_in(const Token& for_token) {
+        Statement statement;
+        statement.kind = Statement::Kind::ForIn;
+        statement.position = for_token.position;
+
+        const auto first =
+            expect(TokenKind::Identifier, "expected loop variable after 'for'");
+        if (first.has_value()) {
+            statement.loop_names.push_back(first->text);
+            statement.loop_name_positions.push_back(first->position);
+        }
+        if (match(TokenKind::Comma)) {
+            const auto second = expect(TokenKind::Identifier,
+                                       "expected loop variable after ','");
+            if (second.has_value()) {
+                statement.loop_names.push_back(second->text);
+                statement.loop_name_positions.push_back(second->position);
+            }
+        }
+        expect(TokenKind::In, "expected 'in' after loop variable");
+        statement.iterable = parse_expression();
+        if (match(TokenKind::DotDot)) {
+            statement.range_upper = parse_expression();
+        }
+        statement.body = parse_block("expected '{' before for-in body");
         return statement;
     }
 

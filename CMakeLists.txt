@@ -85,6 +85,9 @@ target_link_libraries(lang_iteration26_weak_refs PRIVATE lang_runtime)
 add_executable(lang_iteration26_weak_source_fuzz tests/iteration26_weak_source_fuzz.cpp)
 target_link_libraries(lang_iteration26_weak_source_fuzz PRIVATE lang_runtime)
 
+add_executable(lang_iteration28_for_in tests/iteration28_for_in.cpp)
+target_link_libraries(lang_iteration28_for_in PRIVATE lang_runtime)
+
 add_executable(lang_bench src/bench.cpp)
 target_link_libraries(lang_bench PRIVATE lang_runtime)
 
@@ -111,4 +114,5 @@ add_test(NAME lang_iteration24_closures COMMAND lang_iteration24_closures)
 add_test(NAME lang_iteration25_maps COMMAND lang_iteration25_maps)
 add_test(NAME lang_iteration26_weak_refs COMMAND lang_iteration26_weak_refs)
 add_test(NAME lang_iteration26_weak_source_fuzz COMMAND lang_iteration26_weak_source_fuzz)
+add_test(NAME lang_iteration28_for_in COMMAND lang_iteration28_for_in)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)
