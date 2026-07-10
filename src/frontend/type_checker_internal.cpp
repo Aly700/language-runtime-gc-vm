@@ -90,7 +90,21 @@ bool is_scalar_array_element_type(const TypeSpec& type) {
 bool is_reference_array_element_type(const TypeSpec& type) {
     return type.kind == TypeSpec::Kind::Pair || type.kind == TypeSpec::Kind::Named ||
            type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str ||
-           type.kind == TypeSpec::Kind::Function || type.kind == TypeSpec::Kind::Map;
+           type.kind == TypeSpec::Kind::Function || type.kind == TypeSpec::Kind::Map ||
+           type.kind == TypeSpec::Kind::Weak;
+}
+
+bool is_object_type(const TypeSpec& type) {
+    return is_reference_array_element_type(type);
+}
+
+bool is_weak_target_type(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Pair ||
+           type.kind == TypeSpec::Kind::Named ||
+           type.kind == TypeSpec::Kind::Array ||
+           type.kind == TypeSpec::Kind::Str ||
+           type.kind == TypeSpec::Kind::Function ||
+           type.kind == TypeSpec::Kind::Map;
 }
 
 bool is_valid_map_key_type(const TypeSpec& type) {
@@ -100,14 +114,7 @@ bool is_valid_map_key_type(const TypeSpec& type) {
 }
 
 bool is_known_nonnil_reference(const TypedValue& value) {
-    if (value.type.kind == TypeSpec::Kind::Array ||
-        value.type.kind == TypeSpec::Kind::Str ||
-        value.type.kind == TypeSpec::Kind::Function ||
-        value.type.kind == TypeSpec::Kind::Map) {
-        return true;
-    }
-    return is_pair(value.type) && value.type.kind != TypeSpec::Kind::Nil &&
-           !value.includes_nil;
+    return is_object_type(value.type) && !value.includes_nil;
 }
 
 TypedValue value_from_type(TypeSpec type) {
@@ -125,11 +132,12 @@ TypedValue value_from_type(TypeSpec type) {
 TypedValue value_as_declared_type(const TypedValue& value, TypeSpec declared_type) {
     TypedValue coerced;
     coerced.type = std::move(declared_type);
-    if (is_pair(coerced.type)) {
+    if (is_object_type(coerced.type)) {
         coerced.object_sites = value.object_sites;
         coerced.includes_nil = value.includes_nil || value.type.kind == TypeSpec::Kind::Nil;
-    } else if (coerced.type.kind == TypeSpec::Kind::Array &&
-               coerced.type.element != nullptr) {
+    }
+    if (coerced.type.kind == TypeSpec::Kind::Array &&
+        coerced.type.element != nullptr) {
         if (value.array_element != nullptr) {
             coerced.array_element =
                 std::make_shared<TypedValue>(value_as_declared_type(
@@ -158,13 +166,14 @@ TypedValue join_values(const TypedValue& lhs, const TypedValue& rhs) {
     }
     TypedValue result;
     result.type = joined_type;
-    if (is_pair(result.type)) {
+    if (is_object_type(result.type)) {
         result.object_sites = lhs.object_sites;
         result.object_sites.insert(rhs.object_sites.begin(), rhs.object_sites.end());
         result.includes_nil = lhs.includes_nil || rhs.includes_nil ||
                               lhs.type.kind == TypeSpec::Kind::Nil ||
                               rhs.type.kind == TypeSpec::Kind::Nil;
-    } else if (result.type.kind == TypeSpec::Kind::Array) {
+    }
+    if (result.type.kind == TypeSpec::Kind::Array) {
         if (lhs.array_element != nullptr && rhs.array_element != nullptr) {
             result.array_element = std::make_shared<TypedValue>(
                 join_values(*lhs.array_element, *rhs.array_element));
@@ -247,6 +256,11 @@ public:
         if (result.type.kind == TypeSpec::Kind::Nil) {
             diagnose(program.result->position,
                      "nil literal requires a named pair type context");
+        } else if (result.includes_nil &&
+                   result.type.kind != TypeSpec::Kind::Named) {
+            diagnose(program.result->position,
+                     "program result requires non-nil value of type " +
+                         type_name(result.type));
         }
         program.entry_local_count = static_cast<std::uint32_t>(state_.locals.size());
         return result.type;
@@ -434,6 +448,17 @@ private:
             }
             return;
         }
+        if (type.kind == TypeSpec::Kind::Weak &&
+            type.weak_target != nullptr) {
+            resolve_type(*type.weak_target);
+            if (!is_invalid(*type.weak_target) &&
+                !is_weak_target_type(*type.weak_target)) {
+                diagnose(type.weak_target->position,
+                         "weak target type must be an object type");
+                type = invalid_type();
+            }
+            return;
+        }
         if (type.kind != TypeSpec::Kind::Named) {
             return;
         }
@@ -494,7 +519,10 @@ private:
         SourcePosition use_position) {
         if (const auto existing = find_capture_index(*context.lambda, name);
             existing.has_value()) {
-            return value_from_type(context.lambda->captures[*existing].type);
+            auto captured =
+                value_from_type(context.lambda->captures[*existing].type);
+            captured.includes_nil = false;
+            return captured;
         }
 
         if (auto* local = find_local(*context.outer_state, name); local != nullptr) {
@@ -503,10 +531,18 @@ private:
                          "captured local '" + name + "' may be uninitialized");
                 return invalid_value();
             }
+            if (local->value.includes_nil) {
+                diagnose(use_position,
+                         "captured local '" + name +
+                             "' requires non-nil value");
+                return invalid_value();
+            }
             context.lambda->captures.push_back(
                 CaptureSpec{name, local->declaration_position,
                             local->declared_type, local->index, false});
-            return value_from_type(local->declared_type);
+            auto captured = value_from_type(local->declared_type);
+            captured.includes_nil = false;
+            return captured;
         }
 
         if (context.parent == nullptr) {
@@ -516,6 +552,9 @@ private:
         if (!parent_value.has_value()) {
             return std::nullopt;
         }
+        if (is_invalid(parent_value->type)) {
+            return invalid_value();
+        }
         const auto parent_index =
             find_capture_index(*context.parent->lambda, name);
         assert(parent_index.has_value() &&
@@ -524,7 +563,9 @@ private:
             CaptureSpec{name, use_position,
                         context.parent->lambda->captures[*parent_index].type,
                         static_cast<std::uint32_t>(*parent_index), true});
-        return value_from_type(context.lambda->captures.back().type);
+        auto captured = value_from_type(context.lambda->captures.back().type);
+        captured.includes_nil = false;
+        return captured;
     }
 
     void diagnose(SourcePosition position, std::string message) {
@@ -608,7 +649,8 @@ private:
         }
         if (target.kind == TypeSpec::Kind::Array) {
             if (value.type.kind != TypeSpec::Kind::Array ||
-                target.element == nullptr || value.type.element == nullptr) {
+                value.includes_nil || target.element == nullptr ||
+                value.type.element == nullptr) {
                 return false;
             }
             if (is_scalar_array_element_type(*target.element) !=
@@ -625,6 +667,11 @@ private:
             return !value.includes_nil && value.type == target &&
                    target.key != nullptr && target.value != nullptr &&
                    is_valid_map_key_type(*target.key);
+        }
+        if (target.kind == TypeSpec::Kind::Weak) {
+            return !value.includes_nil && value.type == target &&
+                   target.weak_target != nullptr &&
+                   is_weak_target_type(*target.weak_target);
         }
         if (target.kind == TypeSpec::Kind::Named) {
             if (value.type.kind == TypeSpec::Kind::Nil) {
@@ -705,8 +752,13 @@ private:
         }
 
         const auto initializer = check_expr(*statement.initializer, state);
-        if (!is_invalid(initializer.type) &&
-            !value_conforms_to_type(initializer, statement.declared_type, state)) {
+        const bool nullable_weak_get_binding =
+            initializer.includes_nil &&
+            initializer.type == statement.declared_type &&
+            is_weak_target_type(statement.declared_type);
+        if (!is_invalid(initializer.type) && !nullable_weak_get_binding &&
+            !value_conforms_to_type(initializer, statement.declared_type,
+                                    state)) {
             diagnose(statement.equals_position,
                      "cannot initialize local '" + statement.name + "' of type " +
                          type_name(statement.declared_type) + " with " +
@@ -766,6 +818,13 @@ private:
             return;
         }
         final_step.receiver_type = receiver.type;
+
+        if (receiver.includes_nil) {
+            diagnose(final_step.position,
+                     "assignment requires non-nil value of type " +
+                         type_name(receiver.type));
+            return;
+        }
 
         if (final_step.kind == LValueStep::Kind::Index) {
             const auto index = check_expr(*final_step.index, state);
@@ -895,7 +954,7 @@ private:
         auto* then_local = find_local(then_state, condition.receiver->name);
         auto* else_local = find_local(else_state, condition.receiver->name);
         if (then_local == nullptr || else_local == nullptr ||
-            !is_pair(then_local->declared_type)) {
+            !is_object_type(then_local->declared_type)) {
             return;
         }
 
@@ -944,6 +1003,10 @@ private:
             return check_map_empty(expression);
         case Expr::Kind::MapHas:
             return check_map_has(expression, state);
+        case Expr::Kind::WeakConstruct:
+            return check_weak_construct(expression, state);
+        case Expr::Kind::WeakGet:
+            return check_weak_get(expression, state);
         }
         return annotate(expression, invalid_value());
     }
@@ -970,6 +1033,9 @@ private:
             auto captured = try_ensure_capture(*capture_context_, expression.name,
                                                expression.position);
             if (captured.has_value()) {
+                if (is_invalid(captured->type)) {
+                    return annotate(expression, invalid_value());
+                }
                 const auto capture =
                     find_capture_index(*capture_context_->lambda,
                                        expression.name);
@@ -1192,6 +1258,12 @@ private:
             diagnose(expression.position, "has requires map");
             return annotate(expression, invalid_value());
         }
+        if (receiver.includes_nil) {
+            diagnose(expression.position,
+                     "map operation requires non-nil value of type " +
+                         type_name(receiver.type));
+            return annotate(expression, invalid_value());
+        }
         if (!value_conforms_to_type(key, *receiver.type.key, state)) {
             diagnose(expression.left->position,
                      "map key expects " + type_name(*receiver.type.key) +
@@ -1199,6 +1271,36 @@ private:
             return annotate(expression, invalid_value());
         }
         return annotate(expression, scalar_value(bool_type()));
+    }
+
+    TypedValue check_weak_construct(Expr& expression, FlowState& state) {
+        const auto target = check_expr(*expression.receiver, state);
+        if (is_invalid(target.type)) {
+            return annotate(expression, invalid_value());
+        }
+        if (!is_weak_target_type(target.type) || target.includes_nil) {
+            diagnose(expression.receiver->position,
+                     "weak() requires a non-nil object operand");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression,
+                        value_from_type(weak_type(target.type)));
+    }
+
+    TypedValue check_weak_get(Expr& expression, FlowState& state) {
+        const auto receiver = check_expr(*expression.receiver, state);
+        if (is_invalid(receiver.type)) {
+            return annotate(expression, invalid_value());
+        }
+        if (receiver.includes_nil ||
+            receiver.type.kind != TypeSpec::Kind::Weak ||
+            receiver.type.weak_target == nullptr) {
+            diagnose(expression.position, "get requires weak");
+            return annotate(expression, invalid_value());
+        }
+        auto target = value_from_type(*receiver.type.weak_target);
+        target.includes_nil = true;
+        return annotate(expression, std::move(target));
     }
 
     TypedValue load_array_element(const TypedValue& receiver, SourcePosition position) {
@@ -1223,6 +1325,12 @@ private:
     TypedValue check_array_index(Expr& expression, FlowState& state) {
         const auto receiver = check_expr(*expression.receiver, state);
         const auto index = check_expr(*expression.left, state);
+        if (!is_invalid(receiver.type) && receiver.includes_nil) {
+            diagnose(expression.position,
+                     "indexing requires non-nil value of type " +
+                         type_name(receiver.type));
+            return annotate(expression, invalid_value());
+        }
         if (receiver.type.kind == TypeSpec::Kind::Map &&
             receiver.type.key != nullptr && receiver.type.value != nullptr) {
             if (!is_invalid(index.type) &&
@@ -1256,6 +1364,12 @@ private:
 
     TypedValue check_array_len(Expr& expression, FlowState& state) {
         const auto receiver = check_expr(*expression.receiver, state);
+        if (!is_invalid(receiver.type) && receiver.includes_nil) {
+            diagnose(expression.position,
+                     "len requires non-nil value of type " +
+                         type_name(receiver.type));
+            return annotate(expression, invalid_value());
+        }
         if (!is_invalid(receiver.type) &&
             receiver.type.kind != TypeSpec::Kind::Str &&
             receiver.type.kind != TypeSpec::Kind::Map &&
@@ -1273,6 +1387,12 @@ private:
         if (expression.binary_op == '+') {
             if (left.type == int64_type() && right.type == int64_type()) {
                 return annotate(expression, scalar_value(int64_type()));
+            }
+            if (left.type == str_type() && right.type == str_type() &&
+                (left.includes_nil || right.includes_nil)) {
+                diagnose(expression.operator_position,
+                         "operator '+' requires non-nil str operands");
+                return annotate(expression, invalid_value());
             }
             if (left.type == str_type() && right.type == str_type()) {
                 return annotate(expression, scalar_value(str_type()));
@@ -1299,6 +1419,12 @@ private:
             return annotate(expression, scalar_value(bool_type()));
         }
         if (expression.binary_op == '=' || expression.binary_op == '!') {
+            if (left.type == str_type() && right.type == str_type() &&
+                (left.includes_nil || right.includes_nil)) {
+                diagnose(expression.operator_position,
+                         "string comparison requires non-nil str operands");
+                return annotate(expression, invalid_value());
+            }
             if ((!is_invalid(left.type) && left.type != str_type()) ||
                 (!is_invalid(right.type) && right.type != str_type())) {
                 const std::string operation = expression.binary_op == '=' ? "==" : "!=";
@@ -1315,8 +1441,9 @@ private:
     TypedValue check_is_nil(Expr& expression, FlowState& state) {
         const auto value = check_expr(*expression.receiver, state);
         if (!is_invalid(value.type) && !is_pair(value.type) &&
-            value.type.kind != TypeSpec::Kind::Nil) {
-            diagnose(expression.position, "is_nil requires pair or nil operand");
+            !value.includes_nil && value.type.kind != TypeSpec::Kind::Nil) {
+            diagnose(expression.position,
+                     "is_nil requires pair, nil, or nil-able object operand");
             return annotate(expression, invalid_value());
         }
         return annotate(expression, scalar_value(bool_type()));
@@ -1351,6 +1478,12 @@ private:
                          "cannot call non-function of type " +
                              type_name(callee.type));
             }
+            return annotate(expression, invalid_value());
+        }
+        if (callee.includes_nil) {
+            diagnose(expression.position,
+                     "function call requires non-nil value of type " +
+                         type_name(callee.type));
             return annotate(expression, invalid_value());
         }
 
@@ -1406,6 +1539,9 @@ private:
                 const auto captured = try_ensure_capture(
                     *capture_context_, lvalue.base_name, lvalue.base_position);
                 if (captured.has_value()) {
+                    if (is_invalid(captured->type)) {
+                        return invalid_value();
+                    }
                     diagnose(lvalue.base_position,
                              "cannot assign through immutable capture '" +
                                  lvalue.base_name + "'");
@@ -1426,6 +1562,12 @@ private:
         for (std::size_t i = 0; i < step_count; ++i) {
             auto& step = lvalue.steps[i];
             step.receiver_type = current.type;
+            if (current.includes_nil) {
+                diagnose(step.position,
+                         "assignment requires non-nil value of type " +
+                             type_name(current.type));
+                return invalid_value();
+            }
             if (step.kind == LValueStep::Kind::Field) {
                 current = load_field(current, step.name, step.position, state);
             } else {

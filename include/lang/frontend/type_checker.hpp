@@ -10,7 +10,7 @@
 
 namespace lang::frontend {
 
-enum class Type { Int64, Bool, Pair, Array, Str, Function, Map, Invalid };
+enum class Type { Int64, Bool, Pair, Array, Str, Function, Map, Weak, Invalid };
 
 struct SourcePosition {
     std::size_t offset{0};

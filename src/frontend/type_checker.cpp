@@ -26,6 +26,8 @@ const char* type_name(Type type) {
         return "function";
     case Type::Map:
         return "map";
+    case Type::Weak:
+        return "weak";
     case Type::Invalid:
         return "invalid";
     }

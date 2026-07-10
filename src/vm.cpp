@@ -254,6 +254,24 @@ Value VM::execute_verified(const Module& module,
             push(frame, Value::nil());
             ++frame.pc;
             break;
+        case OpCode::AllocWeak: {
+            const auto target = pop(frame);
+            assert(target.is_object() &&
+                   "verifier invariant violated: AllocWeak target must be a non-nil object");
+            push(frame, Value::object(heap_.allocate_weak(target)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::WeakGet: {
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: WeakGet receiver must be an object");
+            assert(heap_.TEST_ONLY_is_weak_ref(receiver.as_object()) &&
+                   "verifier invariant violated: WeakGet receiver must be a WeakRef");
+            push(frame, heap_.weak_get(receiver.as_object()));
+            ++frame.pc;
+            break;
+        }
         case OpCode::IsNil: {
             const auto value = pop(frame);
             assert((value.tag() == Value::Tag::Object ||

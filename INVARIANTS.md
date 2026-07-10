@@ -30,14 +30,30 @@
 
 - Every live object is reachable from an explicit root or another live object at collection start.
 - The collector must never treat non-reference values as references.
-- Every heap object has a descriptor derived from its header kind and length. The
-  collector may inspect only descriptor-declared reference slots: `Pair` scans its two
-  tagged `Value` fields, `RefArray` scans every tagged `Value` object-reference payload
-  slot, and `ScalarArray` and `Str` scan zero payload slots.
-- Reference-bearing variable-length payloads must be expressed through the same
-  descriptor visitor as fixed-size objects. Marking, forwarding, remembered-set
-  validation, and post-collection validation may not add one-off object-kind scans
-  outside that descriptor path.
+- Every object-payload reference belongs to exactly one of two exhaustive categories.
+  Descriptor visitors define **all strong edges**: `Pair`, `RefArray`, `Closure`, and
+  `Map` expose exactly their statically declared reference slots. The exact heap-owned
+  WeakRef registry defines **all weak edges**. No third payload reference path may mark,
+  retain, forward, clear, or validate an object ID.
+- Reference-bearing variable-length strong payloads must use the same descriptor visitor
+  as fixed-size strong payloads. Marking, strong forwarding, remembered-set validation,
+  and strong post-collection validation may not add one-off object-kind scans outside
+  that path. Weak targets are the sole extension: they are processed only through the
+  registry-driven post-mark weak phase and never through a descriptor visitor.
+- `WeakRef` is a fixed-width object with one collector-owned target slot. Its descriptor
+  visits zero strong fields, so neither the WeakRef object nor its registry entry keeps
+  the target alive. The mutator initializes a non-nil object target exactly once through
+  `AllocWeak`; no target setter, store opcode, or write-barrier path exists. After
+  construction, only the collector may forward or canonically clear the slot.
+- The weak registry contains every live WeakRef owner exactly once in ascending heap-slot
+  order and no other object. Allocation inserts in slot order; movement rewrites owner
+  IDs; collection prunes dead owners. `validate_weak_targets` proves registry exactness
+  and that every target is canonical `Nil` or a current generation-valid object ID.
+- Weak processing runs after liveness and the forwarding table are fixed and before the
+  moved heap is installed. Live owners are visited in registry/old-slot order: targets
+  with forwarding entries are rewritten and targets without them are cleared to `Nil`.
+  A cleared slot is never matched against later allocation and stays cleared across slot
+  reuse.
 - `ScalarArray` payload elements are raw `i64` values, not tagged `Value`s. Even if a raw
   element's bit pattern equals a valid or stale `ObjectId`, marking, forwarding,
   remembered-set validation, and post-collection validation must not interpret it as a
@@ -88,6 +104,10 @@
   path itself must insert the closure into the remembered set before collection-boundary
   validation. This GC-internal insertion must be exact, deterministic, and must not count
   as a mutator write-barrier hit.
+- Weak edges never enter the remembered set and never run a write barrier. Minor
+  collection finds old WeakRef owners through the exact weak registry, not through
+  strong-edge remembered-set scanning. A young weak target survives only if a strong
+  minor root marks it; survivors are promoted/forwarded and dead young targets clear.
 
 ## Frontend
 
@@ -121,6 +141,11 @@
   construction requires a non-nil initializer expression.
 - Indexing a typed reference array must recover the declared element type in frontend and
   verifier metadata even though the runtime value is a coarse object reference.
+- `weak<T>` accepts only object types (`pair`/named pair, array, map, `str`, or `fn`).
+  `weak(x)` requires a proven non-nil object and lowers to `AllocWeak`; `.get()` lowers to
+  `WeakGet` and produces nil-able `T`. Every object operation, argument, store, or return
+  requires the existing `is_nil(local)` false-branch refinement first. `WeakIsAlive` is
+  intentionally absent so `is_nil` remains the single refinement mechanism.
 
 ## Testing
 

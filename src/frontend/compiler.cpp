@@ -27,6 +27,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
         return ValueKind::Function;
     case TypeSpec::Kind::Map:
         return ValueKind::Map;
+    case TypeSpec::Kind::Weak:
+        return ValueKind::Weak;
     case TypeSpec::Kind::Nil:
         return ValueKind::Nil;
     case TypeSpec::Kind::Invalid:
@@ -65,6 +67,11 @@ SignatureValue signature_value_from_type(const TypeSpec& type) {
                "compile boundary rejected an invalid map key type");
         return map_signature(signature_value_from_type(*type.key),
                              signature_value_from_type(*type.value));
+    }
+    if (type.kind == TypeSpec::Kind::Weak &&
+        type.weak_target != nullptr) {
+        return weak_signature(
+            signature_value_from_type(*type.weak_target));
     }
     return signature_value(bytecode_kind(type));
 }
@@ -227,6 +234,8 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
         return;
     case Expr::Kind::Field:
     case Expr::Kind::IsNil:
+    case Expr::Kind::WeakConstruct:
+    case Expr::Kind::WeakGet:
         add_expr_array_counts(*expression.receiver, counts);
         return;
     case Expr::Kind::MapHas:
@@ -546,6 +555,14 @@ private:
             compile_expr(*expression.receiver);
             compile_expr(*expression.left);
             emit(OpCode::MapHas, 0);
+            break;
+        case Expr::Kind::WeakConstruct:
+            compile_expr(*expression.receiver);
+            emit(OpCode::AllocWeak, 0);
+            break;
+        case Expr::Kind::WeakGet:
+            compile_expr(*expression.receiver);
+            emit(OpCode::WeakGet, 0);
             break;
         }
     }

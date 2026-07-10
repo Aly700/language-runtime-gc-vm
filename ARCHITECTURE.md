@@ -26,8 +26,8 @@ Frontend implementation files are split by pipeline stage while keeping
 The source language is intentionally small:
 
 - Types are `i64`, `bool`, `str`, opaque `pair`, finite parametric `pair<T, U>`, array
-  types `[T]`, deterministic maps `map<K, V>`, structural function types
-  `fn(T1, ..., Tn) -> R`, and named pair
+  types `[T]`, deterministic maps `map<K, V>`, weak references `weak<T>`, structural
+  function types `fn(T1, ..., Tn) -> R`, and named pair
   declarations such as `type List = pair<i64, List>;`.
 - Top-level `let name: type = expression;` declarations introduce initialized locals.
 - Assignment supports locals, `pair` fields (`left` and `right`), and array elements
@@ -49,6 +49,9 @@ The source language is intentionally small:
 - `nil` is a literal for terminating named pair types, and `is_nil(local)` is a bool
   expression that refines the checked local to non-nil in the `else` branch of an
   `if is_nil(local) { ... } else { ... }` statement.
+- `weak(x)` constructs an immutable WeakRef to a proven non-nil object. `w.get()` returns
+  nil-able `T`; callers bind it and use the same `is_nil(local)` false-branch refinement
+  before any object operation. There is no separate `is_alive` surface.
 - A program ends with a final expression, which becomes the VM result.
 
 Minimal cuts: there are no substrings, string interning/mutation, expression-valued blocks,
@@ -163,12 +166,19 @@ pair fields, arrays, closures, and nested map values.
   retained verified layout identity. Its logical width is one header slot plus two slots
   per current entry. Empty construction therefore starts at width one, and every append
   grows the logical width by exactly two.
-- All heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two tagged
-  fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
+- `WeakRef` is fixed-width storage with one private collector-owned target. Its descriptor
+  scans zero strong fields. Construction accepts one non-nil object, and the heap exposes
+  only a const read; post-construction writes are confined to weak processing.
+- All strong heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two
+  tagged fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
   It also scans zero `Str` payload slots. For `Closure`, it consults the capture map and
   visits exactly the statically reference-typed capture slots. Raw scalar elements, scalar
   closure captures, and string bytes are never marked, forwarded, validated as references,
   or entered into remembered-set logic.
+- Weak edges are the one explicit non-descriptor reference category. A heap-owned
+  `std::vector<ObjectId>` contains every live WeakRef owner exactly once in ascending slot
+  order. It is not a root and is never consulted by marking; it only locates weak targets
+  after liveness is decided, including old WeakRefs during minor collection.
 - The same descriptor visitor handles maps. It validates entry-count/slot-tag agreement and
   visits each inserted key before its value in insertion order, but only when the layout's
   corresponding reference flag is set. String keys and reference values are therefore
@@ -359,7 +369,7 @@ ownership. Move-only handles keep C++ root lifetimes visible.
 
 ## Moving collection
 
-Collection is mark, forward, rewrite, install, validate:
+Collection is mark, forward, rewrite-strong, process-weak, install, validate:
 
 1. Marking uses an explicit vector worklist. Roots are visited in provider order, object
    payloads are visited through their kind descriptor, pair fields are traced left before
@@ -381,9 +391,14 @@ Collection is mark, forward, rewrite, install, validate:
    rewriting is not a separate collector path; it is the variable-length case of the same
    descriptor visitor used by pairs. Closure capture rewriting is the per-bitmap case of
    that same visitor; scalar capture slots are never presented to the forwarding pass.
-5. After installation, validation walks all roots and all descriptor-declared live-object
+5. The weak phase walks the exact registry in ascending old owner-slot order. Dead owners
+   are pruned. Nil stays nil, targets with forwarding entries are rewritten, and targets
+   without entries clear to canonical `Nil`. This never marks a target. Map-growth
+   relocation invokes the same forwarding hook, with no clearing because all objects live.
+6. After installation, validation walks all roots and all descriptor-declared live-object
    reference slots, checks that every object reference resolves through the current
-   generation table, and verifies variable-size storage runs do not overlap.
+   generation table, verifies storage runs, and separately proves weak-registry exactness
+   plus nil-or-current weak targets.
 
 Rejected alternative: a permanent handle-indirection table where ObjectIds never change.
 That would preserve external numeric handles, but it would not exercise the root and heap
@@ -394,7 +409,7 @@ makes missed updates fail as stale IDs.
 
 The heap has two logical object generations on top of the same slot vector:
 
-- New pair, array, string, and closure allocations are young.
+- New pair, array, string, closure, map, and WeakRef allocations are young.
 - Any young object that survives one collection is promoted to old. This one-survival
   policy keeps the phase deterministic and makes promotion independent of wall-clock age or
   allocation rate.
@@ -406,6 +421,10 @@ The heap has two logical object generations on top of the same slot vector:
   young objects. Old objects are retained conservatively until the next major collection,
   but all roots and all retained heap fields are still rewritten through the forwarding
   table before mutator execution resumes.
+- Weak edges are excluded from minor roots and the remembered set. After young marking,
+  the registry enumerates old and surviving young WeakRef owners: dead young targets
+  clear, strongly marked young targets promote/forward, and old targets receive their
+  ordinary minor forwarding entry.
 - The remembered set is a `std::vector<ObjectId>`, not an unordered container. Barrier
   insertion is stable and duplicate-free by linear scan; collection-time pruning rebuilds it
   in slot order by keeping only valid old objects whose descriptor-declared reference
@@ -481,6 +500,11 @@ remembered-set entries.
   derived static types. Every heap phase uses the descriptor visitor, which sees exactly
   those flagged ordered slots. Map growth preserves `1 + 2N` width and rewrites the owner
   identity before an append whenever adjacent storage is unavailable.
+- Weak-edge precision: verification preserves complete `weak<T>` structure, `AllocWeak`
+  consumes only a non-nil reference, and `WeakGet` produces a maybe-reference carrying
+  exact target facts. Only `IsNil` refines that local to non-nil `T`. At runtime the
+  descriptor exposes zero WeakRef targets, the exact slot-ordered registry owns all weak
+  processing, and `validate_weak_targets` rejects stale or unforwarded IDs.
 - Signature safety: call sites are checked against the callee signature only; returns are
   checked against the current function signature. This keeps bytecode verification
   modular and rejects out-of-range calls, wrong arity, wrong argument kind, wrong

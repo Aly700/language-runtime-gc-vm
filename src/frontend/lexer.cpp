@@ -200,6 +200,8 @@ private:
             kind = TokenKind::Array;
         } else if (text == "map") {
             kind = TokenKind::Map;
+        } else if (text == "weak") {
+            kind = TokenKind::Weak;
         } else if (text == "i64") {
             kind = TokenKind::I64;
         } else if (text == "bool") {

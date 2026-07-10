@@ -56,6 +56,7 @@ enum class ObjectKind {
     Str,
     Closure,
     Map,
+    WeakRef,
 };
 
 struct MapEntry {
@@ -73,6 +74,9 @@ struct Object {
                           std::vector<bool> capture_map);
     static Object map(std::size_t layout_index, bool key_is_ref,
                       bool value_is_ref);
+    static Object weak_ref(Value target);
+
+    [[nodiscard]] Value weak_target() const { return weak_target_; }
 
     bool marked{false};
     ObjectGeneration generation{ObjectGeneration::Young};
@@ -91,6 +95,10 @@ struct Object {
     bool map_key_is_ref{false};
     bool map_value_is_ref{false};
     std::vector<MapEntry> map_entries;
+
+private:
+    friend class Heap;
+    Value weak_target_{Value::nil()};
 };
 
 class Handle {
@@ -138,6 +146,7 @@ public:
                               std::vector<bool> capture_map);
     ObjectId allocate_map(std::size_t layout_index, bool key_is_ref,
                           bool value_is_ref);
+    ObjectId allocate_weak(Value target);
     [[nodiscard]] Handle make_handle(Value value);
     [[nodiscard]] Handle make_handle(ObjectId id);
     void set_root_provider(RootProvider* provider) { root_provider_ = provider; }
@@ -174,6 +183,7 @@ public:
     void map_set(ObjectId id, Value key, Value value);
     [[nodiscard]] Value map_key_at(ObjectId id, std::size_t index) const;
     [[nodiscard]] Value map_value_at(ObjectId id, std::size_t index) const;
+    [[nodiscard]] Value weak_get(ObjectId id) const;
     [[nodiscard]] std::size_t live_count() const;
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
@@ -186,6 +196,7 @@ public:
     [[nodiscard]] bool TEST_ONLY_is_string(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_closure(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_map(ObjectId id) const;
+    [[nodiscard]] bool TEST_ONLY_is_weak_ref(ObjectId id) const;
     [[nodiscard]] std::size_t TEST_ONLY_remembered_set_size() const {
         return remembered_set_.size();
     }
@@ -233,6 +244,7 @@ private:
     [[nodiscard]] const Object& checked_closure(ObjectId id) const;
     [[nodiscard]] const Object& checked_map(ObjectId id) const;
     [[nodiscard]] Object& checked_map(ObjectId id);
+    [[nodiscard]] const Object& checked_weak_ref(ObjectId id) const;
     void register_handle_root(Value* slot);
     void deregister_handle_root(Value* slot) noexcept;
     void move_handle_root(Value* from, Value* to) noexcept;
@@ -268,12 +280,16 @@ private:
                             std::vector<std::optional<Object>>& compacted_objects,
                             RootProvider* roots, std::span<Value*> extra_roots) const;
     void rewrite_value(Value& value, const ForwardingTable& forwarding) const;
+    [[nodiscard]] std::vector<ObjectId> process_weak_targets(
+        const ForwardingTable& forwarding,
+        std::vector<std::optional<Object>>& moved_objects) const;
     [[nodiscard]] std::vector<ObjectId> rewrite_remembered_set(
         const ForwardingTable& forwarding) const;
     void prune_remembered_set();
     void validate_heap_storage_layout() const;
     void validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const;
     void validate_remembered_set() const;
+    void validate_weak_targets() const;
     void validate_value(Value value) const;
 
     RootProvider* root_provider_{nullptr};
@@ -282,6 +298,7 @@ private:
     std::vector<std::optional<Object>> objects_;
     std::vector<std::uint32_t> generations_;
     std::vector<ObjectId> remembered_set_;
+    std::vector<ObjectId> weak_refs_;
     std::vector<Value*> handle_roots_;
     HeapMetrics metrics_{};
     bool TEST_ONLY_skip_next_write_barrier_{false};

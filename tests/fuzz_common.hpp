@@ -225,6 +225,16 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             }
             rendered << ")";
             break;
+        case lang::gc::ObjectKind::WeakRef: {
+            const auto target = heap.weak_get(order[i]);
+            if (target.tag() == lang::Value::Tag::Nil) {
+                rendered << "weak(cleared)";
+            } else {
+                rendered << "weak(alive="
+                         << value_token(heap, target, indexes, order) << ")";
+            }
+            break;
+        }
         }
         objects.push_back(rendered.str());
     }
