@@ -166,6 +166,21 @@ The recursive positive corpus also runs seeds `1..48` across all 10 schedules, a
 480 executions per CTest run. It has its own pinned seed-`17` snapshot; legacy and
 recursive corpus dumps are deterministic and can be byte-compared independently.
 
+Iteration 22 adds a third source grammar, selected in replay as `array`, for the source
+array surface. It emits deterministic programs with:
+
+- `[i64]` and `[bool]` scalar arrays using sized construction, literals, indexing,
+  stores, and `.len` loops.
+- `[pair<i64, i64>]`, `[List]`, and `[[i64]]` reference arrays using non-nil
+  initializers and element stores that compile through `RefArraySet`.
+- array parameters and returns across helper functions, exercising detailed
+  `SignatureValue` array element metadata at call and return boundaries.
+- typed element recovery through `pairs[i].left`, `lists[i].left`, and `grid[i][j]`.
+
+The array positive corpus also runs seeds `1..48` across all 10 schedules, adding another
+480 executions per CTest run. It has its own pinned seed-`17` snapshot; the legacy and
+recursive snapshots are unchanged.
+
 The negative corpus checks the frontend gate with deterministic mutations of generated
 legacy sources. Seeds `1..12` are each mutated three ways:
 
@@ -182,8 +197,15 @@ The recursive grammar adds four more mutation operators over seeds `1..12`:
 - prepend `type X = X;` before an otherwise-valid program.
 - assign a typed payload pair into a named `Node.right: Links` field.
 
+The array grammar adds four mutation operators over seeds `1..12`:
+
+- insert an `i64` into a `[bool]` literal.
+- use a bool expression as an array index.
+- read `.len` from an `i64`.
+- index an `i64` as if it were an array.
+
 Each mutant must reject with at least one diagnostic and must not crash the frontend. The
-combined source-level CTest run now covers 960 positive executions and 84 negative
+combined source-level CTest run now covers 1440 positive executions and 132 negative
 frontend-rejection checks.
 
 Replay a positive source finding with:
@@ -198,6 +220,12 @@ Replay a positive recursive-source finding with:
 ./build/lang_iteration10_source_fuzz --grammar recursive --seed <uint64> --schedule <schedule-name>
 ```
 
+Replay a positive array-source finding with:
+
+```bash
+./build/lang_iteration10_source_fuzz --grammar array --seed <uint64> --schedule <schedule-name>
+```
+
 Replay a negative mutant check with:
 
 ```bash
@@ -210,9 +238,16 @@ Replay a recursive negative mutant check with:
 ./build/lang_iteration10_source_fuzz --grammar recursive --seed <uint64> --mutant <0..3>
 ```
 
+Replay an array negative mutant check with:
+
+```bash
+./build/lang_iteration10_source_fuzz --grammar array --seed <uint64> --mutant <0..3>
+```
+
 Dump either source corpus for byte-identity checks with:
 
 ```bash
 ./build/lang_iteration10_source_fuzz --dump-corpus legacy
 ./build/lang_iteration10_source_fuzz --dump-corpus recursive
+./build/lang_iteration10_source_fuzz --dump-corpus array
 ```

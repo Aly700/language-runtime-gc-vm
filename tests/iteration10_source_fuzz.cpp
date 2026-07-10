@@ -1,6 +1,7 @@
 #include "lang/frontend/type_checker.hpp"
 #include "fuzz_common.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -24,6 +25,7 @@ using fuzz::schedules;
 enum class SourceGrammar {
     Legacy,
     Recursive,
+    Array,
 };
 
 const char* grammar_name(SourceGrammar grammar) {
@@ -32,6 +34,8 @@ const char* grammar_name(SourceGrammar grammar) {
         return "legacy";
     case SourceGrammar::Recursive:
         return "recursive";
+    case SourceGrammar::Array:
+        return "array";
     }
     return "<unknown>";
 }
@@ -43,17 +47,23 @@ SourceGrammar parse_grammar(const std::string& value) {
     if (value == "recursive") {
         return SourceGrammar::Recursive;
     }
+    if (value == "array") {
+        return SourceGrammar::Array;
+    }
     throw std::runtime_error("invalid source grammar: " + value);
 }
 
 constexpr std::uint64_t kSnapshotSeed = 17;
 constexpr std::uint64_t kRecursiveSnapshotSeed = 17;
+constexpr std::uint64_t kArraySnapshotSeed = 17;
 constexpr std::uint64_t kFirstCorpusSeed = 1;
 constexpr std::uint64_t kPositiveCorpusSize = 48;
 constexpr std::uint64_t kRecursivePositiveCorpusSize = 48;
+constexpr std::uint64_t kArrayPositiveCorpusSize = 48;
 constexpr std::uint64_t kMutantCorpusSize = 12;
 constexpr std::size_t kMutantCount = 3;
 constexpr std::size_t kRecursiveMutantCount = 4;
+constexpr std::size_t kArrayMutantCount = 4;
 
 void require(bool condition, const std::string& message) {
     if (!condition) {
@@ -100,6 +110,10 @@ bool is_pair_type(const GenType& type) {
 
 GenType pair_type(const GenType& left, const GenType& right) {
     return GenType{"pair<" + left.text + ", " + right.text + ">"};
+}
+
+GenType array_type(const GenType& element) {
+    return GenType{"[" + element.text + "]"};
 }
 
 bool conforms_to(const GenType& value, const GenType& target) {
@@ -566,12 +580,109 @@ GeneratedProgram generate_recursive_source_program(std::uint64_t seed) {
     return GeneratedProgram{seed, 9, list_limit, list_limit, out.str()};
 }
 
+GeneratedProgram generate_array_source_program(std::uint64_t seed) {
+    const auto i64_array = array_type(i64_type());
+    const auto bool_array = array_type(bool_type());
+    const auto pair_i64_i64 = pair_type(i64_type(), i64_type());
+    const auto pair_array = array_type(pair_i64_i64);
+    const auto nested_i64_array = array_type(i64_array);
+    const auto list_type = GenType{"List"};
+    const auto list_array = array_type(list_type);
+
+    const auto length = static_cast<std::int64_t>(3);
+    const auto base = static_cast<std::int64_t>((seed % 13) - 6);
+    const auto bias = static_cast<std::int64_t>((seed % 5) + 1);
+    const auto replacement = static_cast<std::int64_t>(20 + (seed % 17));
+    const auto flag0 = (seed % 2) == 0;
+    const auto flag1 = (seed % 3) == 0;
+    const auto flag2 = (seed % 5) < 2;
+    const auto flag_index = static_cast<std::int64_t>(seed % 3);
+    const auto result_variant = seed % 5;
+
+    std::ostringstream out;
+    out << "type List = pair<i64, List>;\n\n";
+
+    out << "fn row_sum(row: " << i64_array.text << ") -> i64 {\n";
+    out << "  row[0] + row[1] + row[2]\n";
+    out << "}\n\n";
+
+    out << "fn pair_at(items: " << pair_array.text << ", index: i64) -> "
+        << pair_i64_i64.text << " {\n";
+    out << "  items[index]\n";
+    out << "}\n\n";
+
+    out << "fn place_row(grid: " << nested_i64_array.text << ", row: "
+        << i64_array.text << ") -> " << nested_i64_array.text << " {\n";
+    out << "  grid[1] = row;\n";
+    out << "  grid\n";
+    out << "}\n\n";
+
+    out << "let values: " << i64_array.text << " = array<i64>(" << length
+        << ", " << base << ");\n";
+    out << "let flags: " << bool_array.text << " = ["
+        << (flag0 ? "true" : "false") << ", "
+        << (flag1 ? "true" : "false") << ", "
+        << (flag2 ? "true" : "false") << "];\n";
+    out << "let first: " << i64_array.text << " = ["
+        << base << ", " << (base + 1) << ", " << (base + 2) << "];\n";
+    out << "let second: " << i64_array.text << " = array<i64>(" << length
+        << ", 0);\n";
+    out << "let pairs: " << pair_array.text << " = array<" << pair_i64_i64.text
+        << ">(" << length << ", pair(" << base << ", " << (base + 1)
+        << "));\n";
+    out << "let grid: " << nested_i64_array.text << " = array<" << i64_array.text
+        << ">(2, first);\n";
+    out << "let list_head: " << list_type.text << " = pair(" << replacement
+        << ", nil);\n";
+    out << "let lists: " << list_array.text << " = array<" << list_type.text
+        << ">(2, list_head);\n";
+    out << "let i: i64 = 0;\n";
+    out << "let sum: i64 = 0;\n";
+    out << "while i < values.len {\n";
+    out << "  values[i] = i + " << base << ";\n";
+    out << "  second[i] = values[i] + " << bias << ";\n";
+    out << "  pairs[i] = pair(values[i], second[i]);\n";
+    out << "  sum = sum + pairs[i].left;\n";
+    out << "  i = i + 1;\n";
+    out << "}\n";
+    out << "grid = place_row(grid, second);\n";
+    out << "lists[1] = pair(lists[0].left + " << bias << ", nil);\n";
+    out << "if flags[" << flag_index << "] {\n";
+    out << "  sum = sum + row_sum(grid[1]);\n";
+    out << "} else {\n";
+    out << "  sum = sum + row_sum(grid[0]);\n";
+    out << "}\n";
+    out << "sum = sum + pair_at(pairs, 1).right;\n";
+
+    switch (result_variant) {
+    case 0:
+        out << "sum\n";
+        break;
+    case 1:
+        out << "grid\n";
+        break;
+    case 2:
+        out << "lists[1].left\n";
+        break;
+    case 3:
+        out << "flags[" << flag_index << "]\n";
+        break;
+    default:
+        out << "pair_at(pairs, 2)\n";
+        break;
+    }
+
+    return GeneratedProgram{seed, 3, length, 0, out.str()};
+}
+
 GeneratedProgram generate_program(SourceGrammar grammar, std::uint64_t seed) {
     switch (grammar) {
     case SourceGrammar::Legacy:
         return generate_source_program(seed);
     case SourceGrammar::Recursive:
         return generate_recursive_source_program(seed);
+    case SourceGrammar::Array:
+        return generate_array_source_program(seed);
     }
     throw std::runtime_error("unknown source grammar");
 }
@@ -796,12 +907,38 @@ std::string mutate_recursive_source(const GeneratedProgram& generated,
     }
 }
 
+std::string mutate_array_source(const GeneratedProgram& generated,
+                                std::size_t mutant_index) {
+    switch (mutant_index) {
+    case 0:
+        return replace_line_containing(
+            generated.source, "let flags: [bool] = [",
+            "let flags: [bool] = [true, 7, false];\n",
+            "array literal element type break");
+    case 1:
+        return replace_once(generated.source, "values[i] = i + ",
+                            "values[flags[0]] = i + ",
+                            "non-i64 array index");
+    case 2:
+        return replace_once(generated.source, "while i < values.len",
+                            "while i < sum.len", "len on non-array");
+    case 3:
+        return replace_once(generated.source, "sum = sum + pair_at(pairs, 1).right;",
+                            "sum = sum + sum[0];", "index on non-array");
+    default:
+        throw std::runtime_error("unknown array mutant index " +
+                                 std::to_string(mutant_index));
+    }
+}
+
 std::size_t mutant_count(SourceGrammar grammar) {
     switch (grammar) {
     case SourceGrammar::Legacy:
         return kMutantCount;
     case SourceGrammar::Recursive:
         return kRecursiveMutantCount;
+    case SourceGrammar::Array:
+        return kArrayMutantCount;
     }
     throw std::runtime_error("unknown source grammar");
 }
@@ -812,6 +949,8 @@ std::uint64_t positive_corpus_size(SourceGrammar grammar) {
         return kPositiveCorpusSize;
     case SourceGrammar::Recursive:
         return kRecursivePositiveCorpusSize;
+    case SourceGrammar::Array:
+        return kArrayPositiveCorpusSize;
     }
     throw std::runtime_error("unknown source grammar");
 }
@@ -823,6 +962,8 @@ std::string mutate_source(SourceGrammar grammar, const GeneratedProgram& generat
         return mutate_source(generated, mutant_index);
     case SourceGrammar::Recursive:
         return mutate_recursive_source(generated, mutant_index);
+    case SourceGrammar::Array:
+        return mutate_array_source(generated, mutant_index);
     }
     throw std::runtime_error("unknown source grammar");
 }
@@ -1049,6 +1190,56 @@ direct_score + tail_value(chosen)
                 expected + "actual:\n" + generated.source);
 }
 
+void pinned_array_source_snapshot() {
+    const auto generated = generate_array_source_program(kArraySnapshotSeed);
+    const std::string expected = R"SRC(type List = pair<i64, List>;
+
+fn row_sum(row: [i64]) -> i64 {
+  row[0] + row[1] + row[2]
+}
+
+fn pair_at(items: [pair<i64, i64>], index: i64) -> pair<i64, i64> {
+  items[index]
+}
+
+fn place_row(grid: [[i64]], row: [i64]) -> [[i64]] {
+  grid[1] = row;
+  grid
+}
+
+let values: [i64] = array<i64>(3, -2);
+let flags: [bool] = [false, false, false];
+let first: [i64] = [-2, -1, 0];
+let second: [i64] = array<i64>(3, 0);
+let pairs: [pair<i64, i64>] = array<pair<i64, i64>>(3, pair(-2, -1));
+let grid: [[i64]] = array<[i64]>(2, first);
+let list_head: List = pair(20, nil);
+let lists: [List] = array<List>(2, list_head);
+let i: i64 = 0;
+let sum: i64 = 0;
+while i < values.len {
+  values[i] = i + -2;
+  second[i] = values[i] + 3;
+  pairs[i] = pair(values[i], second[i]);
+  sum = sum + pairs[i].left;
+  i = i + 1;
+}
+grid = place_row(grid, second);
+lists[1] = pair(lists[0].left + 3, nil);
+if flags[2] {
+  sum = sum + row_sum(grid[1]);
+} else {
+  sum = sum + row_sum(grid[0]);
+}
+sum = sum + pair_at(pairs, 1).right;
+lists[1].left
+)SRC";
+    require(generated.source == expected,
+            "array source generator snapshot changed for seed " +
+                std::to_string(kArraySnapshotSeed) + "\nexpected:\n" +
+                expected + "actual:\n" + generated.source);
+}
+
 std::size_t parse_mutant_index(const std::string& value, std::size_t count) {
     std::size_t parsed = 0;
     const auto index = std::stoull(value, &parsed, 10);
@@ -1116,18 +1307,18 @@ int run(int argc, char** argv) {
 
     if (argc != 1) {
         std::cerr << "usage: " << argv[0]
-                  << " --dump-corpus <legacy|recursive>\n"
+                  << " --dump-corpus <legacy|recursive|array>\n"
                   << "       " << argv[0]
                   << " [--seed <uint64> --schedule <schedule-name>]\n"
                   << "       " << argv[0]
-                  << " --grammar <legacy|recursive> --seed <uint64>"
+                  << " --grammar <legacy|recursive|array> --seed <uint64>"
                      " --schedule <schedule-name>\n"
                   << "       " << argv[0]
                   << " --seed <uint64> --mutant <0.." << (kMutantCount - 1)
                   << ">\n"
                   << "       " << argv[0]
-                  << " --grammar recursive --seed <uint64> --mutant <0.."
-                  << (kRecursiveMutantCount - 1)
+                  << " --grammar <recursive|array> --seed <uint64> --mutant <0.."
+                  << (std::max(kRecursiveMutantCount, kArrayMutantCount) - 1)
                   << ">\n";
         std::cerr << "schedules:";
         for (const auto& schedule : all_schedules) {
@@ -1139,6 +1330,7 @@ int run(int argc, char** argv) {
 
     pinned_source_snapshot();
     pinned_recursive_source_snapshot();
+    pinned_array_source_snapshot();
 
     for (std::uint64_t seed = kFirstCorpusSeed;
          seed < kFirstCorpusSeed + kPositiveCorpusSize; ++seed) {
@@ -1148,12 +1340,19 @@ int run(int argc, char** argv) {
          seed < kFirstCorpusSeed + kRecursivePositiveCorpusSize; ++seed) {
         run_seed_all_schedules(SourceGrammar::Recursive, seed, all_schedules);
     }
+    for (std::uint64_t seed = kFirstCorpusSeed;
+         seed < kFirstCorpusSeed + kArrayPositiveCorpusSize; ++seed) {
+        run_seed_all_schedules(SourceGrammar::Array, seed, all_schedules);
+    }
     run_mutant_corpus();
     run_mutant_corpus(SourceGrammar::Recursive);
+    run_mutant_corpus(SourceGrammar::Array);
 
     std::cerr << "[PASS] source_pinned_seed_snapshot seed=" << kSnapshotSeed << "\n";
     std::cerr << "[PASS] recursive_source_pinned_seed_snapshot seed="
               << kRecursiveSnapshotSeed << "\n";
+    std::cerr << "[PASS] array_source_pinned_seed_snapshot seed="
+              << kArraySnapshotSeed << "\n";
     std::cerr << "[PASS] lang_iteration10_source_fuzz positive seeds="
               << kPositiveCorpusSize << " schedules=" << all_schedules.size()
               << " executions=" << (kPositiveCorpusSize * all_schedules.size())
@@ -1162,12 +1361,20 @@ int run(int argc, char** argv) {
               << kRecursivePositiveCorpusSize << " schedules="
               << all_schedules.size() << " executions="
               << (kRecursivePositiveCorpusSize * all_schedules.size()) << "\n";
+    std::cerr << "[PASS] lang_iteration10_source_fuzz array positive seeds="
+              << kArrayPositiveCorpusSize << " schedules="
+              << all_schedules.size() << " executions="
+              << (kArrayPositiveCorpusSize * all_schedules.size()) << "\n";
     std::cerr << "[PASS] lang_iteration10_source_fuzz mutants seeds="
               << kMutantCorpusSize << " mutants=" << kMutantCount
               << " checks=" << (kMutantCorpusSize * kMutantCount) << "\n";
     std::cerr << "[PASS] lang_iteration10_source_fuzz recursive mutants seeds="
               << kMutantCorpusSize << " mutants=" << kRecursiveMutantCount
               << " checks=" << (kMutantCorpusSize * kRecursiveMutantCount)
+              << "\n";
+    std::cerr << "[PASS] lang_iteration10_source_fuzz array mutants seeds="
+              << kMutantCorpusSize << " mutants=" << kArrayMutantCount
+              << " checks=" << (kMutantCorpusSize * kArrayMutantCount)
               << "\n";
     return 0;
 }

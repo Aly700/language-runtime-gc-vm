@@ -80,6 +80,12 @@ public:
             case '}':
                 tokens.push_back(simple(TokenKind::RBrace, start, "}"));
                 break;
+            case '[':
+                tokens.push_back(simple(TokenKind::LBracket, start, "["));
+                break;
+            case ']':
+                tokens.push_back(simple(TokenKind::RBracket, start, "]"));
+                break;
             default:
                 add_diagnostic(diagnostics_, start,
                                std::string("unexpected character '") + c + "'");
@@ -172,6 +178,8 @@ private:
             kind = TokenKind::Nil;
         } else if (text == "is_nil") {
             kind = TokenKind::IsNil;
+        } else if (text == "array") {
+            kind = TokenKind::Array;
         } else if (text == "i64") {
             kind = TokenKind::I64;
         } else if (text == "bool") {

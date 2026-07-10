@@ -3,6 +3,7 @@
 #include "diagnostics.hpp"
 
 #include <cassert>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -17,6 +18,7 @@ struct TypedValue {
     TypeSpec type{invalid_type()};
     std::set<std::size_t> object_sites;
     bool includes_nil{false};
+    std::shared_ptr<TypedValue> array_element;
 };
 
 struct FieldState {
@@ -39,8 +41,12 @@ struct FlowState {
 };
 
 bool operator==(const TypedValue& lhs, const TypedValue& rhs) {
+    const bool elements_equal =
+        (lhs.array_element == nullptr && rhs.array_element == nullptr) ||
+        (lhs.array_element != nullptr && rhs.array_element != nullptr &&
+         *lhs.array_element == *rhs.array_element);
     return lhs.type == rhs.type && lhs.object_sites == rhs.object_sites &&
-           lhs.includes_nil == rhs.includes_nil;
+           lhs.includes_nil == rhs.includes_nil && elements_equal;
 }
 
 bool operator==(const FieldState& lhs, const FieldState& rhs) {
@@ -57,9 +63,11 @@ bool operator==(const FlowState& lhs, const FlowState& rhs) {
     return lhs.locals == rhs.locals && lhs.fields_by_site == rhs.fields_by_site;
 }
 
-TypedValue invalid_value() { return TypedValue{invalid_type(), {}, false}; }
-TypedValue scalar_value(TypeSpec type) { return TypedValue{std::move(type), {}, false}; }
-TypedValue nil_value() { return TypedValue{nil_type(), {}, true}; }
+TypedValue invalid_value() { return TypedValue{invalid_type(), {}, false, nullptr}; }
+TypedValue scalar_value(TypeSpec type) {
+    return TypedValue{std::move(type), {}, false, nullptr};
+}
+TypedValue nil_value() { return TypedValue{nil_type(), {}, true, nullptr}; }
 
 TypedValue pair_value(TypeSpec type, std::size_t site) {
     TypedValue value;
@@ -68,9 +76,40 @@ TypedValue pair_value(TypeSpec type, std::size_t site) {
     return value;
 }
 
+TypedValue array_value(TypeSpec type, TypedValue element) {
+    TypedValue value;
+    value.type = std::move(type);
+    value.array_element = std::make_shared<TypedValue>(std::move(element));
+    return value;
+}
+
+bool is_scalar_array_element_type(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Int64 || type.kind == TypeSpec::Kind::Bool;
+}
+
+bool is_reference_array_element_type(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Pair || type.kind == TypeSpec::Kind::Named ||
+           type.kind == TypeSpec::Kind::Array;
+}
+
+bool is_known_nonnil_reference(const TypedValue& value) {
+    if (value.type.kind == TypeSpec::Kind::Array) {
+        return true;
+    }
+    return is_pair(value.type) && value.type.kind != TypeSpec::Kind::Nil &&
+           !value.includes_nil;
+}
+
 TypedValue value_from_type(TypeSpec type) {
+    if (type.kind == TypeSpec::Kind::Array && type.element != nullptr) {
+        auto element = value_from_type(*type.element);
+        if (is_reference_array_element_type(*type.element)) {
+            element.includes_nil = false;
+        }
+        return array_value(std::move(type), std::move(element));
+    }
     const bool includes_nil = type.kind == TypeSpec::Kind::Named;
-    return TypedValue{std::move(type), {}, includes_nil};
+    return TypedValue{std::move(type), {}, includes_nil, nullptr};
 }
 
 TypedValue value_as_declared_type(const TypedValue& value, TypeSpec declared_type) {
@@ -79,6 +118,19 @@ TypedValue value_as_declared_type(const TypedValue& value, TypeSpec declared_typ
     if (is_pair(coerced.type)) {
         coerced.object_sites = value.object_sites;
         coerced.includes_nil = value.includes_nil || value.type.kind == TypeSpec::Kind::Nil;
+    } else if (coerced.type.kind == TypeSpec::Kind::Array &&
+               coerced.type.element != nullptr) {
+        if (value.array_element != nullptr) {
+            coerced.array_element =
+                std::make_shared<TypedValue>(value_as_declared_type(
+                    *value.array_element, *coerced.type.element));
+        } else {
+            coerced.array_element =
+                std::make_shared<TypedValue>(value_from_type(*coerced.type.element));
+        }
+        if (is_reference_array_element_type(*coerced.type.element)) {
+            coerced.array_element->includes_nil = false;
+        }
     }
     return coerced;
 }
@@ -102,6 +154,15 @@ TypedValue join_values(const TypedValue& lhs, const TypedValue& rhs) {
         result.includes_nil = lhs.includes_nil || rhs.includes_nil ||
                               lhs.type.kind == TypeSpec::Kind::Nil ||
                               rhs.type.kind == TypeSpec::Kind::Nil;
+    } else if (result.type.kind == TypeSpec::Kind::Array) {
+        if (lhs.array_element != nullptr && rhs.array_element != nullptr) {
+            result.array_element = std::make_shared<TypedValue>(
+                join_values(*lhs.array_element, *rhs.array_element));
+        } else if (lhs.array_element != nullptr) {
+            result.array_element = lhs.array_element;
+        } else {
+            result.array_element = rhs.array_element;
+        }
     }
     return result;
 }
@@ -326,6 +387,10 @@ private:
             resolve_type(*type.right);
             return;
         }
+        if (type.kind == TypeSpec::Kind::Array && type.element != nullptr) {
+            resolve_type(*type.element);
+            return;
+        }
         if (type.kind != TypeSpec::Kind::Named) {
             return;
         }
@@ -450,6 +515,21 @@ private:
         if (is_invalid(value.type) || is_invalid(target)) {
             return false;
         }
+        if (target.kind == TypeSpec::Kind::Array) {
+            if (value.type.kind != TypeSpec::Kind::Array ||
+                target.element == nullptr || value.type.element == nullptr) {
+                return false;
+            }
+            if (is_scalar_array_element_type(*target.element) !=
+                is_scalar_array_element_type(*value.type.element)) {
+                return false;
+            }
+            if (value.array_element != nullptr) {
+                return value_conforms_to_type(*value.array_element, *target.element,
+                                              state, assumptions);
+            }
+            return *value.type.element == *target.element;
+        }
         if (target.kind == TypeSpec::Kind::Named) {
             if (value.type.kind == TypeSpec::Kind::Nil) {
                 return true;
@@ -548,7 +628,7 @@ private:
 
     void check_assignment(Statement& statement, FlowState& state) {
         const auto assigned = check_expr(*statement.value, state);
-        if (statement.target.fields.empty()) {
+        if (statement.target.steps.empty()) {
             auto* local = find_local(state, statement.target.base_name);
             if (local == nullptr) {
                 diagnose(statement.target.base_position,
@@ -570,11 +650,40 @@ private:
         }
 
         const auto receiver = check_lvalue_prefix(statement.target, state,
-                                                 statement.target.fields.size() - 1);
-        const auto& field = statement.target.fields.back();
+                                                 statement.target.steps.size() - 1);
+        auto& final_step = statement.target.steps.back();
         if (is_invalid(receiver.type) || is_invalid(assigned.type)) {
             return;
         }
+        final_step.receiver_type = receiver.type;
+
+        if (final_step.kind == LValueStep::Kind::Index) {
+            const auto index = check_expr(*final_step.index, state);
+            if (!is_invalid(index.type) && index.type != int64_type()) {
+                diagnose(final_step.index->position, "array index must be i64");
+                return;
+            }
+            if (receiver.type.kind != TypeSpec::Kind::Array ||
+                receiver.type.element == nullptr) {
+                diagnose(final_step.position, "indexing requires array");
+                return;
+            }
+            statement.target.receiver_type = receiver.type;
+            statement.target.element_type = *receiver.type.element;
+            final_step.element_type = *receiver.type.element;
+            if (!value_conforms_to_type(assigned, *receiver.type.element, state)) {
+                diagnose(statement.equals_position,
+                         "cannot assign " + type_name(assigned.type) +
+                             " to array element of type " +
+                             type_name(*receiver.type.element));
+                return;
+            }
+            (void)require_nonnil_ref_array_element(
+                assigned, *receiver.type.element, statement.equals_position);
+            return;
+        }
+
+        const auto& field = final_step;
         if (!is_pair(receiver.type)) {
             diagnose(field.position, "field assignment requires pair");
             return;
@@ -673,6 +782,14 @@ private:
             return check_variable(expression, state);
         case Expr::Kind::PairLiteral:
             return check_pair_literal(expression, state);
+        case Expr::Kind::ArrayLiteral:
+            return check_array_literal(expression, state);
+        case Expr::Kind::ArraySized:
+            return check_array_sized(expression, state);
+        case Expr::Kind::ArrayIndex:
+            return check_array_index(expression, state);
+        case Expr::Kind::ArrayLen:
+            return check_array_len(expression, state);
         case Expr::Kind::Binary:
             return check_binary(expression, state);
         case Expr::Kind::Field:
@@ -726,6 +843,136 @@ private:
         }
         const auto inferred_type = pair_type(left.type, right.type);
         return annotate(expression, pair_value(inferred_type, expression.pair_site));
+    }
+
+    bool require_nonnil_ref_array_element(const TypedValue& value,
+                                          const TypeSpec& element_type,
+                                          SourcePosition position) {
+        if (!is_reference_array_element_type(element_type)) {
+            return true;
+        }
+        if (!is_known_nonnil_reference(value)) {
+            diagnose(position, "reference array elements must be non-nil");
+            return false;
+        }
+        return true;
+    }
+
+    TypedValue check_array_literal(Expr& expression, FlowState& state) {
+        if (expression.arguments.empty()) {
+            diagnose(expression.position,
+                     "array literal requires at least one element; use array<T>(len, init) for sized construction");
+            return annotate(expression, invalid_value());
+        }
+
+        std::vector<TypedValue> elements;
+        elements.reserve(expression.arguments.size());
+        for (auto& argument : expression.arguments) {
+            elements.push_back(check_expr(*argument, state));
+        }
+
+        TypeSpec element_type = elements.front().type;
+        TypedValue joined_element = elements.front();
+        bool valid = !is_invalid(element_type);
+        for (std::size_t i = 1; i < elements.size(); ++i) {
+            if (is_invalid(elements[i].type)) {
+                valid = false;
+                continue;
+            }
+            if (elements[i].type != element_type) {
+                diagnose(expression.arguments[i]->position,
+                         "array literal elements must have one type");
+                valid = false;
+                continue;
+            }
+            joined_element = join_values(joined_element, elements[i]);
+        }
+        for (std::size_t i = 0; i < elements.size(); ++i) {
+            valid = require_nonnil_ref_array_element(
+                        elements[i], element_type, expression.arguments[i]->position) &&
+                    valid;
+        }
+        if (!valid) {
+            return annotate(expression, invalid_value());
+        }
+
+        auto inferred_type = array_type(element_type);
+        return annotate(expression, array_value(std::move(inferred_type),
+                                                std::move(joined_element)));
+    }
+
+    TypedValue check_array_sized(Expr& expression, FlowState& state) {
+        resolve_type(expression.array_element_type);
+        const auto length = check_expr(*expression.left, state);
+        const auto initializer = check_expr(*expression.right, state);
+        bool valid = true;
+        if (!is_invalid(length.type) && length.type != int64_type()) {
+            diagnose(expression.left->position, "array length must be i64");
+            valid = false;
+        }
+        if (!is_invalid(initializer.type) &&
+            !value_conforms_to_type(initializer, expression.array_element_type, state)) {
+            diagnose(expression.right->position,
+                     "array initializer expects " +
+                         type_name(expression.array_element_type) + " but got " +
+                         type_name(initializer.type));
+            valid = false;
+        }
+        valid = require_nonnil_ref_array_element(
+                    initializer, expression.array_element_type, expression.right->position) &&
+                valid;
+        if (!valid || is_invalid(expression.array_element_type)) {
+            return annotate(expression, invalid_value());
+        }
+
+        auto coerced_element =
+            value_as_declared_type(initializer, expression.array_element_type);
+        if (is_reference_array_element_type(expression.array_element_type)) {
+            coerced_element.includes_nil = false;
+        }
+        auto inferred_type = array_type(expression.array_element_type);
+        return annotate(expression, array_value(std::move(inferred_type),
+                                                std::move(coerced_element)));
+    }
+
+    TypedValue load_array_element(const TypedValue& receiver, SourcePosition position) {
+        if (is_invalid(receiver.type)) {
+            return invalid_value();
+        }
+        if (receiver.type.kind != TypeSpec::Kind::Array ||
+            receiver.type.element == nullptr) {
+            diagnose(position, "indexing requires array");
+            return invalid_value();
+        }
+        auto element = receiver.array_element != nullptr
+                           ? *receiver.array_element
+                           : value_from_type(*receiver.type.element);
+        element.type = *receiver.type.element;
+        if (is_reference_array_element_type(*receiver.type.element)) {
+            element.includes_nil = false;
+        }
+        return element;
+    }
+
+    TypedValue check_array_index(Expr& expression, FlowState& state) {
+        const auto receiver = check_expr(*expression.receiver, state);
+        const auto index = check_expr(*expression.left, state);
+        if (!is_invalid(index.type) && index.type != int64_type()) {
+            diagnose(expression.left->position, "array index must be i64");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, load_array_element(receiver, expression.position));
+    }
+
+    TypedValue check_array_len(Expr& expression, FlowState& state) {
+        const auto receiver = check_expr(*expression.receiver, state);
+        if (!is_invalid(receiver.type) &&
+            (receiver.type.kind != TypeSpec::Kind::Array ||
+             receiver.type.element == nullptr)) {
+            diagnose(expression.position, "len requires array");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, scalar_value(int64_type()));
     }
 
     TypedValue check_binary(Expr& expression, FlowState& state) {
@@ -812,7 +1059,7 @@ private:
     }
 
     TypedValue check_lvalue_prefix(LValue& lvalue, FlowState& state,
-                                   std::size_t field_count) {
+                                   std::size_t step_count) {
         auto* local = find_local(state, lvalue.base_name);
         if (local == nullptr) {
             diagnose(lvalue.base_position, "undefined variable '" + lvalue.base_name + "'");
@@ -826,9 +1073,22 @@ private:
         }
 
         auto current = local->value;
-        for (std::size_t i = 0; i < field_count; ++i) {
-            const auto& field = lvalue.fields[i];
-            current = load_field(current, field.name, field.position, state);
+        for (std::size_t i = 0; i < step_count; ++i) {
+            auto& step = lvalue.steps[i];
+            step.receiver_type = current.type;
+            if (step.kind == LValueStep::Kind::Field) {
+                current = load_field(current, step.name, step.position, state);
+            } else {
+                const auto index = check_expr(*step.index, state);
+                if (!is_invalid(index.type) && index.type != int64_type()) {
+                    diagnose(step.index->position, "array index must be i64");
+                    return invalid_value();
+                }
+                current = load_array_element(current, step.position);
+                if (!is_invalid(current.type)) {
+                    step.element_type = current.type;
+                }
+            }
             if (is_invalid(current.type)) {
                 return current;
             }

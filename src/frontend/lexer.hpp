@@ -23,6 +23,7 @@ enum class TokenKind {
     False,
     Nil,
     IsNil,
+    Array,
     I64,
     Bool,
     Pair,
@@ -41,6 +42,8 @@ enum class TokenKind {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
 };
 
 struct Token {

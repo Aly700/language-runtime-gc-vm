@@ -37,6 +37,13 @@ TypeSpec pair_type(TypeSpec left, TypeSpec right) {
     return type;
 }
 
+TypeSpec array_type(TypeSpec element) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Array;
+    type.element = std::make_shared<TypeSpec>(std::move(element));
+    return type;
+}
+
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs.kind != rhs.kind) {
         return false;
@@ -46,6 +53,12 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
             return lhs.named_type_index == rhs.named_type_index;
         }
         return lhs.name == rhs.name;
+    }
+    if (lhs.kind == TypeSpec::Kind::Array) {
+        if (lhs.element == nullptr || rhs.element == nullptr) {
+            return lhs.element == rhs.element;
+        }
+        return *lhs.element == *rhs.element;
     }
     if (!lhs.has_pair_fields() && !rhs.has_pair_fields()) {
         return true;
@@ -76,6 +89,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Bool;
     case TypeSpec::Kind::Pair:
         return Type::Pair;
+    case TypeSpec::Kind::Array:
+        return Type::Array;
     case TypeSpec::Kind::Named:
         return Type::Pair;
     case TypeSpec::Kind::Nil:
@@ -97,6 +112,11 @@ std::string type_name(const TypeSpec& type) {
             return "pair<" + type_name(*type.left) + ", " + type_name(*type.right) + ">";
         }
         return "pair";
+    case TypeSpec::Kind::Array:
+        if (type.element != nullptr) {
+            return "[" + type_name(*type.element) + "]";
+        }
+        return "[invalid]";
     case TypeSpec::Kind::Named:
         return type.name;
     case TypeSpec::Kind::Nil:
@@ -121,6 +141,10 @@ TypeSpec join_types(const TypeSpec& lhs, const TypeSpec& rhs) {
         return rhs;
     }
     if (rhs.kind == TypeSpec::Kind::Nil && is_pair(lhs)) {
+        return lhs;
+    }
+    if (lhs.kind == TypeSpec::Kind::Array && rhs.kind == TypeSpec::Kind::Array &&
+        lhs.element != nullptr && rhs.element != nullptr && *lhs.element == *rhs.element) {
         return lhs;
     }
     if (is_pair(lhs) && is_pair(rhs)) {
@@ -295,10 +319,27 @@ private:
             return false;
         }
         std::size_t index = current_ + 1;
-        while (index + 1 < tokens_.size() && tokens_[index].kind == TokenKind::Dot &&
-               (tokens_[index + 1].kind == TokenKind::Left ||
-                tokens_[index + 1].kind == TokenKind::Right)) {
-            index += 2;
+        while (index < tokens_.size()) {
+            if (index + 1 < tokens_.size() && tokens_[index].kind == TokenKind::Dot &&
+                (tokens_[index + 1].kind == TokenKind::Left ||
+                 tokens_[index + 1].kind == TokenKind::Right)) {
+                index += 2;
+                continue;
+            }
+            if (tokens_[index].kind == TokenKind::LBracket) {
+                std::size_t depth = 1;
+                ++index;
+                while (index < tokens_.size() && depth != 0) {
+                    if (tokens_[index].kind == TokenKind::LBracket) {
+                        ++depth;
+                    } else if (tokens_[index].kind == TokenKind::RBracket) {
+                        --depth;
+                    }
+                    ++index;
+                }
+                continue;
+            }
+            break;
         }
         return index < tokens_.size() && tokens_[index].kind == TokenKind::Equal;
     }
@@ -341,6 +382,14 @@ private:
     }
 
     TypeSpec parse_type() {
+        if (match(TokenKind::LBracket)) {
+            const auto position = previous().position;
+            auto element = parse_type();
+            expect(TokenKind::RBracket, "expected ']' after array element type");
+            auto type = array_type(std::move(element));
+            type.position = position;
+            return type;
+        }
         if (match(TokenKind::I64)) {
             auto type = int64_type();
             type.position = previous().position;
@@ -370,7 +419,7 @@ private:
             return named_type(previous().text, previous().position);
         }
         add_diagnostic(diagnostics_, peek().position,
-                       "expected type 'i64', 'bool', 'pair', or named type");
+                       "expected type 'i64', 'bool', 'pair', array type, or named type");
         return invalid_type();
     }
 
@@ -437,12 +486,42 @@ private:
         }
         while (match(TokenKind::Dot)) {
             if (match(TokenKind::Left) || match(TokenKind::Right)) {
-                value.fields.push_back(FieldStep{previous().text, previous().position});
+                LValueStep step;
+                step.kind = LValueStep::Kind::Field;
+                step.name = previous().text;
+                step.position = previous().position;
+                value.steps.push_back(std::move(step));
             } else {
                 add_diagnostic(diagnostics_, peek().position,
                                "expected field name 'left' or 'right'");
                 break;
             }
+        }
+        while (true) {
+            if (match(TokenKind::Dot)) {
+                if (match(TokenKind::Left) || match(TokenKind::Right)) {
+                    LValueStep step;
+                    step.kind = LValueStep::Kind::Field;
+                    step.name = previous().text;
+                    step.position = previous().position;
+                    value.steps.push_back(std::move(step));
+                } else {
+                    add_diagnostic(diagnostics_, peek().position,
+                                   "expected field name 'left' or 'right'");
+                    break;
+                }
+                continue;
+            }
+            if (match(TokenKind::LBracket)) {
+                LValueStep step;
+                step.kind = LValueStep::Kind::Index;
+                step.position = previous().position;
+                step.index = parse_expression();
+                expect(TokenKind::RBracket, "expected ']' after array index");
+                value.steps.push_back(std::move(step));
+                continue;
+            }
+            break;
         }
         return value;
     }
@@ -491,11 +570,26 @@ private:
                     node->name = previous().text;
                     node->receiver = std::move(expression);
                     expression = std::move(node);
+                } else if (check(TokenKind::Identifier) && peek().text == "len") {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::ArrayLen;
+                    node->position = peek().position;
+                    node->receiver = std::move(expression);
+                    ++current_;
+                    expression = std::move(node);
                 } else {
                     add_diagnostic(diagnostics_, peek().position,
-                                   "expected field name 'left' or 'right'");
+                                   "expected field name 'left', 'right', or 'len'");
                     break;
                 }
+            } else if (match(TokenKind::LBracket)) {
+                auto node = std::make_unique<Expr>();
+                node->kind = Expr::Kind::ArrayIndex;
+                node->position = previous().position;
+                node->receiver = std::move(expression);
+                node->left = parse_expression();
+                expect(TokenKind::RBracket, "expected ']' after array index");
+                expression = std::move(node);
             } else if (match(TokenKind::LParen)) {
                 auto node = std::make_unique<Expr>();
                 node->kind = Expr::Kind::Call;
@@ -567,6 +661,32 @@ private:
             expect(TokenKind::Comma, "expected ',' between pair fields");
             node->right = parse_expression();
             expect(TokenKind::RParen, "expected ')' after pair fields");
+            return node;
+        }
+        if (match(TokenKind::Array)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::ArraySized;
+            node->position = previous().position;
+            expect(TokenKind::Less, "expected '<' after 'array'");
+            node->array_element_type = parse_type();
+            expect(TokenKind::Greater, "expected '>' after array element type");
+            expect(TokenKind::LParen, "expected '(' after array element type");
+            node->left = parse_expression();
+            expect(TokenKind::Comma, "expected ',' between array length and initializer");
+            node->right = parse_expression();
+            expect(TokenKind::RParen, "expected ')' after array initializer");
+            return node;
+        }
+        if (match(TokenKind::LBracket)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::ArrayLiteral;
+            node->position = previous().position;
+            if (!check(TokenKind::RBracket)) {
+                do {
+                    node->arguments.push_back(parse_expression());
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::RBracket, "expected ']' after array literal");
             return node;
         }
         if (match(TokenKind::LParen)) {

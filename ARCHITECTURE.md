@@ -25,12 +25,14 @@ Frontend implementation files are split by pipeline stage while keeping
 
 The source language is intentionally small:
 
-- Types are `i64`, `bool`, opaque `pair`, finite parametric `pair<T, U>`, and named
-  pair declarations such as `type List = pair<i64, List>;`.
+- Types are `i64`, `bool`, opaque `pair`, finite parametric `pair<T, U>`, array
+  types `[T]`, and named pair declarations such as `type List = pair<i64, List>;`.
 - Top-level `let name: type = expression;` declarations introduce initialized locals.
-- Assignment supports locals and `pair` fields (`left` and `right`).
+- Assignment supports locals, `pair` fields (`left` and `right`), and array elements
+  (`a[i] = v`).
 - Expressions include i64/bool literals, variables, `+`, `<`, `pair(left, right)`, field
-  access, and parentheses.
+  access, `[v, ...]` array literals, `array<T>(len, init)` sized array construction,
+  array indexing `a[i]`, array length `a.len`, and parentheses.
 - `if condition { ... } else { ... }` and `while condition { ... }` are statement forms.
 - Function declarations use `fn name(a: i64, b: pair<i64, pair>) -> pair<i64, bool> { ... }`.
   Function bodies have the same shape as the top level: statements followed by a final
@@ -59,12 +61,24 @@ recursive fields read as nullable named values again, so `xs.right.left` require
 check. This preserves the old non-nil guarantees for anonymous `pair<T, U>` and opaque
 `pair`.
 
+Source arrays are a typed surface over the two heap array descriptors. `[i64]` and
+`[bool]` are scalar arrays backed by `ObjectKind::ScalarArray`; bool elements are encoded
+as raw integer payload values by the compiler and recovered as bool on indexing.
+Reference element arrays such as `[pair<i64, i64>]`, `[List]`, and `[[i64]]` are backed by
+`ObjectKind::RefArray`; literals list every element, and sized construction requires an
+initializer expression, so no nil or uninitialized reference-array hole is observable.
+`nil` and maybe-nil named values are rejected for RefArray construction and stores, but
+indexing a reference array returns the declared element type as known non-nil. That typed
+element recovery is what allows `pairs[i].left`, `[List]` element field reads, and
+`grid[i][j]` for `[[i64]]` even though `RefArrayGet` is a coarse bytecode operation.
+
 ## Runtime scaffold
 
 - `lang::Module` stores a designated entry function, all callable `lang::Function`
   bodies, and a finite named-type table. Each function carries a `FunctionSignature` of
-  coarse parameter/return kinds, optional detailed `SignatureValue` pair-field types or
-  named-type back-references, bytecode, local count, and optional stack maps.
+  coarse parameter/return kinds, optional detailed `SignatureValue` pair-field types,
+  array element types, or named-type back-references, bytecode, local count, and optional
+  stack maps.
 - `lang::VerifiedModule` is the immutable execution proof for module bytecode. It is
   constructible only through `verify_module_with_diagnostics`, `verify_module`, or the
   frontend compiler path, all of which first run the module verifier, attach the generated
@@ -113,9 +127,9 @@ check. This preserves the old non-nil guarantees for anonymous `pair<T, U>` and 
   fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
   Raw scalar array elements are never marked, forwarded, validated as references, or
   entered into the remembered-set logic.
-- Pair field types and named recursive types are verification-time metadata only. They do
-  not change `Value`, object layout, stack-map format, root tracing, write barriers,
-  forwarding, movement, or heap validation.
+- Pair field types, array element types, and named recursive types are verification-time
+  metadata only. They do not change `Value`, object layout, stack-map format, root
+  tracing, write barriers, forwarding, movement, or heap validation.
 - Pair field mutation is routed through `Heap::store_pair_field`, and RefArray element
   mutation is routed through `Heap::store_ref_array_element`. Those methods are the only
   reference-publishing mutation hook points exposed to bytecode, and each runs the
@@ -211,6 +225,12 @@ Compiler accommodations for verifier strictness:
   and also attaches finite `pair<T, U>` details to function signatures. A field can be read
   only when all possible allocation sites and signature facts agree on the field kind;
   field assignment through typed pairs must preserve the declared field kind.
+- Arrays: the type checker classifies each `[T]` by element type. `[i64]` and `[bool]`
+  compile to `AllocArray`/`ArrayGet`/`ArraySet`; `[pair<...>]`, `[[...]]`, and named-pair
+  arrays compile to `AllocRefArray`/`RefArrayGet`/`RefArraySet`. `compile_checked_program`
+  asserts this representation split before returning the verifier-produced
+  `VerifiedModule`, and detailed `SignatureValue` array elements let the verifier recover
+  the declared element shape after `RefArrayGet`.
 - Recursive named pairs: the compiler emits the module named-type table before compiling
   signatures, lowers named references to table indices, emits `Nil` for `nil`, and emits
   `IsNil` for nil checks. The type checker and verifier both refine only a checked local,
