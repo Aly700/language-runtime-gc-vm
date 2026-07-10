@@ -23,6 +23,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
         return ValueKind::Object;
     case TypeSpec::Kind::Array:
         return ValueKind::Array;
+    case TypeSpec::Kind::Function:
+        return ValueKind::Function;
     case TypeSpec::Kind::Nil:
         return ValueKind::Nil;
     case TypeSpec::Kind::Invalid:
@@ -41,6 +43,17 @@ SignatureValue signature_value_from_type(const TypeSpec& type) {
     }
     if (type.kind == TypeSpec::Kind::Array && type.element != nullptr) {
         return array_signature(signature_value_from_type(*type.element));
+    }
+    if (type.kind == TypeSpec::Kind::Function &&
+        type.function_return != nullptr) {
+        std::vector<SignatureValue> parameters;
+        parameters.reserve(type.function_parameters.size());
+        for (const auto& parameter : type.function_parameters) {
+            parameters.push_back(signature_value_from_type(parameter));
+        }
+        return function_signature(
+            std::move(parameters),
+            signature_value_from_type(*type.function_return));
     }
     return signature_value(bytecode_kind(type));
 }
@@ -140,6 +153,13 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::NilLiteral:
     case Expr::Kind::Variable:
         return;
+    case Expr::Kind::Lambda:
+        assert(expression.lambda != nullptr);
+        for (const auto& statement : expression.lambda->statements) {
+            add_statement_array_counts(statement, counts);
+        }
+        add_expr_array_counts(*expression.lambda->result, counts);
+        return;
     case Expr::Kind::PairLiteral:
     case Expr::Kind::Binary:
         add_expr_array_counts(*expression.left, counts);
@@ -190,6 +210,9 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::Call:
         for (const auto& argument : expression.arguments) {
             add_expr_array_counts(*argument, counts);
+        }
+        if (!expression.direct_call) {
+            add_expr_array_counts(*expression.receiver, counts);
         }
         return;
     }
@@ -257,13 +280,26 @@ FunctionSignature signature_from_types(const std::vector<Parameter>& parameters,
     return signature;
 }
 
+SignatureValue closure_function_type_from_types(
+    const std::vector<Parameter>& parameters, const TypeSpec& return_type) {
+    std::vector<SignatureValue> parameter_types;
+    parameter_types.reserve(parameters.size());
+    for (const auto& parameter : parameters) {
+        parameter_types.push_back(signature_value_from_type(parameter.type));
+    }
+    return function_signature(std::move(parameter_types),
+                              signature_value_from_type(return_type));
+}
+
 class Compiler {
 public:
     Compiler(std::uint32_t local_count, FunctionSignature signature,
-             std::vector<std::string>& string_constants)
+             std::vector<std::string>& string_constants,
+             std::optional<std::size_t> closure_layout = std::nullopt)
         : string_constants_(string_constants) {
         function_.signature = std::move(signature);
         function_.local_count = local_count;
+        function_.closure_layout = closure_layout;
     }
 
     Function compile(const std::vector<Statement>& statements, const Expr& result) {
@@ -395,7 +431,19 @@ private:
             emit(OpCode::Nil, 0);
             break;
         case Expr::Kind::Variable:
-            emit(OpCode::LoadLocal, expression.local_index);
+            if (expression.is_capture) {
+                emit(OpCode::LoadCapture,
+                     static_cast<std::int64_t>(expression.capture_index));
+            } else if (expression.is_function_reference) {
+                emit(OpCode::AllocClosure,
+                     static_cast<std::int64_t>(
+                         expression.closure_layout_index));
+            } else {
+                emit(OpCode::LoadLocal, expression.local_index);
+            }
+            break;
+        case Expr::Kind::Lambda:
+            compile_lambda(expression);
             break;
         case Expr::Kind::PairLiteral:
             compile_expr(*expression.left);
@@ -443,7 +491,13 @@ private:
             for (const auto& argument : expression.arguments) {
                 compile_expr(*argument);
             }
-            emit(OpCode::Call, static_cast<std::int64_t>(expression.callee_index));
+            if (expression.direct_call) {
+                emit(OpCode::Call,
+                     static_cast<std::int64_t>(expression.callee_index));
+            } else {
+                compile_expr(*expression.receiver);
+                emit(OpCode::CallClosure, 0);
+            }
             break;
         case Expr::Kind::IsNil:
             compile_expr(*expression.receiver);
@@ -459,6 +513,21 @@ private:
         emit(OpCode::ConstantI64, value ? 0 : 1);
         emit(OpCode::ConstantI64, value ? 1 : 0);
         emit(OpCode::LessI64, 0);
+    }
+
+    void compile_lambda(const Expr& expression) {
+        assert(expression.lambda != nullptr &&
+               "type-checked lambda must carry body metadata");
+        for (const auto& capture : expression.lambda->captures) {
+            if (capture.source_is_capture) {
+                emit(OpCode::LoadCapture, capture.source_index);
+            } else {
+                emit(OpCode::LoadLocal, capture.source_index);
+            }
+        }
+        emit(OpCode::AllocClosure,
+             static_cast<std::int64_t>(
+                 expression.lambda->closure_layout_index));
     }
 
     void invert_bool_on_stack() {
@@ -580,17 +649,49 @@ CompileModuleResult compile_checked_program(const Program& program,
             NamedTypeSignature{declaration.name,
                                signature_value_from_type(declaration.body)});
     }
-    module.functions.reserve(program.functions.size() + 1);
+    module.functions.reserve(program.functions.size() + program.lambdas.size() + 1);
+    module.closure_layouts.reserve(program.functions.size() +
+                                   program.lambdas.size());
+    for (const auto& declaration : program.functions) {
+        ClosureLayout layout;
+        layout.function_index = declaration.function_index;
+        layout.function_type = closure_function_type_from_types(
+            declaration.parameters, declaration.return_type);
+        module.closure_layouts.push_back(std::move(layout));
+    }
+    for (const auto& lambda : program.lambdas) {
+        ClosureLayout layout;
+        layout.function_index = lambda->function_index;
+        layout.function_type = closure_function_type_from_types(
+            lambda->parameters, lambda->return_type);
+        layout.capture_types.reserve(lambda->captures.size());
+        layout.capture_map.reserve(lambda->captures.size());
+        for (const auto& capture : lambda->captures) {
+            auto type = signature_value_from_type(capture.type);
+            layout.capture_map.push_back(signature_value_is_reference(type));
+            layout.capture_types.push_back(std::move(type));
+        }
+        module.closure_layouts.push_back(std::move(layout));
+    }
 
     std::vector<Function> compiled_functions;
-    compiled_functions.reserve(program.functions.size());
+    compiled_functions.reserve(program.functions.size() + program.lambdas.size());
     for (const auto& declaration : program.functions) {
         Compiler function_compiler(declaration.local_count,
                                    signature_from_types(declaration.parameters,
                                                         declaration.return_type),
-                                   module.string_constants);
+                                   module.string_constants,
+                                   declaration.closure_layout_index);
         compiled_functions.push_back(
             function_compiler.compile(declaration.statements, *declaration.result));
+    }
+    for (const auto& lambda : program.lambdas) {
+        Compiler lambda_compiler(
+            lambda->local_count,
+            signature_from_types(lambda->parameters, lambda->return_type),
+            module.string_constants, lambda->closure_layout_index);
+        compiled_functions.push_back(
+            lambda_compiler.compile(lambda->statements, *lambda->result));
     }
 
     FunctionSignature entry_signature;

@@ -64,6 +64,8 @@ std::size_t storage_slot_count(const Object& object) {
         return 1 + (static_cast<std::size_t>(object.length) +
                     kStorageSlotBytes - 1) /
                        kStorageSlotBytes;
+    case ObjectKind::Closure:
+        return 1 + static_cast<std::size_t>(object.length);
     }
     throw std::logic_error("unknown object kind");
 }
@@ -72,20 +74,25 @@ void validate_descriptor_shape(const Object& object) {
     switch (object.kind) {
     case ObjectKind::Pair:
         if (object.length != 2 || !object.scalar_elements.empty() ||
-            !object.ref_elements.empty() || !object.string_bytes.empty()) {
+            !object.ref_elements.empty() || !object.string_bytes.empty() ||
+            !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty()) {
             throw std::logic_error("pair object descriptor does not match pair payload");
         }
         return;
     case ObjectKind::ScalarArray:
         if (object.scalar_elements.size() != object.length ||
-            !object.ref_elements.empty() || !object.string_bytes.empty()) {
+            !object.ref_elements.empty() || !object.string_bytes.empty() ||
+            !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty()) {
             throw std::logic_error("scalar array descriptor length does not match payload");
         }
         return;
     case ObjectKind::RefArray:
         if (!object.scalar_elements.empty() ||
             object.ref_elements.size() != object.length ||
-            !object.string_bytes.empty()) {
+            !object.string_bytes.empty() || !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty()) {
             throw std::logic_error("ref array descriptor length does not match payload");
         }
         return;
@@ -93,8 +100,33 @@ void validate_descriptor_shape(const Object& object) {
         if (!object.scalar_elements.empty() || !object.ref_elements.empty() ||
             object.string_bytes.size() != object.length ||
             object.left.tag() != Value::Tag::Nil ||
-            object.right.tag() != Value::Tag::Nil) {
+            object.right.tag() != Value::Tag::Nil ||
+            !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty()) {
             throw std::logic_error("string descriptor length does not match opaque byte payload");
+        }
+        return;
+    case ObjectKind::Closure:
+        if (!object.scalar_elements.empty() || !object.ref_elements.empty() ||
+            !object.string_bytes.empty() ||
+            object.closure_captures.size() != object.length ||
+            object.closure_capture_map.size() != object.length ||
+            object.left.tag() != Value::Tag::Nil ||
+            object.right.tag() != Value::Tag::Nil) {
+            throw std::logic_error(
+                "closure descriptor length does not match capture-map payload");
+        }
+        for (std::size_t i = 0; i < object.closure_captures.size(); ++i) {
+            const auto tag = object.closure_captures[i].tag();
+            if (object.closure_capture_map[i]) {
+                if (tag != Value::Tag::Object && tag != Value::Tag::Nil) {
+                    throw std::logic_error(
+                        "closure capture map marks a scalar payload as a reference");
+                }
+            } else if (tag == Value::Tag::Object) {
+                throw std::logic_error(
+                    "closure capture map marks a reference payload as scalar");
+            }
         }
         return;
     }
@@ -124,6 +156,13 @@ void visit_reference_fields(Object& object, Fn&& fn) {
         return;
     case ObjectKind::Str:
         return;
+    case ObjectKind::Closure:
+        for (std::size_t i = 0; i < object.closure_captures.size(); ++i) {
+            if (object.closure_capture_map[i]) {
+                fn(object.closure_captures[i]);
+            }
+        }
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -144,6 +183,13 @@ void visit_reference_fields(const Object& object, Fn&& fn) {
         }
         return;
     case ObjectKind::Str:
+        return;
+    case ObjectKind::Closure:
+        for (std::size_t i = 0; i < object.closure_captures.size(); ++i) {
+            if (object.closure_capture_map[i]) {
+                fn(object.closure_captures[i]);
+            }
+        }
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -169,6 +215,13 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
         }
         return;
     case ObjectKind::Str:
+        return;
+    case ObjectKind::Closure:
+        for (std::size_t i = object.closure_captures.size(); i > 0; --i) {
+            if (object.closure_capture_map[i - 1]) {
+                fn(object.closure_captures[i - 1]);
+            }
+        }
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -222,6 +275,29 @@ Object Object::string(std::span<const std::uint8_t> bytes) {
     object.left = Value::nil();
     object.right = Value::nil();
     object.string_bytes.assign(bytes.begin(), bytes.end());
+    return object;
+}
+
+Object Object::closure(std::size_t layout_index, std::size_t function_index,
+                       std::vector<Value> captures,
+                       std::vector<bool> capture_map) {
+    if (captures.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("closure capture count exceeds object header limit");
+    }
+    if (layout_index > std::numeric_limits<std::uint32_t>::max() ||
+        function_index > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("closure metadata index exceeds object header limit");
+    }
+    Object object;
+    object.kind = ObjectKind::Closure;
+    object.length = static_cast<std::uint32_t>(captures.size());
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.closure_layout_index = static_cast<std::uint32_t>(layout_index);
+    object.closure_function_index = static_cast<std::uint32_t>(function_index);
+    object.closure_captures = std::move(captures);
+    object.closure_capture_map = std::move(capture_map);
+    validate_descriptor_shape(object);
     return object;
 }
 
@@ -455,6 +531,36 @@ ObjectId Heap::allocate_string_concat(Value left, Value right) {
     return id;
 }
 
+ObjectId Heap::allocate_closure(std::size_t layout_index,
+                                std::size_t function_index,
+                                std::vector<Value> captures,
+                                std::vector<bool> capture_map) {
+    if (captures.size() != capture_map.size()) {
+        throw std::logic_error(
+            "closure capture-map length does not match capture payload");
+    }
+    (void)Object::closure(layout_index, function_index, captures, capture_map);
+
+    if (stress_config_.collect_before_every_allocation) {
+        std::vector<Value*> operand_roots;
+        operand_roots.reserve(captures.size());
+        for (auto& capture : captures) {
+            operand_roots.push_back(&capture);
+        }
+        collect_with_extra_roots(operand_roots);
+    }
+
+    auto id = allocate_object(Object::closure(
+        layout_index, function_index, std::move(captures), std::move(capture_map)));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+    return id;
+}
+
 Handle Heap::make_handle(Value value) {
     if (value.is_object()) {
         (void)checked_slot(value.as_object());
@@ -619,6 +725,15 @@ const Object& Heap::checked_string(ObjectId id) const {
     return object;
 }
 
+const Object& Heap::checked_closure(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Closure) {
+        throw std::logic_error("object is not a closure");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
 void Heap::register_handle_root(Value* slot) {
     assert(slot != nullptr && "cannot register a null GC handle root slot");
     handle_roots_.push_back(slot);
@@ -729,6 +844,26 @@ std::uint8_t Heap::string_index(ObjectId id, std::size_t index) const {
     return bytes[index];
 }
 
+std::size_t Heap::closure_layout_index(ObjectId id) const {
+    return checked_closure(id).closure_layout_index;
+}
+
+std::size_t Heap::closure_function_index(ObjectId id) const {
+    return checked_closure(id).closure_function_index;
+}
+
+std::size_t Heap::closure_capture_count(ObjectId id) const {
+    return checked_closure(id).closure_captures.size();
+}
+
+Value Heap::closure_capture(ObjectId id, std::size_t index) const {
+    const auto& object = checked_closure(id);
+    if (index >= object.closure_captures.size()) {
+        throw std::out_of_range("closure capture index out of bounds");
+    }
+    return object.closure_captures[index];
+}
+
 void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     // Barrier hook: every pair field mutation must flow through this method. The public
     // heap API intentionally exposes only const object inspection plus set_left/set_right,
@@ -787,13 +922,39 @@ bool Heap::record_write_barrier_if_needed(ObjectId owner, Value value) {
 void Heap::record_remembered_object(ObjectId id) {
     const auto slot = checked_slot(id);
     if (!is_old_slot(slot)) {
-        throw std::logic_error("write barrier attempted to remember a non-old object");
+        throw std::logic_error("remembered-set insertion attempted for a non-old object");
     }
     if (!remembered_set_contains(id)) {
         remembered_set_.push_back(id);
     }
     if (remembered_set_.size() > metrics_.remembered_set_peak) {
         metrics_.remembered_set_peak = remembered_set_.size();
+    }
+}
+
+void Heap::record_promoted_object_edges(
+    std::span<const std::size_t> promoted_slots) {
+    for (const auto slot : promoted_slots) {
+        if (slot >= objects_.size() || !objects_[slot].has_value() ||
+            !is_old_slot(slot)) {
+            throw std::logic_error(
+                "collector promotion edge scan did not name an installed old object");
+        }
+        const auto owner = make_object_id(static_cast<std::uint32_t>(slot),
+                                          generations_[slot]);
+        bool has_young_reference = false;
+        visit_reference_fields(*objects_[slot], [&](Value value) {
+            if (!value.is_object()) {
+                return;
+            }
+            const auto target_slot = checked_slot(value.as_object());
+            has_young_reference = has_young_reference || is_young_slot(target_slot);
+        });
+        if (has_young_reference) {
+            record_remembered_object(owner);
+            assert(remembered_set_contains(owner) &&
+                   "collector promotion failed to record an old-to-young edge");
+        }
     }
 }
 
@@ -912,6 +1073,7 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     objects_ = std::move(compacted.objects);
     generations_ = std::move(compacted.generations);
     remembered_set_ = std::move(rewritten_remembered_set);
+    record_promoted_object_edges(compacted.promoted_slots);
     prune_remembered_set();
 
     validate_after_collection(roots, extra_roots);
@@ -957,6 +1119,7 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
         moved.marked = false;
         if (moved.generation == ObjectGeneration::Young) {
             moved.generation = ObjectGeneration::Old;
+            result.promoted_slots.push_back(next_live_slot);
         }
 
         const auto required_slots = storage_slot_count(moved);
@@ -1169,8 +1332,23 @@ bool Heap::TEST_ONLY_is_string(ObjectId id) const {
     return object(id).kind == ObjectKind::Str;
 }
 
+bool Heap::TEST_ONLY_is_closure(ObjectId id) const {
+    return object(id).kind == ObjectKind::Closure;
+}
+
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {
     TEST_ONLY_skip_next_write_barrier_ = true;
+}
+
+void Heap::TEST_ONLY_promote_object_through_collector_path(ObjectId id) {
+    const auto slot = checked_slot(id);
+    if (!is_young_slot(slot)) {
+        throw std::logic_error("test promotion requires a young object");
+    }
+    objects_[slot]->generation = ObjectGeneration::Old;
+    const std::array<std::size_t, 1> promoted{slot};
+    record_promoted_object_edges(promoted);
+    validate_remembered_set();
 }
 
 void Heap::TEST_ONLY_validate_gc_invariants() const {

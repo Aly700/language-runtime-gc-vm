@@ -26,7 +26,8 @@ Frontend implementation files are split by pipeline stage while keeping
 The source language is intentionally small:
 
 - Types are `i64`, `bool`, `str`, opaque `pair`, finite parametric `pair<T, U>`, array
-  types `[T]`, and named pair declarations such as `type List = pair<i64, List>;`.
+  types `[T]`, structural function types `fn(T1, ..., Tn) -> R`, and named pair
+  declarations such as `type List = pair<i64, List>;`.
 - Top-level `let name: type = expression;` declarations introduce initialized locals.
 - Assignment supports locals, `pair` fields (`left` and `right`), and array elements
   (`a[i] = v`).
@@ -39,14 +40,18 @@ The source language is intentionally small:
   Function bodies have the same shape as the top level: statements followed by a final
   expression.
 - Calls are expressions and recursion is allowed.
+- Lambdas such as `fn(x: i64) -> i64 { body }` are expressions. They snapshot referenced
+  enclosing locals by value in deterministic first-use order. Function values can be
+  called, passed, returned, placed in pairs, and stored in `RefArray`s; referencing a named
+  top-level function constructs its zero-capture closure value.
 - `nil` is a literal for terminating named pair types, and `is_nil(local)` is a bool
   expression that refines the checked local to non-nil in the `else` branch of an
   `if is_nil(local) { ... } else { ... }` statement.
 - A program ends with a final expression, which becomes the VM result.
 
 Minimal cuts: there are no substrings, string interning/mutation, expression-valued blocks,
-first-class functions, or block-local `let` declarations. Bare `pair` remains an opaque
-pair leaf type for
+capture mutation, recursion through a self-capture, or block-local `let` declarations.
+Bare `pair` remains an opaque pair leaf type for
 compatibility: it proves only "object" at function boundaries, so field reads through bare
 pair parameters/returns are rejected as unknown. Inside a function, the type checker still
 tracks pair field types flow-sensitively by allocation site, so old local pair-field reads
@@ -88,7 +93,9 @@ exists.
   carries a `FunctionSignature` of
   coarse parameter/return kinds, optional detailed `SignatureValue` pair-field types,
   array element types, or named-type back-references, bytecode, local count, and optional
-  stack maps.
+  stack maps. The module also owns a deterministic closure-layout table. Each layout names
+  its function body, repeats the body's structural function type, lists capture types in
+  slot order, and carries the exactly-derived object-reference bitmap.
 - `lang::VerifiedModule` is the immutable execution proof for module bytecode. It is
   constructible only through `verify_module_with_diagnostics`, `verify_module`, or the
   frontend compiler path, all of which first run the module verifier, attach the generated
@@ -135,10 +142,16 @@ exists.
   element is a non-null, descriptor-declared object-reference slot. `Str` stores immutable
   raw bytes and reserves one header slot plus the byte payload rounded up to the
   `std::int64_t` storage-slot granularity.
+- `Closure` is variable-width immutable storage: a raw scalar function index plus N tagged
+  capture slots. Its header retains the validated module layout identity and heap-side
+  capture-map metadata; its logical storage width is one function-index slot plus N capture
+  slots. No closure capture setter exists.
 - All heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two tagged
   fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
-  It also scans zero `Str` payload slots. Raw scalar elements and string bytes are never
-  marked, forwarded, validated as references, or entered into remembered-set logic.
+  It also scans zero `Str` payload slots. For `Closure`, it consults the capture map and
+  visits exactly the statically reference-typed capture slots. Raw scalar elements, scalar
+  closure captures, and string bytes are never marked, forwarded, validated as references,
+  or entered into remembered-set logic.
 - Pair field types, array element types, and named recursive types are verification-time
   metadata only. They do not change `Value`, object layout, stack-map format, root
   tracing, write barriers, forwarding, movement, or heap validation.
@@ -149,6 +162,9 @@ exists.
   `ArraySet` writes raw scalar payload and therefore does not run the write barrier.
   Strings expose only construction and const byte access; there is no string write barrier
   because no post-construction payload mutation exists.
+  Closures likewise expose only construction and const capture access. Their only possible
+  old-to-young edge is collector-created during promotion, so that edge is recorded by the
+  promotion path rather than a mutator barrier.
 - Deterministic GC stress is configured with explicit counters: before every allocation,
   after every allocation, after every barrier-triggering old-to-young store, every N
   major-collection bytecode instructions, and every N minor-collection bytecode
@@ -176,6 +192,13 @@ proof in an immutable `VerifiedModule` keeps the public safety boundary explicit
 Function 0 is the compiled top-level entry. Source `fn` declarations are emitted as
 functions 1..N, and `Call` operands are direct callee indexes. Parameters occupy locals
 0..N-1 in the callee and are initialized when the VM pushes the frame.
+
+Lambda bodies follow named functions in deterministic parser order. `AllocClosure(layout)`
+pops the layout's captures and creates an immutable snapshot. `CallClosure` consumes a
+structural function value and uses the same frame construction and depth check as `Call`.
+A closure body frame additionally owns one precise closure root; `LoadCapture(i)` reads the
+validated immutable slot from that rooted object. Named function bodies use zero-capture
+layouts when referenced as values while direct named calls retain legacy `Call` lowering.
 
 The verifier is modular at function boundaries: it does not import caller allocation-site
 state into the callee and does not export callee allocation-site state back to the caller.
@@ -235,6 +258,11 @@ Compiler accommodations for verifier strictness:
 - Function boundaries: calls emit arguments left-to-right followed by `Call <callee>`.
   Function signatures initialize parameter locals in the verifier and VM, and `Return`
   must match the declared return kind plus any detailed pair field types.
+- Closures: capture analysis orders free locals by first use and emits each current value
+  before `AllocClosure`. Layout signatures, capture types, and derived bitmap are emitted
+  together. Value calls emit arguments followed by the callee and `CallClosure`; lambda
+  bodies read only through verified `LoadCapture` indexes. Function values in arrays select
+  `AllocRefArray`/`RefArrayGet`/`RefArraySet`.
 - Pair fields: the type checker uses the same allocation-site join idea as the verifier
   and also attaches finite `pair<T, U>` details to function signatures. A field can be read
   only when all possible allocation sites and signature facts agree on the field kind;
@@ -313,7 +341,8 @@ Collection is mark, forward, rewrite, install, validate:
    roots) and every descriptor-declared reference slot in every copied live object through
    the forwarding table while the old layout can still validate old IDs. RefArray element
    rewriting is not a separate collector path; it is the variable-length case of the same
-   descriptor visitor used by pairs.
+   descriptor visitor used by pairs. Closure capture rewriting is the per-bitmap case of
+   that same visitor; scalar capture slots are never presented to the forwarding pass.
 5. After installation, validation walks all roots and all descriptor-declared live-object
    reference slots, checks that every object reference resolves through the current
    generation table, and verifies variable-size storage runs do not overlap.
@@ -327,7 +356,7 @@ makes missed updates fail as stale IDs.
 
 The heap has two logical object generations on top of the same slot vector:
 
-- New pair, array, and string allocations are young.
+- New pair, array, string, and closure allocations are young.
 - Any young object that survives one collection is promoted to old. This one-survival
   policy keeps the phase deterministic and makes promotion independent of wall-clock age or
   allocation rate.
@@ -353,6 +382,10 @@ The heap has two logical object generations on top of the same slot vector:
   RefArray elements directly, protecting the barrier-completeness invariant. Scalar arrays
   do not contain reference slots, so `ArraySet` cannot publish an object reference.
   Strings are immutable and therefore have no mutation hook or remembered-set entry.
+- Closure captures are also immutable and have no mutation hook. The compaction promotion
+  path scans every newly promoted owner through its descriptor and records any resulting
+  old-to-young edge before exact remembered-set pruning and boundary validation. This
+  collector-internal insertion does not increment mutator write-barrier metrics.
 
 Rejected alternative: keep old objects fixed during minor collection and compact only young
 slots. That would reduce forwarding work, but it would leave minor collection unable to
@@ -369,14 +402,15 @@ remembered-set entries.
   `LoadLocal` requires a known initialized kind on every incoming path.
 - Root precision: `verify_with_stack_maps` emits per-function per-pc stack reference maps
   from the verifier's abstract states. A true bit means the slot may contain an object
-  reference, including pair objects, scalar arrays, RefArrays, and strings; nullable named-pair
-  slots may contain `nil` in the same reference-capable slot. Hand-written maps, when
+  reference, including pair objects, scalar arrays, RefArrays, strings, and closures;
+  nullable named-pair slots may contain `nil` in the same reference-capable slot. Hand-written maps, when
   present, must match the verifier state, and VM-controlled collection points assert that
   the active frame's runtime stack tags agree with the generated map for the current
   function and pc.
 - Frame-root precision: every live frame's locals and operand stack slots are traced as
   mutable roots. A collection triggered in a deep callee rewrites references held by
-  suspended callers before the callee or caller can resume.
+  suspended callers before the callee or caller can resume. Closure frames additionally
+  trace their frame-owned closure slot so `LoadCapture` always sees the forwarded object.
 - GC identity safety: dereferencing, marking, forwarding, or validating an invalid/stale
   `ObjectId` throws, exposing root-precision and missed-forwarding bugs instead of silently
   ignoring or aliasing them.
@@ -393,7 +427,12 @@ remembered-set entries.
   `Heap::store_pair_field` and `Heap::store_ref_array_element`, minor collection traces
   young objects from mutator roots plus remembered old objects, remembered-set entries are
   rewritten/pruned after movement, and validation traps any valid old-to-young
-  descriptor-declared field or RefArray element absent from the remembered set.
+  descriptor-declared field, RefArray element, or mapped closure capture absent from the
+  remembered set. Promotion-created closure edges are inserted by the collector itself.
+- Capture-map precision: verification requires every closure layout bitmap to equal the
+  ordered capture types. Every heap phase uses the descriptor visitor, which sees mapped
+  reference captures and never sees scalar captures, even when adjacent scalar bits equal
+  current or stale object IDs.
 - Signature safety: call sites are checked against the callee signature only; returns are
   checked against the current function signature. This keeps bytecode verification
   modular and rejects out-of-range calls, wrong arity, wrong argument kind, wrong
@@ -403,8 +442,8 @@ remembered-set entries.
   layout. Scalar arrays and RefArrays are bytecode-only reference-capable values, but
   stack maps keep the same single reference/non-reference bit per stack slot, and the
   VM/heap continue to trace, barrier, forward, and validate by runtime `Value` tags plus
-  heap object descriptors. `Str` adds a distinct verification kind without changing the
-  runtime `Value` tag or stack-map format.
+  heap object descriptors. `Str` and structural `Function` add distinct verification kinds
+  without changing the runtime `Value` tag or stack-map format.
 - Source agreement: `compile_program` does not return bytecode for rejected source, and
   every returned `VerifiedModule` has passed module verification with generated stack
   maps. The returned proof is the single blessed execution product and carries that same
@@ -415,10 +454,11 @@ remembered-set entries.
 
 - Stack height is invariant at a merge; different heights reject immediately to protect
   stack-depth safety.
-- Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `RefArray`, `Str`, `Nil`, and
-  `Poison`; recursive
+- Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `RefArray`, `Str`, `Function`,
+  `Nil`, and `Poison`; recursive
   named values use `Object` with an explicit nullable bit rather than a new runtime kind.
-- Equal non-object/non-array kinds join to themselves; array kinds join only to array;
+- Equal scalar/string kinds join to themselves; structural function values join only when
+  their complete parameter/return types are equal; array kinds join only to array;
   object kinds join to object with the union of possible allocation sites, an opaque-object
   bit, an optional nil bit, optional signature-derived pair fields, and optional
   named-type references.

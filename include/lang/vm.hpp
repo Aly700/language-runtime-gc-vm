@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace lang {
@@ -47,6 +48,7 @@ private:
         std::size_t pc{0};
         std::vector<Value> stack;
         std::vector<Value> locals;
+        std::optional<Value> closure;
     };
 
     void collect_at_instruction_boundary_if_needed(const ModuleVerificationResult& verification,
@@ -59,7 +61,8 @@ private:
     Value pop(Frame& frame);
     void push(Frame& frame, Value value);
     void push_frame(const Module& module, std::size_t function_index,
-                    std::vector<Value> arguments);
+                    std::vector<Value> arguments,
+                    std::optional<Value> closure = std::nullopt);
     std::vector<Frame> frames_;
     gc::Heap heap_;
     gc::StressConfig gc_stress_{};

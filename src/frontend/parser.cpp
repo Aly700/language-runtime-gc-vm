@@ -45,6 +45,14 @@ TypeSpec array_type(TypeSpec element) {
     return type;
 }
 
+TypeSpec function_type(std::vector<TypeSpec> parameters, TypeSpec result) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Function;
+    type.function_parameters = std::move(parameters);
+    type.function_return = std::make_shared<TypeSpec>(std::move(result));
+    return type;
+}
+
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs.kind != rhs.kind) {
         return false;
@@ -60,6 +68,19 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
             return lhs.element == rhs.element;
         }
         return *lhs.element == *rhs.element;
+    }
+    if (lhs.kind == TypeSpec::Kind::Function) {
+        if (lhs.function_parameters.size() != rhs.function_parameters.size() ||
+            lhs.function_return == nullptr || rhs.function_return == nullptr ||
+            *lhs.function_return != *rhs.function_return) {
+            return false;
+        }
+        for (std::size_t i = 0; i < lhs.function_parameters.size(); ++i) {
+            if (lhs.function_parameters[i] != rhs.function_parameters[i]) {
+                return false;
+            }
+        }
+        return true;
     }
     if (!lhs.has_pair_fields() && !rhs.has_pair_fields()) {
         return true;
@@ -94,6 +115,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Pair;
     case TypeSpec::Kind::Array:
         return Type::Array;
+    case TypeSpec::Kind::Function:
+        return Type::Function;
     case TypeSpec::Kind::Named:
         return Type::Pair;
     case TypeSpec::Kind::Nil:
@@ -122,6 +145,20 @@ std::string type_name(const TypeSpec& type) {
             return "[" + type_name(*type.element) + "]";
         }
         return "[invalid]";
+    case TypeSpec::Kind::Function: {
+        std::string rendered = "fn(";
+        for (std::size_t i = 0; i < type.function_parameters.size(); ++i) {
+            if (i != 0) {
+                rendered += ", ";
+            }
+            rendered += type_name(type.function_parameters[i]);
+        }
+        rendered += ") -> ";
+        rendered += type.function_return == nullptr
+                        ? "invalid"
+                        : type_name(*type.function_return);
+        return rendered;
+    }
     case TypeSpec::Kind::Named:
         return type.name;
     case TypeSpec::Kind::Nil:
@@ -166,7 +203,8 @@ public:
 
     std::optional<Program> parse() {
         Program program;
-        while (check(TokenKind::Type) || check(TokenKind::Fn)) {
+        while (check(TokenKind::Type) ||
+               (check(TokenKind::Fn) && check_next(TokenKind::Identifier))) {
             if (match(TokenKind::Type)) {
                 auto declaration = parse_type_declaration(previous());
                 if (declaration.has_value()) {
@@ -213,6 +251,7 @@ public:
             expect(TokenKind::End, "expected end of input after final expression");
         }
         program.pair_site_count = next_pair_site_;
+        program.lambdas = lambdas_;
         if (!diagnostics_.empty()) {
             return std::nullopt;
         }
@@ -227,6 +266,10 @@ private:
     [[nodiscard]] const Token& peek() const { return tokens_[current_]; }
     [[nodiscard]] const Token& previous() const { return tokens_[current_ - 1]; }
     [[nodiscard]] bool check(TokenKind kind) const { return peek().kind == kind; }
+    [[nodiscard]] bool check_next(TokenKind kind) const {
+        return current_ + 1 < tokens_.size() &&
+               tokens_[current_ + 1].kind == kind;
+    }
     [[nodiscard]] bool at_end() const { return check(TokenKind::End); }
 
     bool match(TokenKind kind) {
@@ -410,6 +453,22 @@ private:
             type.position = previous().position;
             return type;
         }
+        if (match(TokenKind::Fn)) {
+            const auto position = previous().position;
+            expect(TokenKind::LParen, "expected '(' after 'fn' in function type");
+            std::vector<TypeSpec> parameters;
+            if (!check(TokenKind::RParen)) {
+                do {
+                    parameters.push_back(parse_type());
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::RParen, "expected ')' after function parameter types");
+            expect(TokenKind::Arrow, "expected '->' in function type");
+            auto result = parse_type();
+            auto type = function_type(std::move(parameters), std::move(result));
+            type.position = position;
+            return type;
+        }
         if (match(TokenKind::Pair)) {
             const auto position = previous().position;
             if (match(TokenKind::Less)) {
@@ -429,7 +488,7 @@ private:
             return named_type(previous().text, previous().position);
         }
         add_diagnostic(diagnostics_, peek().position,
-                       "expected type 'i64', 'bool', 'str', 'pair', array type, or named type");
+                       "expected type 'i64', 'bool', 'str', 'pair', function type, array type, or named type");
         return invalid_type();
     }
 
@@ -620,12 +679,7 @@ private:
                 auto node = std::make_unique<Expr>();
                 node->kind = Expr::Kind::Call;
                 node->position = expression->position;
-                if (expression->kind == Expr::Kind::Variable) {
-                    node->name = expression->name;
-                } else {
-                    add_diagnostic(diagnostics_, node->position,
-                                   "call target must be a function name");
-                }
+                node->receiver = std::move(expression);
                 if (!check(TokenKind::RParen)) {
                     do {
                         node->arguments.push_back(parse_expression());
@@ -641,6 +695,55 @@ private:
     }
 
     std::unique_ptr<Expr> parse_primary() {
+        if (match(TokenKind::Fn)) {
+            const auto fn_token = previous();
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::Lambda;
+            node->position = fn_token.position;
+            node->lambda = std::make_shared<LambdaExpr>();
+            node->lambda->position = fn_token.position;
+
+            expect(TokenKind::LParen, "expected '(' after 'fn' in lambda");
+            if (!check(TokenKind::RParen)) {
+                do {
+                    Parameter parameter;
+                    const auto name =
+                        expect(TokenKind::Identifier, "expected lambda parameter name");
+                    if (name.has_value()) {
+                        parameter.name = name->text;
+                        parameter.position = name->position;
+                    }
+                    expect(TokenKind::Colon,
+                           "expected ':' after lambda parameter name");
+                    parameter.type = parse_type();
+                    node->lambda->parameters.push_back(std::move(parameter));
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::RParen, "expected ')' after lambda parameters");
+            expect(TokenKind::Arrow, "expected '->' before lambda return type");
+            node->lambda->return_type = parse_type();
+            expect(TokenKind::LBrace, "expected '{' before lambda body");
+            while (!check(TokenKind::RBrace) && !check(TokenKind::End)) {
+                if (starts_statement()) {
+                    auto statement = parse_statement();
+                    if (statement.has_value()) {
+                        node->lambda->statements.push_back(std::move(*statement));
+                    } else {
+                        synchronize();
+                    }
+                    continue;
+                }
+                node->lambda->result = parse_expression();
+                break;
+            }
+            if (!node->lambda->result && diagnostics_.empty()) {
+                add_diagnostic(diagnostics_, peek().position,
+                               "lambda body must end with an expression");
+            }
+            expect(TokenKind::RBrace, "expected '}' after lambda body");
+            lambdas_.push_back(node->lambda);
+            return node;
+        }
         if (match(TokenKind::Integer)) {
             auto node = std::make_unique<Expr>();
             node->kind = Expr::Kind::IntLiteral;
@@ -756,6 +859,7 @@ private:
     std::vector<Token> tokens_;
     std::size_t current_{0};
     std::size_t next_pair_site_{0};
+    std::vector<std::shared_ptr<LambdaExpr>> lambdas_;
     std::vector<Diagnostic> diagnostics_;
 };
 

@@ -195,6 +195,19 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             rendered << ")";
             break;
         }
+        case lang::gc::ObjectKind::Closure:
+            rendered << "closure(layout="
+                     << heap.closure_layout_index(order[i]) << ", captures=[";
+            for (std::size_t capture = 0;
+                 capture < heap.closure_capture_count(order[i]); ++capture) {
+                if (capture != 0) {
+                    rendered << ", ";
+                }
+                rendered << value_token(
+                    heap, heap.closure_capture(order[i], capture), indexes, order);
+            }
+            rendered << "])";
+            break;
         }
         objects.push_back(rendered.str());
     }

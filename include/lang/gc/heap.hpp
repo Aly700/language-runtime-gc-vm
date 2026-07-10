@@ -54,6 +54,7 @@ enum class ObjectKind {
     ScalarArray,
     RefArray,
     Str,
+    Closure,
 };
 
 struct Object {
@@ -61,6 +62,9 @@ struct Object {
     static Object scalar_array(std::size_t length, std::int64_t init);
     static Object ref_array(std::size_t length, Value init);
     static Object string(std::span<const std::uint8_t> bytes);
+    static Object closure(std::size_t layout_index, std::size_t function_index,
+                          std::vector<Value> captures,
+                          std::vector<bool> capture_map);
 
     bool marked{false};
     ObjectGeneration generation{ObjectGeneration::Young};
@@ -71,6 +75,10 @@ struct Object {
     std::vector<std::int64_t> scalar_elements;
     std::vector<Value> ref_elements;
     std::vector<std::uint8_t> string_bytes;
+    std::uint32_t closure_layout_index{0};
+    std::uint32_t closure_function_index{0};
+    std::vector<Value> closure_captures;
+    std::vector<bool> closure_capture_map;
 };
 
 class Handle {
@@ -112,6 +120,10 @@ public:
     ObjectId allocate_scalar_array(std::size_t length, std::int64_t init);
     ObjectId allocate_string(std::span<const std::uint8_t> bytes);
     ObjectId allocate_string_concat(Value left, Value right);
+    ObjectId allocate_closure(std::size_t layout_index,
+                              std::size_t function_index,
+                              std::vector<Value> captures,
+                              std::vector<bool> capture_map);
     [[nodiscard]] Handle make_handle(Value value);
     [[nodiscard]] Handle make_handle(ObjectId id);
     void set_root_provider(RootProvider* provider) { root_provider_ = provider; }
@@ -137,6 +149,10 @@ public:
     [[nodiscard]] std::span<const std::uint8_t> string_bytes(ObjectId id) const;
     [[nodiscard]] bool string_equal(ObjectId left, ObjectId right) const;
     [[nodiscard]] std::uint8_t string_index(ObjectId id, std::size_t index) const;
+    [[nodiscard]] std::size_t closure_layout_index(ObjectId id) const;
+    [[nodiscard]] std::size_t closure_function_index(ObjectId id) const;
+    [[nodiscard]] std::size_t closure_capture_count(ObjectId id) const;
+    [[nodiscard]] Value closure_capture(ObjectId id, std::size_t index) const;
     [[nodiscard]] std::size_t live_count() const;
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
@@ -147,6 +163,7 @@ public:
     [[nodiscard]] bool TEST_ONLY_is_scalar_array(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_ref_array(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_string(ObjectId id) const;
+    [[nodiscard]] bool TEST_ONLY_is_closure(ObjectId id) const;
     [[nodiscard]] std::size_t TEST_ONLY_remembered_set_size() const {
         return remembered_set_.size();
     }
@@ -157,6 +174,7 @@ public:
         return handle_roots_.size();
     }
     void TEST_ONLY_skip_next_write_barrier_for_barrier_validator();
+    void TEST_ONLY_promote_object_through_collector_path(ObjectId id);
     void TEST_ONLY_validate_gc_invariants() const;
 
 private:
@@ -173,6 +191,7 @@ private:
         ForwardingTable forwarding;
         std::vector<std::optional<Object>> objects;
         std::vector<std::uint32_t> generations;
+        std::vector<std::size_t> promoted_slots;
         std::uint64_t objects_moved{0};
     };
 
@@ -189,6 +208,7 @@ private:
     [[nodiscard]] const Object& checked_ref_array(ObjectId id) const;
     [[nodiscard]] Object& checked_ref_array(ObjectId id);
     [[nodiscard]] const Object& checked_string(ObjectId id) const;
+    [[nodiscard]] const Object& checked_closure(ObjectId id) const;
     void register_handle_root(Value* slot);
     void deregister_handle_root(Value* slot) noexcept;
     void move_handle_root(Value* from, Value* to) noexcept;
@@ -201,6 +221,7 @@ private:
     void store_ref_array_element(ObjectId id, std::size_t index, Value value);
     [[nodiscard]] bool record_write_barrier_if_needed(ObjectId owner, Value value);
     void record_remembered_object(ObjectId id);
+    void record_promoted_object_edges(std::span<const std::size_t> promoted_slots);
     [[nodiscard]] bool remembered_set_contains(ObjectId id) const;
     [[nodiscard]] bool is_young_slot(std::size_t slot) const;
     [[nodiscard]] bool is_old_slot(std::size_t slot) const;
