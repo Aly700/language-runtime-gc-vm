@@ -20,6 +20,8 @@ struct VMMetrics {
 
 class VM : public gc::RootProvider {
 public:
+    static constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
+
     VM();
     VM(const VM&) = delete;
     VM& operator=(const VM&) = delete;
@@ -34,6 +36,7 @@ public:
     void set_gc_stress(gc::StressConfig config);
     [[nodiscard]] gc::StressConfig gc_stress_config() const { return gc_stress_; }
     void trace_roots(gc::RootVisitor& visitor) override;
+    [[nodiscard]] const std::vector<std::uint8_t>& output() const { return output_; }
 
     [[nodiscard]] const gc::Heap& heap() const { return heap_; }
     [[nodiscard]] gc::Heap& heap() { return heap_; }
@@ -70,6 +73,8 @@ private:
     std::uint64_t raw_module_executions_{0};
     std::uint64_t raw_function_executions_{0};
     std::size_t max_call_depth_{1024};
+    // Deliberately not a GC root: output owns copied bytes, never heap references.
+    std::vector<std::uint8_t> output_;
 };
 
 } // namespace lang

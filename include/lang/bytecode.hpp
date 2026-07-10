@@ -52,6 +52,10 @@ enum class OpCode {
     WeakGet,
     MapKeyAt,
     MapValueAt,
+    Print,
+    I64ToStr,
+    StrToI64,
+    BoolToStr,
 };
 
 struct Instruction {
@@ -312,6 +316,10 @@ enum class VerifierReason {
     WeakOperationOnNonWeak,   // WeakGet receiver is not a typed weak reference.
     WeakTargetMayBeNil,       // WeakGet result was used without IsNil refinement.
     BadMapPositionAccess,     // MapKeyAt/MapValueAt receiver or i64 index is invalid.
+    PrintRequiresStr,         // Print operand is not a string.
+    I64ToStrRequiresI64,      // I64ToStr operand is not an i64.
+    StrToI64RequiresStr,      // StrToI64 operand is not a string.
+    BoolToStrRequiresBool,    // BoolToStr operand is not a bool.
 };
 
 struct VerifierDiagnostic {

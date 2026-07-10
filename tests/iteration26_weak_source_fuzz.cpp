@@ -181,7 +181,8 @@ fuzz::Outcome execute_weak_once(const lang::VerifiedModule& module,
 
         return fuzz::Outcome{
             true,
-            fuzz::canonical_object_graph(vm.heap(), value.as_object()), {}};
+            fuzz::canonical_object_graph(vm.heap(), value.as_object()), {},
+            fuzz::output_for(vm)};
     } catch (const std::exception& error) {
         return fuzz::Outcome{false, {}, error.what()};
     }
@@ -191,8 +192,12 @@ void run_seed_schedule(std::uint64_t seed, const fuzz::Schedule& schedule) {
     const auto generated = generate_weak_source(seed);
     const auto compiled = require_compiles(generated);
     const auto outcome = execute_weak_once(*compiled.verified_module, schedule);
+    const auto baseline = execute_weak_once(
+        *compiled.verified_module,
+        fuzz::find_schedule(fuzz::schedules(), "no_stress"));
     const auto expected = expected_observable(generated, schedule);
-    if (!outcome.ok || outcome.observable != expected) {
+    if (!outcome.ok || !baseline.ok || outcome.observable != expected ||
+        outcome.output != baseline.output) {
         std::ostringstream out;
         out << "weak source fuzz mismatch seed=" << seed
             << " schedule=" << schedule.name << "\n"
@@ -200,7 +205,11 @@ void run_seed_schedule(std::uint64_t seed, const fuzz::Schedule& schedule) {
             << "source:\n" << generated.source
             << "expected:\n" << expected << "\n"
             << "observed:\n"
-            << (outcome.ok ? outcome.observable : outcome.error) << "\n";
+            << (outcome.ok ? outcome.observable : outcome.error) << "\n"
+            << "baseline output bytes:\n"
+            << fuzz::render_output_bytes(baseline.output) << "\n"
+            << "observed output bytes:\n"
+            << fuzz::render_output_bytes(outcome.output) << "\n";
         throw std::runtime_error(out.str());
     }
 }

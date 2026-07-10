@@ -100,6 +100,8 @@ struct Expr {
         MapHas,
         WeakConstruct,
         WeakGet,
+        ToStr,
+        ToI64,
     };
 
     Kind kind{Kind::IntLiteral};
@@ -167,6 +169,7 @@ struct Statement {
         If,
         While,
         ForIn,
+        Print,
     };
 
     Kind kind{Kind::Let};

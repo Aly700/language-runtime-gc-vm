@@ -1,6 +1,7 @@
 #include "lang/vm.hpp"
 
 #include <cassert>
+#include <charconv>
 #include <cstddef>
 #include <limits>
 #include <span>
@@ -9,6 +10,72 @@
 #include <utility>
 
 namespace lang {
+
+namespace {
+
+std::string canonical_i64(std::int64_t value) {
+    char buffer[32];
+    const auto [end, error] =
+        std::to_chars(buffer, buffer + sizeof(buffer), value);
+    if (error != std::errc{}) {
+        throw std::logic_error("canonical i64 formatting failed");
+    }
+    return std::string(buffer, end);
+}
+
+std::int64_t parse_canonical_i64(std::span<const std::uint8_t> bytes) {
+    if (bytes.empty()) {
+        throw std::runtime_error("invalid string for i64 conversion");
+    }
+
+    std::size_t index = 0;
+    const bool negative = bytes.front() == static_cast<std::uint8_t>('-');
+    if (negative) {
+        index = 1;
+        if (index == bytes.size()) {
+            throw std::runtime_error("invalid string for i64 conversion");
+        }
+    }
+    if (bytes[index] == static_cast<std::uint8_t>('0') &&
+        (negative || index + 1 != bytes.size())) {
+        throw std::runtime_error("invalid string for i64 conversion");
+    }
+
+    constexpr std::uint64_t kPositiveLimit =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+    constexpr std::uint64_t kNegativeLimit = kPositiveLimit + 1;
+    const auto limit = negative ? kNegativeLimit : kPositiveLimit;
+    std::uint64_t magnitude = 0;
+    for (; index < bytes.size(); ++index) {
+        const auto byte = bytes[index];
+        if (byte < static_cast<std::uint8_t>('0') ||
+            byte > static_cast<std::uint8_t>('9')) {
+            throw std::runtime_error("invalid string for i64 conversion");
+        }
+        const auto digit = static_cast<std::uint64_t>(byte - '0');
+        if (magnitude > (limit - digit) / 10) {
+            throw std::runtime_error("invalid string for i64 conversion");
+        }
+        magnitude = magnitude * 10 + digit;
+    }
+
+    if (!negative) {
+        return static_cast<std::int64_t>(magnitude);
+    }
+    if (magnitude == kNegativeLimit) {
+        return std::numeric_limits<std::int64_t>::min();
+    }
+    return -static_cast<std::int64_t>(magnitude);
+}
+
+std::runtime_error runtime_trap(std::size_t function_index, std::size_t pc,
+                                const char* diagnostic) {
+    return std::runtime_error("runtime trap at function " +
+                              std::to_string(function_index) + " pc " +
+                              std::to_string(pc) + ": " + diagnostic);
+}
+
+} // namespace
 
 VM::VM() {
     heap_.set_root_provider(this);
@@ -104,6 +171,7 @@ void VM::push(Frame& frame, Value value) {
 }
 
 Value VM::execute(const Function& function) {
+    output_.clear();
     ++raw_function_executions_;
     Module module;
     module.entry_function = 0;
@@ -153,6 +221,7 @@ void VM::push_frame(const Module& module, std::size_t function_index,
 }
 
 Value VM::execute(const Module& module) {
+    output_.clear();
     ++raw_module_executions_;
     return execute_unverified_module(module);
 }
@@ -171,6 +240,7 @@ Value VM::execute_unverified_module(const Module& module) {
 }
 
 Value VM::execute(const VerifiedModule& module) {
+    output_.clear();
     return execute_verified(module.module(), module.verification());
 }
 
@@ -259,6 +329,58 @@ Value VM::execute_verified(const Module& module,
             push(frame, Value::int64(static_cast<std::int64_t>(
                             heap_.string_index(receiver.as_object(),
                                                static_cast<std::size_t>(index)))));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::Print: {
+            assert(!frame.stack.empty() && frame.stack.back().is_object() &&
+                   "verifier invariant violated: Print operand must be string object");
+            const auto bytes = heap_.string_bytes(frame.stack.back().as_object());
+            if (output_.size() >= kMaxOutputBytes ||
+                bytes.size() > kMaxOutputBytes - output_.size() - 1) {
+                throw runtime_trap(frame.function_index, frame.pc,
+                                   "output buffer overflow");
+            }
+            output_.insert(output_.end(), bytes.begin(), bytes.end());
+            output_.push_back(static_cast<std::uint8_t>('\n'));
+            (void)pop(frame);
+            ++frame.pc;
+            break;
+        }
+        case OpCode::I64ToStr: {
+            const auto value = pop(frame);
+            assert(value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: I64ToStr operand must be i64");
+            const auto text = canonical_i64(value.as_i64());
+            const auto bytes = std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+            push(frame, Value::object(heap_.allocate_string(bytes)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::StrToI64: {
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: StrToI64 operand must be string object");
+            try {
+                push(frame, Value::int64(
+                                parse_canonical_i64(heap_.string_bytes(
+                                    receiver.as_object()))));
+            } catch (const std::runtime_error&) {
+                throw runtime_trap(frame.function_index, frame.pc,
+                                   "invalid string for i64 conversion");
+            }
+            ++frame.pc;
+            break;
+        }
+        case OpCode::BoolToStr: {
+            const auto value = pop(frame);
+            assert(value.tag() == Value::Tag::Bool &&
+                   "verifier invariant violated: BoolToStr operand must be bool");
+            const std::string_view text = value.as_bool() ? "true" : "false";
+            const auto bytes = std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+            push(frame, Value::object(heap_.allocate_string(bytes)));
             ++frame.pc;
             break;
         }

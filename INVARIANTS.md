@@ -35,6 +35,10 @@
   `map entry index out of bounds` diagnostic; lowered iteration deliberately reaches that
   boundary when the entry count grows after its entry snapshot.
 - VM observable behavior must not depend on host pointer addresses.
+- The VM output buffer is execution-local copied byte state, never a heap root. Its
+  contents are a pure function of the verified module and its inputs and must be
+  byte-identical across every GC stress schedule. Collection, forwarding, barriers, and
+  validation never read or rewrite output bytes.
 
 ## GC
 
@@ -136,6 +140,10 @@
   must be marked as precise object roots.
 - String indexing is read-only and returns an unsigned byte widened to `i64`. The frontend
   must reject indexed string assignment before bytecode generation.
+- `print(e)` accepts exactly `str` and appends its bytes plus one newline to the bounded VM
+  output log. `to_str` accepts exactly `i64` or `bool`; `to_i64` accepts exactly `str` and
+  traps on every non-canonical or out-of-range spelling. Frontend overload resolution and
+  verifier opcode types must agree.
 - `map<K, V>` accepts only `i64`, `bool`, or `str` for `K`; the type checker and compile
   boundary enforce exactly the same restriction as the verifier. `map<K, V>()`, indexed
   get/set, `.has(key)`, and `.len` preserve complete nested `K`/`V` facts through function
@@ -172,3 +180,5 @@
 
 - GC stress mode must be deterministic and able to collect before or after any allocation.
 - A test that passes with GC disabled is not sufficient for runtime correctness.
+- Differential fuzz executions compare two independent observables across schedules: the
+  canonical returned heap graph/value and the VM output byte log. Both must match exactly.

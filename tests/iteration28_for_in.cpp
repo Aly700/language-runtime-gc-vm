@@ -516,11 +516,14 @@ void run_loop_seed_schedule(std::uint64_t seed,
             "loop source fuzz trapped seed=" + std::to_string(seed) +
                 " schedule=" + schedule.name + " baseline=" +
                 baseline.error + " observed=" + observed.error);
-    require(baseline.observable == observed.observable,
+    require(fuzz::same_observables(baseline, observed),
             "loop source fuzz drift seed=" + std::to_string(seed) +
                 " schedule=" + schedule.name + "\nbaseline:\n" +
                 baseline.observable + "\nobserved:\n" +
-                observed.observable);
+                observed.observable + "\nbaseline output bytes:\n" +
+                fuzz::render_output_bytes(baseline.output) +
+                "\nobserved output bytes:\n" +
+                fuzz::render_output_bytes(observed.output));
 }
 
 std::vector<std::string> loop_mutants(std::uint64_t seed) {

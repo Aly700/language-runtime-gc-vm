@@ -158,6 +158,14 @@ const char* op_name(OpCode op) {
         return "MapKeyAt";
     case OpCode::MapValueAt:
         return "MapValueAt";
+    case OpCode::Print:
+        return "Print";
+    case OpCode::I64ToStr:
+        return "I64ToStr";
+    case OpCode::StrToI64:
+        return "StrToI64";
+    case OpCode::BoolToStr:
+        return "BoolToStr";
     }
     return "<invalid>";
 }
@@ -1670,6 +1678,53 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         return push_fallthrough_or_report(pc, function, function_index,
                                           std::move(state), successors,
                                           diagnostics);
+    case OpCode::Print:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::PrintRequiresStr,
+                                  "print operand")) {
+            return false;
+        }
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    case OpCode::I64ToStr:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::I64ToStrRequiresI64,
+                                  "i64-to-string operand")) {
+            return false;
+        }
+        state.stack.push_back(str_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    case OpCode::StrToI64:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::StrToI64RequiresStr,
+                                  "string-to-i64 operand")) {
+            return false;
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    case OpCode::BoolToStr:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Bool,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BoolToStrRequiresBool,
+                                  "bool-to-string operand")) {
+            return false;
+        }
+        state.stack.push_back(str_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
     case OpCode::Nil:
         state.stack.push_back(nil_object_value());
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
@@ -2598,6 +2653,14 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "WeakTargetMayBeNil";
     case VerifierReason::BadMapPositionAccess:
         return "BadMapPositionAccess";
+    case VerifierReason::PrintRequiresStr:
+        return "PrintRequiresStr";
+    case VerifierReason::I64ToStrRequiresI64:
+        return "I64ToStrRequiresI64";
+    case VerifierReason::StrToI64RequiresStr:
+        return "StrToI64RequiresStr";
+    case VerifierReason::BoolToStrRequiresBool:
+        return "BoolToStrRequiresBool";
     }
     return "<unknown>";
 }

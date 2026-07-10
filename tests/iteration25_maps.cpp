@@ -685,11 +685,14 @@ void run_maps_seed_schedule(std::uint64_t seed,
             "maps source fuzz trapped for seed " + std::to_string(seed) +
                 " schedule=" + schedule.name + " baseline=" + baseline.error +
                 " observed=" + observed.error);
-    require(baseline.observable == observed.observable,
+    require(fuzz::same_observables(baseline, observed),
             "maps source fuzz observable drift for seed " +
                 std::to_string(seed) + " schedule=" + schedule.name +
                 "\nbaseline:\n" + baseline.observable + "\nobserved:\n" +
-                observed.observable);
+                observed.observable + "\nbaseline output bytes:\n" +
+                fuzz::render_output_bytes(baseline.output) +
+                "\nobserved output bytes:\n" +
+                fuzz::render_output_bytes(observed.output));
 }
 
 std::vector<std::string> map_mutants(std::uint64_t seed) {
