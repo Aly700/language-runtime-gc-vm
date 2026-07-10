@@ -30,6 +30,9 @@ void VM::trace_roots(gc::RootVisitor& visitor) {
         for (auto& value : frame.locals) {
             visitor.visit(value);
         }
+        if (frame.closure.has_value()) {
+            visitor.visit(*frame.closure);
+        }
     }
 }
 
@@ -97,7 +100,8 @@ Value VM::execute(const Function& function) {
 }
 
 void VM::push_frame(const Module& module, std::size_t function_index,
-                    std::vector<Value> arguments) {
+                    std::vector<Value> arguments,
+                    std::optional<Value> closure) {
     if (frames_.size() >= max_call_depth_) {
         throw std::runtime_error("VM call depth limit exceeded");
     }
@@ -119,6 +123,19 @@ void VM::push_frame(const Module& module, std::size_t function_index,
     frame.locals.assign(function.local_count, Value::nil());
     for (std::size_t i = 0; i < arguments.size(); ++i) {
         frame.locals[i] = arguments[i];
+    }
+    if (closure.has_value()) {
+        assert(closure->is_object() &&
+               "verifier invariant violated: frame closure must be an object");
+        assert(heap_.TEST_ONLY_is_closure(closure->as_object()) &&
+               "verifier invariant violated: frame closure object kind mismatch");
+        assert(heap_.closure_function_index(closure->as_object()) == function_index &&
+               "verifier invariant violated: closure target differs from frame function");
+        assert(function.closure_layout.has_value() &&
+               *function.closure_layout ==
+                   heap_.closure_layout_index(closure->as_object()) &&
+               "verifier invariant violated: closure layout differs from frame body");
+        frame.closure = *closure;
     }
     frames_.push_back(std::move(frame));
 }
@@ -466,6 +483,56 @@ Value VM::execute_verified(const Module& module,
             assert_stack_matches_map(verification, frame);
             heap_.collect();
             assert_stack_matches_map(verification, frame);
+            ++frame.pc;
+            break;
+        }
+        case OpCode::AllocClosure: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.closure_layouts.size() &&
+                   "verifier invariant violated: AllocClosure layout must be in range");
+            const auto layout_index = static_cast<std::size_t>(ins.operand);
+            const auto& layout = module.closure_layouts[layout_index];
+            std::vector<Value> captures(layout.capture_types.size(), Value::nil());
+            for (std::size_t i = captures.size(); i > 0; --i) {
+                captures[i - 1] = pop(frame);
+            }
+            const auto closure = heap_.allocate_closure(
+                layout_index, layout.function_index, std::move(captures),
+                layout.capture_map);
+            push(frame, Value::object(closure));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::CallClosure: {
+            const auto closure = pop(frame);
+            assert(closure.is_object() &&
+                   "verifier invariant violated: CallClosure callee must be object");
+            assert(heap_.TEST_ONLY_is_closure(closure.as_object()) &&
+                   "verifier invariant violated: CallClosure object must be closure");
+            const auto callee_index =
+                heap_.closure_function_index(closure.as_object());
+            assert(callee_index < module.functions.size() &&
+                   "validated closure target must be in module function table");
+            const auto& signature = module.functions[callee_index].signature;
+            std::vector<Value> arguments(signature.parameters.size(), Value::nil());
+            for (std::size_t i = arguments.size(); i > 0; --i) {
+                arguments[i - 1] = pop(frame);
+            }
+            ++frame.pc;
+            push_frame(module, callee_index, std::move(arguments), closure);
+            break;
+        }
+        case OpCode::LoadCapture: {
+            assert(frame.closure.has_value() &&
+                   "verifier invariant violated: LoadCapture requires closure frame");
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       heap_.closure_capture_count(frame.closure->as_object()) &&
+                   "verifier invariant violated: LoadCapture index must be in range");
+            push(frame, heap_.closure_capture(
+                            frame.closure->as_object(),
+                            static_cast<std::size_t>(ins.operand)));
             ++frame.pc;
             break;
         }

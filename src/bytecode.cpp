@@ -1,5 +1,6 @@
 #include "lang/bytecode.hpp"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -24,6 +25,7 @@ enum class AbstractKind {
     Array,
     RefArray,
     Str,
+    Function,
     Nil,
     Poison,
 };
@@ -38,6 +40,7 @@ struct AbstractValue {
     bool includes_nil{false};
     std::shared_ptr<const PairFields> signature_fields;
     std::shared_ptr<const AbstractValue> signature_array_element;
+    std::shared_ptr<const SignatureValue> signature_function;
     std::optional<std::size_t> signature_named_type;
     std::optional<std::size_t> source_local;
     std::optional<std::size_t> nil_test_local;
@@ -121,6 +124,12 @@ const char* op_name(OpCode op) {
         return "StrConcat";
     case OpCode::StrIndex:
         return "StrIndex";
+    case OpCode::AllocClosure:
+        return "AllocClosure";
+    case OpCode::CallClosure:
+        return "CallClosure";
+    case OpCode::LoadCapture:
+        return "LoadCapture";
     }
     return "<invalid>";
 }
@@ -139,6 +148,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Nil";
     case ValueKind::Str:
         return "Str";
+    case ValueKind::Function:
+        return "Function";
     }
     return "<invalid>";
 }
@@ -157,6 +168,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "RefArray";
     case AbstractKind::Str:
         return "Str";
+    case AbstractKind::Function:
+        return "Function";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -193,6 +206,36 @@ AbstractValue bool_value() { return value_with_kind(AbstractKind::Bool); }
 AbstractValue array_value() { return value_with_kind(AbstractKind::Array); }
 AbstractValue ref_array_value() { return value_with_kind(AbstractKind::RefArray); }
 AbstractValue str_value() { return value_with_kind(AbstractKind::Str); }
+
+bool signature_values_equal(const SignatureValue& lhs,
+                            const SignatureValue& rhs);
+
+bool signature_value_ptr_equal(const std::shared_ptr<SignatureValue>& lhs,
+                               const std::shared_ptr<SignatureValue>& rhs) {
+    if (lhs == nullptr || rhs == nullptr) {
+        return lhs == rhs;
+    }
+    return signature_values_equal(*lhs, *rhs);
+}
+
+bool signature_values_equal(const SignatureValue& lhs,
+                            const SignatureValue& rhs) {
+    if (lhs.kind != rhs.kind || lhs.named_type != rhs.named_type ||
+        lhs.function_parameters.size() != rhs.function_parameters.size() ||
+        !signature_value_ptr_equal(lhs.left, rhs.left) ||
+        !signature_value_ptr_equal(lhs.right, rhs.right) ||
+        !signature_value_ptr_equal(lhs.element, rhs.element) ||
+        !signature_value_ptr_equal(lhs.function_return, rhs.function_return)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.function_parameters.size(); ++i) {
+        if (!signature_values_equal(lhs.function_parameters[i],
+                                    rhs.function_parameters[i])) {
+            return false;
+        }
+    }
+    return true;
+}
 
 AbstractValue ref_array_value(std::size_t site) {
     AbstractValue value;
@@ -259,6 +302,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Nil;
     case ValueKind::Str:
         return AbstractKind::Str;
+    case ValueKind::Function:
+        return AbstractKind::Function;
     }
     return AbstractKind::Poison;
 }
@@ -274,10 +319,18 @@ bool signature_array_uses_ref_payload(const SignatureValue& signature) {
     return signature.has_array_element() &&
            (signature.element->kind == ValueKind::Object ||
             signature.element->kind == ValueKind::Array ||
-            signature.element->kind == ValueKind::Str);
+            signature.element->kind == ValueKind::Str ||
+            signature.element->kind == ValueKind::Function);
 }
 
 AbstractValue value_from_signature(const SignatureValue& signature) {
+    if (signature.has_function_signature()) {
+        AbstractValue value;
+        value.kind = AbstractKind::Function;
+        value.signature_function =
+            std::make_shared<const SignatureValue>(signature);
+        return value;
+    }
     if (signature.is_named_type_reference()) {
         return named_signature_object_value(*signature.named_type);
     }
@@ -307,7 +360,8 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
 
 bool is_reference_kind(AbstractKind kind) {
     return kind == AbstractKind::Object || kind == AbstractKind::Array ||
-           kind == AbstractKind::RefArray || kind == AbstractKind::Str;
+           kind == AbstractKind::RefArray || kind == AbstractKind::Str ||
+           kind == AbstractKind::Function;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -325,6 +379,15 @@ SignatureValue return_signature(const FunctionSignature& signature) {
     return signature_value(signature.return_type);
 }
 
+SignatureValue function_type_from_signature(const FunctionSignature& signature) {
+    std::vector<SignatureValue> parameters;
+    parameters.reserve(signature.parameters.size());
+    for (std::size_t i = 0; i < signature.parameters.size(); ++i) {
+        parameters.push_back(parameter_signature(signature, i));
+    }
+    return function_signature(std::move(parameters), return_signature(signature));
+}
+
 bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kind,
                                   const Module& module) {
     if (signature.kind != kind) {
@@ -333,22 +396,47 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
     if (signature.is_named_type_reference()) {
         return signature.kind == ValueKind::Object &&
                *signature.named_type < module.named_types.size() &&
-               signature.left == nullptr && signature.right == nullptr;
+               signature.left == nullptr && signature.right == nullptr &&
+               signature.element == nullptr &&
+               signature.function_return == nullptr &&
+               signature.function_parameters.empty();
     }
     if (signature.has_pair_fields()) {
         return signature_shape_matches_kind(*signature.left, signature.left->kind,
                                             module) &&
                signature_shape_matches_kind(*signature.right, signature.right->kind,
-                                            module);
+                                            module) &&
+               signature.element == nullptr &&
+               signature.function_return == nullptr &&
+               signature.function_parameters.empty();
     }
     if (signature.has_array_element()) {
         return signature.kind == ValueKind::Array &&
                signature_shape_matches_kind(*signature.element,
-                                            signature.element->kind, module);
+                                            signature.element->kind, module) &&
+               signature.left == nullptr && signature.right == nullptr &&
+               signature.function_return == nullptr &&
+               signature.function_parameters.empty();
+    }
+    if (signature.has_function_signature()) {
+        if (!signature_shape_matches_kind(*signature.function_return,
+                                          signature.function_return->kind,
+                                          module)) {
+            return false;
+        }
+        for (const auto& parameter : signature.function_parameters) {
+            if (!signature_shape_matches_kind(parameter, parameter.kind, module)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (signature.kind == ValueKind::Function) {
+        return false;
     }
     return signature.left == nullptr && signature.right == nullptr &&
-           signature.element == nullptr &&
-           !signature.named_type.has_value();
+           signature.element == nullptr && signature.function_return == nullptr &&
+           signature.function_parameters.empty() && !signature.named_type.has_value();
 }
 
 bool named_types_are_well_formed(const Module& module) {
@@ -383,6 +471,68 @@ bool signature_is_well_formed(const FunctionSignature& signature,
     return true;
 }
 
+bool closure_layouts_are_well_formed(
+    const Module& module, std::vector<VerifierDiagnostic>& diagnostics) {
+    for (std::size_t i = 0; i < module.closure_layouts.size(); ++i) {
+        const auto& layout = module.closure_layouts[i];
+        if (layout.function_index >= module.functions.size() ||
+            !module.functions[layout.function_index].closure_layout.has_value() ||
+            *module.functions[layout.function_index].closure_layout != i ||
+            !layout.function_type.has_function_signature() ||
+            !signature_shape_matches_kind(layout.function_type,
+                                          ValueKind::Function, module) ||
+            !signature_is_well_formed(
+                module.functions[layout.function_index].signature, module) ||
+            !signature_values_equal(
+                layout.function_type,
+                function_type_from_signature(
+                    module.functions[layout.function_index].signature))) {
+            std::ostringstream message;
+            message << "closure layout " << i
+                    << " has an invalid function target or structural signature";
+            return reject(diagnostics, layout.function_index, std::nullopt,
+                          VerifierReason::BadClosureLayoutIndex,
+                          message.str());
+        }
+        if (layout.capture_types.size() != layout.capture_map.size()) {
+            std::ostringstream message;
+            message << "closure layout " << i << " capture type count "
+                    << layout.capture_types.size() << " differs from capture map count "
+                    << layout.capture_map.size();
+            return reject(diagnostics, layout.function_index, std::nullopt,
+                          VerifierReason::BadClosureCaptureArity,
+                          message.str());
+        }
+        for (std::size_t capture = 0; capture < layout.capture_types.size(); ++capture) {
+            const auto& type = layout.capture_types[capture];
+            if (!signature_shape_matches_kind(type, type.kind, module) ||
+                layout.capture_map[capture] != signature_value_is_reference(type)) {
+                std::ostringstream message;
+                message << "closure layout " << i << " capture " << capture
+                        << " disagrees with its derived reference bitmap";
+                return reject(diagnostics, layout.function_index, std::nullopt,
+                              VerifierReason::BadClosureCaptureType,
+                              message.str());
+            }
+        }
+    }
+    for (std::size_t function_index = 0;
+         function_index < module.functions.size(); ++function_index) {
+        const auto& function = module.functions[function_index];
+        if (!function.closure_layout.has_value()) {
+            continue;
+        }
+        if (*function.closure_layout >= module.closure_layouts.size() ||
+            module.closure_layouts[*function.closure_layout].function_index !=
+                function_index) {
+            return reject(diagnostics, function_index, std::nullopt,
+                          VerifierReason::BadClosureLayoutIndex,
+                          "function closure-body metadata does not name its own layout");
+        }
+    }
+    return true;
+}
+
 bool fields_equal(const std::shared_ptr<const PairFields>& lhs,
                   const std::shared_ptr<const PairFields>& rhs);
 bool abstract_value_ptr_equal(const std::shared_ptr<const AbstractValue>& lhs,
@@ -396,6 +546,12 @@ bool operator==(const AbstractValue& lhs, const AbstractValue& rhs) {
            fields_equal(lhs.signature_fields, rhs.signature_fields) &&
            abstract_value_ptr_equal(lhs.signature_array_element,
                                     rhs.signature_array_element) &&
+           ((lhs.signature_function == nullptr &&
+             rhs.signature_function == nullptr) ||
+            (lhs.signature_function != nullptr &&
+             rhs.signature_function != nullptr &&
+             signature_values_equal(*lhs.signature_function,
+                                    *rhs.signature_function))) &&
            lhs.signature_named_type == rhs.signature_named_type &&
            lhs.source_local == rhs.source_local &&
            lhs.nil_test_local == rhs.nil_test_local;
@@ -478,6 +634,13 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
         } else {
             joined.signature_array_element = rhs.signature_array_element;
         }
+    } else if (joined.kind == AbstractKind::Function) {
+        if (lhs.signature_function == nullptr ||
+            rhs.signature_function == nullptr ||
+            !signature_values_equal(*lhs.signature_function,
+                                    *rhs.signature_function)) {
+            return poison_value();
+        }
     }
     if (lhs.source_local == rhs.source_local) {
         joined.source_local = lhs.source_local;
@@ -505,6 +668,10 @@ AbstractValue join_ref_array_element_values(const AbstractValue& lhs,
                                             const AbstractValue& rhs) {
     const auto joined = join_values(lhs, rhs);
     if (!is_poison(joined)) {
+        return joined;
+    }
+    if (lhs.kind == AbstractKind::Function ||
+        rhs.kind == AbstractKind::Function) {
         return joined;
     }
     if (is_reference_kind(lhs.kind) && is_reference_kind(rhs.kind)) {
@@ -841,6 +1008,13 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
     if (is_poison(value) || is_poison(expected)) {
         return false;
     }
+    if (expected.kind == AbstractKind::Nil &&
+        value.kind == AbstractKind::Object && value.includes_nil &&
+        value.object_sites.empty() && !value.includes_opaque_object &&
+        value.signature_fields == nullptr &&
+        !value.signature_named_type.has_value()) {
+        return true;
+    }
     if (value.kind == AbstractKind::RefArray && expected.kind == AbstractKind::Object) {
         return !expected.includes_nil && !expected.signature_named_type.has_value() &&
                expected.signature_fields == nullptr;
@@ -869,6 +1043,12 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
         }
         return value.signature_array_element != nullptr ||
                !value.ref_array_sites.empty();
+    }
+    if (expected.kind == AbstractKind::Function) {
+        return value.signature_function != nullptr &&
+               expected.signature_function != nullptr &&
+               signature_values_equal(*value.signature_function,
+                                      *expected.signature_function);
     }
     if (expected.kind != AbstractKind::Object) {
         return true;
@@ -983,7 +1163,11 @@ bool store_ref_array_element(const Module& module, AbstractState& state,
         if (it == state.ref_array_elements_by_site.end()) {
             return false;
         }
-        (void)join_ref_array_element_into(it->second, value);
+        const auto joined = join_ref_array_element_values(it->second, value);
+        if (is_poison(joined)) {
+            return false;
+        }
+        it->second = joined;
     }
     return receiver.signature_array_element != nullptr ||
            !receiver.ref_array_sites.empty();
@@ -1418,6 +1602,118 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
     case OpCode::Collect:
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    case OpCode::AllocClosure: {
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                module.closure_layouts.size()) {
+            std::ostringstream message;
+            message << "layout " << ins.operand << " is outside closure layout count "
+                    << module.closure_layouts.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadClosureLayoutIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto& layout =
+            module.closure_layouts[static_cast<std::size_t>(ins.operand)];
+        for (std::size_t i = layout.capture_types.size(); i > 0; --i) {
+            AbstractValue capture;
+            const auto capture_index = i - 1;
+            std::ostringstream context;
+            context << "capture " << capture_index;
+            if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                                   VerifierReason::BadClosureCaptureArity,
+                                   context.str(), &capture)) {
+                return false;
+            }
+            if (!value_conforms_to_signature(module, state, capture,
+                                             layout.capture_types[capture_index])) {
+                std::ostringstream message;
+                message << "capture " << capture_index
+                        << " does not conform to closure layout type "
+                        << value_kind_name(
+                               layout.capture_types[capture_index].kind);
+                return reject(diagnostics, function_index, pc,
+                              VerifierReason::BadClosureCaptureType,
+                              instruction_message(function, pc, message.str()));
+            }
+        }
+        state.stack.push_back(value_from_signature(layout.function_type));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
+    case OpCode::CallClosure: {
+        AbstractValue callee;
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::BadClosureCallArity,
+                               "closure callee", &callee)) {
+            return false;
+        }
+        if (callee.kind != AbstractKind::Function ||
+            callee.signature_function == nullptr ||
+            !callee.signature_function->has_function_signature()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::CallClosureOnNonFunction,
+                          instruction_message(
+                              function, pc,
+                              "callee stack slot is not a structural function"));
+        }
+        const auto& signature = *callee.signature_function;
+        for (std::size_t i = signature.function_parameters.size(); i > 0; --i) {
+            AbstractValue argument;
+            const auto parameter_index = i - 1;
+            std::ostringstream context;
+            context << "closure argument " << parameter_index;
+            if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                                   VerifierReason::BadClosureCallArity,
+                                   context.str(), &argument)) {
+                return false;
+            }
+            if (!value_conforms_to_signature(
+                    module, state, argument,
+                    signature.function_parameters[parameter_index])) {
+                std::ostringstream message;
+                message << "closure argument " << parameter_index
+                        << " does not conform to parameter type "
+                        << value_kind_name(
+                               signature.function_parameters[parameter_index].kind);
+                return reject(diagnostics, function_index, pc,
+                              VerifierReason::BadClosureCallArgKind,
+                              instruction_message(function, pc, message.str()));
+            }
+        }
+        state.stack.push_back(value_from_signature(*signature.function_return));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
+    case OpCode::LoadCapture: {
+        if (!function.closure_layout.has_value()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::LoadCaptureOutsideClosureBody,
+                          instruction_message(
+                              function, pc,
+                              "current function has no closure-body layout"));
+        }
+        assert(*function.closure_layout < module.closure_layouts.size() &&
+               "module closure layouts are validated before function analysis");
+        const auto& layout = module.closure_layouts[*function.closure_layout];
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                layout.capture_types.size()) {
+            std::ostringstream message;
+            message << "capture " << ins.operand << " is outside capture count "
+                    << layout.capture_types.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::LoadCaptureOutOfRange,
+                          instruction_message(function, pc, message.str()));
+        }
+        state.stack.push_back(value_from_signature(
+            layout.capture_types[static_cast<std::size_t>(ins.operand)]));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
     case OpCode::Call: {
         if (ins.operand < 0 ||
             static_cast<std::uint64_t>(ins.operand) >= module.functions.size()) {
@@ -1428,8 +1724,23 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                           VerifierReason::BadCallTarget,
                           instruction_message(function, pc, message.str()));
         }
-        const auto& callee =
-            module.functions[static_cast<std::size_t>(ins.operand)].signature;
+        const auto callee_index = static_cast<std::size_t>(ins.operand);
+        const auto& callee_function = module.functions[callee_index];
+        if (callee_function.closure_layout.has_value()) {
+            assert(*callee_function.closure_layout <
+                       module.closure_layouts.size() &&
+                   "closure-body layout is validated before transfer");
+            if (!module.closure_layouts[*callee_function.closure_layout]
+                     .capture_types.empty()) {
+                return reject(
+                    diagnostics, function_index, pc,
+                    VerifierReason::BadCallTarget,
+                    instruction_message(
+                        function, pc,
+                        "direct Call cannot target a capture-bearing closure body"));
+            }
+        }
+        const auto& callee = callee_function.signature;
         for (std::size_t i = callee.parameters.size(); i > 0; --i) {
             AbstractValue argument;
             const auto parameter_index = i - 1;
@@ -1649,6 +1960,22 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "BadStringConstantIndex";
     case VerifierReason::BadStringOperation:
         return "BadStringOperation";
+    case VerifierReason::BadClosureLayoutIndex:
+        return "BadClosureLayoutIndex";
+    case VerifierReason::BadClosureCaptureArity:
+        return "BadClosureCaptureArity";
+    case VerifierReason::BadClosureCaptureType:
+        return "BadClosureCaptureType";
+    case VerifierReason::CallClosureOnNonFunction:
+        return "CallClosureOnNonFunction";
+    case VerifierReason::BadClosureCallArity:
+        return "BadClosureCallArity";
+    case VerifierReason::BadClosureCallArgKind:
+        return "BadClosureCallArgKind";
+    case VerifierReason::LoadCaptureOutOfRange:
+        return "LoadCaptureOutOfRange";
+    case VerifierReason::LoadCaptureOutsideClosureBody:
+        return "LoadCaptureOutsideClosureBody";
     }
     return "<unknown>";
 }
@@ -1702,6 +2029,17 @@ ModuleVerifierReport verify_with_diagnostics(const Module& module) {
         reject(report.diagnostics, 0, std::nullopt,
                VerifierReason::SignatureShapeMismatch,
                "module named type table contains a malformed recursive type");
+        return report;
+    }
+    if (!closure_layouts_are_well_formed(module, report.diagnostics)) {
+        return report;
+    }
+    const auto& entry = module.functions[module.entry_function];
+    if (entry.closure_layout.has_value() &&
+        !module.closure_layouts[*entry.closure_layout].capture_types.empty()) {
+        reject(report.diagnostics, module.entry_function, std::nullopt,
+               VerifierReason::BadCallTarget,
+               "module entry cannot be a capture-bearing closure body");
         return report;
     }
 

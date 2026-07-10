@@ -89,12 +89,14 @@ bool is_scalar_array_element_type(const TypeSpec& type) {
 
 bool is_reference_array_element_type(const TypeSpec& type) {
     return type.kind == TypeSpec::Kind::Pair || type.kind == TypeSpec::Kind::Named ||
-           type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str;
+           type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str ||
+           type.kind == TypeSpec::Kind::Function;
 }
 
 bool is_known_nonnil_reference(const TypedValue& value) {
     if (value.type.kind == TypeSpec::Kind::Array ||
-        value.type.kind == TypeSpec::Kind::Str) {
+        value.type.kind == TypeSpec::Kind::Str ||
+        value.type.kind == TypeSpec::Kind::Function) {
         return true;
     }
     return is_pair(value.type) && value.type.kind != TypeSpec::Kind::Nil &&
@@ -199,6 +201,7 @@ struct FunctionSymbol {
     std::string name;
     SourcePosition position;
     std::size_t index{0};
+    std::size_t closure_layout_index{0};
     std::vector<TypeSpec> parameters;
     TypeSpec return_type{invalid_type()};
 };
@@ -219,6 +222,12 @@ public:
     TypeSpec check(Program& program) {
         collect_type_symbols(program);
         collect_function_symbols(program);
+        for (std::size_t i = 0; i < program.lambdas.size(); ++i) {
+            program.lambdas[i]->function_index =
+                1 + program.functions.size() + i;
+            program.lambdas[i]->closure_layout_index =
+                program.functions.size() + i;
+        }
         for (auto& function : program.functions) {
             check_function(function);
         }
@@ -245,6 +254,12 @@ public:
     }
 
 private:
+    struct CaptureContext {
+        FlowState* outer_state{nullptr};
+        LambdaExpr* lambda{nullptr};
+        CaptureContext* parent{nullptr};
+    };
+
     FlowState initial_state() const {
         FlowState state;
         state.fields_by_site.resize(pair_site_count_);
@@ -297,6 +312,7 @@ private:
         for (std::size_t i = 0; i < program.functions.size(); ++i) {
             auto& declaration = program.functions[i];
             declaration.function_index = i + 1;
+            declaration.closure_layout_index = i;
             if (find_function(declaration.name) != nullptr) {
                 diagnose(declaration.position,
                          "function '" + declaration.name + "' is already defined");
@@ -307,6 +323,7 @@ private:
             symbol.name = declaration.name;
             symbol.position = declaration.position;
             symbol.index = declaration.function_index;
+            symbol.closure_layout_index = declaration.closure_layout_index;
             symbol.return_type = declaration.return_type;
             for (const auto& parameter : declaration.parameters) {
                 symbol.parameters.push_back(parameter.type);
@@ -392,6 +409,14 @@ private:
             resolve_type(*type.element);
             return;
         }
+        if (type.kind == TypeSpec::Kind::Function &&
+            type.function_return != nullptr) {
+            for (auto& parameter : type.function_parameters) {
+                resolve_type(parameter);
+            }
+            resolve_type(*type.function_return);
+            return;
+        }
         if (type.kind != TypeSpec::Kind::Named) {
             return;
         }
@@ -435,6 +460,54 @@ private:
             }
         }
         return nullptr;
+    }
+
+    std::optional<std::size_t> find_capture_index(
+        const LambdaExpr& lambda, const std::string& name) const {
+        for (std::size_t i = 0; i < lambda.captures.size(); ++i) {
+            if (lambda.captures[i].name == name) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<TypedValue> try_ensure_capture(
+        CaptureContext& context, const std::string& name,
+        SourcePosition use_position) {
+        if (const auto existing = find_capture_index(*context.lambda, name);
+            existing.has_value()) {
+            return value_from_type(context.lambda->captures[*existing].type);
+        }
+
+        if (auto* local = find_local(*context.outer_state, name); local != nullptr) {
+            if (!local->initialized) {
+                diagnose(use_position,
+                         "captured local '" + name + "' may be uninitialized");
+                return invalid_value();
+            }
+            context.lambda->captures.push_back(
+                CaptureSpec{name, local->declaration_position,
+                            local->declared_type, local->index, false});
+            return value_from_type(local->declared_type);
+        }
+
+        if (context.parent == nullptr) {
+            return std::nullopt;
+        }
+        auto parent_value = try_ensure_capture(*context.parent, name, use_position);
+        if (!parent_value.has_value()) {
+            return std::nullopt;
+        }
+        const auto parent_index =
+            find_capture_index(*context.parent->lambda, name);
+        assert(parent_index.has_value() &&
+               "parent capture resolution must install capture metadata");
+        context.lambda->captures.push_back(
+            CaptureSpec{name, use_position,
+                        context.parent->lambda->captures[*parent_index].type,
+                        static_cast<std::uint32_t>(*parent_index), true});
+        return value_from_type(context.lambda->captures.back().type);
     }
 
     void diagnose(SourcePosition position, std::string message) {
@@ -558,7 +631,8 @@ private:
         }
         if (target.kind == TypeSpec::Kind::Int64 ||
             target.kind == TypeSpec::Kind::Bool ||
-            target.kind == TypeSpec::Kind::Str) {
+            target.kind == TypeSpec::Kind::Str ||
+            target.kind == TypeSpec::Kind::Function) {
             return !value.includes_nil && value.type == target;
         }
         if (value.includes_nil || value.type.kind == TypeSpec::Kind::Nil) {
@@ -634,6 +708,17 @@ private:
         if (statement.target.steps.empty()) {
             auto* local = find_local(state, statement.target.base_name);
             if (local == nullptr) {
+                if (capture_context_ != nullptr) {
+                    const auto captured = try_ensure_capture(
+                        *capture_context_, statement.target.base_name,
+                        statement.target.base_position);
+                    if (captured.has_value()) {
+                        diagnose(statement.target.base_position,
+                                 "cannot assign to immutable capture '" +
+                                     statement.target.base_name + "'");
+                        return;
+                    }
+                }
                 diagnose(statement.target.base_position,
                          "undefined variable '" + statement.target.base_name + "'");
                 return;
@@ -808,6 +893,8 @@ private:
             return check_field_access(expression, state);
         case Expr::Kind::Call:
             return check_call(expression, state);
+        case Expr::Kind::Lambda:
+            return check_lambda(expression, state);
         case Expr::Kind::IsNil:
             return check_is_nil(expression, state);
         }
@@ -822,17 +909,104 @@ private:
 
     TypedValue check_variable(Expr& expression, FlowState& state) {
         auto* local = find_local(state, expression.name);
-        if (local == nullptr) {
-            diagnose(expression.position, "undefined variable '" + expression.name + "'");
+        if (local != nullptr) {
+            expression.local_index = local->index;
+            if (!local->initialized) {
+                diagnose(expression.position,
+                         "local '" + expression.name + "' may be uninitialized");
+                return annotate(expression, invalid_value());
+            }
+            return annotate(expression, local->value);
+        }
+
+        if (capture_context_ != nullptr) {
+            auto captured = try_ensure_capture(*capture_context_, expression.name,
+                                               expression.position);
+            if (captured.has_value()) {
+                const auto capture =
+                    find_capture_index(*capture_context_->lambda,
+                                       expression.name);
+                assert(capture.has_value());
+                expression.is_capture = true;
+                expression.capture_index = *capture;
+                return annotate(expression, *captured);
+            }
+        }
+
+        if (const auto* function = find_function(expression.name);
+            function != nullptr) {
+            expression.is_function_reference = true;
+            expression.callee_index = function->index;
+            expression.closure_layout_index = function->closure_layout_index;
+            return annotate(
+                expression,
+                value_from_type(function_type(function->parameters,
+                                              function->return_type)));
+        }
+
+        diagnose(expression.position, "undefined variable '" + expression.name + "'");
+        return annotate(expression, invalid_value());
+    }
+
+    TypedValue check_lambda(Expr& expression, FlowState& outer_state) {
+        if (expression.lambda == nullptr) {
+            diagnose(expression.position, "lambda metadata is missing");
             return annotate(expression, invalid_value());
         }
-        expression.local_index = local->index;
-        if (!local->initialized) {
-            diagnose(expression.position,
-                     "local '" + expression.name + "' may be uninitialized");
-            return annotate(expression, invalid_value());
+        auto& lambda = *expression.lambda;
+        for (auto& parameter : lambda.parameters) {
+            resolve_type(parameter.type);
         }
-        return annotate(expression, local->value);
+        resolve_type(lambda.return_type);
+        for (auto& statement : lambda.statements) {
+            resolve_statement_types(statement);
+        }
+
+        FlowState state = initial_state();
+        for (auto& parameter : lambda.parameters) {
+            if (find_local(state, parameter.name) != nullptr) {
+                diagnose(parameter.position,
+                         "parameter '" + parameter.name + "' is already defined");
+                continue;
+            }
+            const auto index = static_cast<std::uint32_t>(state.locals.size());
+            parameter.local_index = index;
+            state.locals.push_back(LocalState{parameter.name,
+                                              parameter.type,
+                                              index,
+                                              true,
+                                              value_from_type(parameter.type),
+                                              parameter.position});
+        }
+
+        CaptureContext context{&outer_state, &lambda, capture_context_};
+        auto* previous_context = capture_context_;
+        capture_context_ = &context;
+        for (auto& statement : lambda.statements) {
+            check_statement(statement, state, true);
+        }
+        const auto result = check_expr(*lambda.result, state);
+        capture_context_ = previous_context;
+
+        if (!is_invalid(result.type) &&
+            !value_conforms_to_type(result, lambda.return_type, state)) {
+            diagnose(lambda.result->position,
+                     "lambda returns " + type_name(result.type) +
+                         " but is declared " + type_name(lambda.return_type));
+        }
+        lambda.local_count = static_cast<std::uint32_t>(state.locals.size());
+        return annotate(
+            expression,
+            value_from_type(function_type(
+                [&] {
+                    std::vector<TypeSpec> parameters;
+                    parameters.reserve(lambda.parameters.size());
+                    for (const auto& parameter : lambda.parameters) {
+                        parameters.push_back(parameter.type);
+                    }
+                    return parameters;
+                }(),
+                lambda.return_type)));
     }
 
     TypedValue check_pair_literal(Expr& expression, FlowState& state) {
@@ -1067,18 +1241,41 @@ private:
             arguments.push_back(check_expr(*argument, state));
         }
 
-        const auto* function = find_function(expression.name);
-        if (function == nullptr) {
-            diagnose(expression.position,
-                     "cannot call non-function name '" + expression.name + "'");
+        assert(expression.receiver != nullptr && "call expression must retain callee");
+        const auto callee = check_expr(*expression.receiver, state);
+        if (is_invalid(callee.type)) {
+            return annotate(expression, invalid_value());
+        }
+        if (callee.type.kind != TypeSpec::Kind::Function ||
+            callee.type.function_return == nullptr) {
+            if (expression.receiver->kind == Expr::Kind::Variable) {
+                diagnose(expression.position,
+                         "cannot call non-function name '" +
+                             expression.receiver->name + "'");
+            } else {
+                diagnose(expression.position,
+                         "cannot call non-function of type " +
+                             type_name(callee.type));
+            }
             return annotate(expression, invalid_value());
         }
 
-        expression.callee_index = function->index;
-        if (arguments.size() != function->parameters.size()) {
+        const FunctionSymbol* direct_function = nullptr;
+        if (expression.receiver->kind == Expr::Kind::Variable &&
+            expression.receiver->is_function_reference) {
+            direct_function = find_function(expression.receiver->name);
+            assert(direct_function != nullptr);
+            expression.direct_call = true;
+            expression.callee_index = direct_function->index;
+        }
+
+        const auto& parameters = callee.type.function_parameters;
+        if (arguments.size() != parameters.size()) {
+            const auto label = direct_function == nullptr
+                                   ? "function value"
+                                   : "function '" + direct_function->name + "'";
             diagnose(expression.position,
-                     "function '" + expression.name + "' expects " +
-                         std::to_string(function->parameters.size()) +
+                     label + " expects " + std::to_string(parameters.size()) +
                          " argument(s) but got " + std::to_string(arguments.size()));
             return annotate(expression, invalid_value());
         }
@@ -1089,11 +1286,13 @@ private:
                 valid = false;
                 continue;
             }
-            if (!value_conforms_to_type(arguments[i], function->parameters[i], state)) {
+            if (!value_conforms_to_type(arguments[i], parameters[i], state)) {
+                const auto label = direct_function == nullptr
+                                       ? "function value"
+                                       : "function '" + direct_function->name + "'";
                 diagnose(expression.arguments[i]->position,
-                         "argument " + std::to_string(i + 1) + " of function '" +
-                             expression.name + "' expects " +
-                             type_name(function->parameters[i]) + " but got " +
+                         "argument " + std::to_string(i + 1) + " of " + label +
+                             " expects " + type_name(parameters[i]) + " but got " +
                              type_name(arguments[i].type));
                 valid = false;
             }
@@ -1101,13 +1300,24 @@ private:
         if (!valid) {
             return annotate(expression, invalid_value());
         }
-        return annotate(expression, value_from_type(function->return_type));
+        return annotate(expression,
+                        value_from_type(*callee.type.function_return));
     }
 
     TypedValue check_lvalue_prefix(LValue& lvalue, FlowState& state,
                                    std::size_t step_count) {
         auto* local = find_local(state, lvalue.base_name);
         if (local == nullptr) {
+            if (capture_context_ != nullptr) {
+                const auto captured = try_ensure_capture(
+                    *capture_context_, lvalue.base_name, lvalue.base_position);
+                if (captured.has_value()) {
+                    diagnose(lvalue.base_position,
+                             "cannot assign through immutable capture '" +
+                                 lvalue.base_name + "'");
+                    return invalid_value();
+                }
+            }
             diagnose(lvalue.base_position, "undefined variable '" + lvalue.base_name + "'");
             return invalid_value();
         }
@@ -1182,6 +1392,7 @@ private:
     FlowState state_;
     std::vector<TypeSymbol> types_;
     std::vector<FunctionSymbol> functions_;
+    CaptureContext* capture_context_{nullptr};
     std::vector<Diagnostic> diagnostics_;
 };
 

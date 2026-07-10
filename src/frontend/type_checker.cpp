@@ -22,6 +22,8 @@ const char* type_name(Type type) {
         return "array";
     case Type::Str:
         return "str";
+    case Type::Function:
+        return "function";
     case Type::Invalid:
         return "invalid";
     }

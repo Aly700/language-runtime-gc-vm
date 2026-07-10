@@ -18,6 +18,7 @@ struct TypeSpec {
         Str,
         Pair,
         Array,
+        Function,
         Named,
         Nil,
         Invalid,
@@ -27,12 +28,18 @@ struct TypeSpec {
     std::shared_ptr<TypeSpec> left;
     std::shared_ptr<TypeSpec> right;
     std::shared_ptr<TypeSpec> element;
+    std::vector<TypeSpec> function_parameters;
+    std::shared_ptr<TypeSpec> function_return;
     std::string name;
     SourcePosition position;
     std::optional<std::size_t> named_type_index;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == Kind::Pair && left != nullptr && right != nullptr;
+    }
+
+    [[nodiscard]] bool has_function_signature() const {
+        return kind == Kind::Function && function_return != nullptr;
     }
 };
 
@@ -45,6 +52,7 @@ TypeSpec nil_type();
 TypeSpec invalid_type();
 TypeSpec pair_type(TypeSpec left, TypeSpec right);
 TypeSpec array_type(TypeSpec element);
+TypeSpec function_type(std::vector<TypeSpec> parameters, TypeSpec result);
 
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs);
 bool operator!=(const TypeSpec& lhs, const TypeSpec& rhs);
@@ -53,6 +61,8 @@ bool is_pair(const TypeSpec& type);
 Type public_type(const TypeSpec& type);
 std::string type_name(const TypeSpec& type);
 TypeSpec join_types(const TypeSpec& lhs, const TypeSpec& rhs);
+
+struct LambdaExpr;
 
 struct Expr {
     enum class Kind {
@@ -69,6 +79,7 @@ struct Expr {
         Binary,
         Field,
         Call,
+        Lambda,
         IsNil,
     };
 
@@ -90,6 +101,12 @@ struct Expr {
     TypeSpec inferred_type{invalid_type()};
     std::set<std::size_t> object_sites;
     std::uint32_t local_index{0};
+    std::size_t closure_layout_index{0};
+    std::size_t capture_index{0};
+    bool is_capture{false};
+    bool is_function_reference{false};
+    bool direct_call{false};
+    std::shared_ptr<LambdaExpr> lambda;
 };
 
 struct Parameter {
@@ -145,6 +162,26 @@ struct Statement {
     std::vector<Statement> body;
 };
 
+struct CaptureSpec {
+    std::string name;
+    SourcePosition position;
+    TypeSpec type{invalid_type()};
+    std::uint32_t source_index{0};
+    bool source_is_capture{false};
+};
+
+struct LambdaExpr {
+    SourcePosition position;
+    std::vector<Parameter> parameters;
+    TypeSpec return_type{invalid_type()};
+    std::vector<Statement> statements;
+    std::unique_ptr<Expr> result;
+    std::vector<CaptureSpec> captures;
+    std::size_t function_index{0};
+    std::size_t closure_layout_index{0};
+    std::uint32_t local_count{0};
+};
+
 struct FunctionDecl {
     std::string name;
     SourcePosition position;
@@ -153,6 +190,7 @@ struct FunctionDecl {
     std::vector<Statement> statements;
     std::unique_ptr<Expr> result;
     std::size_t function_index{0};
+    std::size_t closure_layout_index{0};
     std::uint32_t local_count{0};
 };
 
@@ -167,6 +205,7 @@ struct TypeDecl {
 struct Program {
     std::vector<TypeDecl> types;
     std::vector<FunctionDecl> functions;
+    std::vector<std::shared_ptr<LambdaExpr>> lambdas;
     std::vector<Statement> statements;
     std::unique_ptr<Expr> result;
     std::uint32_t entry_local_count{0};

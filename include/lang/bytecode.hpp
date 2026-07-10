@@ -40,6 +40,9 @@ enum class OpCode {
     StrEq,
     StrConcat,
     StrIndex,
+    AllocClosure,
+    CallClosure,
+    LoadCapture,
 };
 
 struct Instruction {
@@ -54,6 +57,7 @@ enum class ValueKind {
     Array,
     Nil,
     Str,
+    Function,
 };
 
 struct SignatureValue {
@@ -61,6 +65,8 @@ struct SignatureValue {
     std::shared_ptr<SignatureValue> left;
     std::shared_ptr<SignatureValue> right;
     std::shared_ptr<SignatureValue> element;
+    std::vector<SignatureValue> function_parameters;
+    std::shared_ptr<SignatureValue> function_return;
     std::optional<std::size_t> named_type;
 
     [[nodiscard]] bool has_pair_fields() const {
@@ -75,6 +81,12 @@ struct SignatureValue {
 
     [[nodiscard]] bool is_named_type_reference() const {
         return kind == ValueKind::Object && named_type.has_value();
+    }
+
+    [[nodiscard]] bool has_function_signature() const {
+        return kind == ValueKind::Function && function_return != nullptr &&
+               left == nullptr && right == nullptr && element == nullptr &&
+               !named_type.has_value();
     }
 };
 
@@ -106,6 +118,21 @@ inline SignatureValue array_signature(SignatureValue element) {
     return value;
 }
 
+inline SignatureValue function_signature(std::vector<SignatureValue> parameters,
+                                         SignatureValue result) {
+    SignatureValue value;
+    value.kind = ValueKind::Function;
+    value.function_parameters = std::move(parameters);
+    value.function_return =
+        std::make_shared<SignatureValue>(std::move(result));
+    return value;
+}
+
+inline bool signature_value_is_reference(const SignatureValue& value) {
+    return value.kind == ValueKind::Object || value.kind == ValueKind::Array ||
+           value.kind == ValueKind::Str || value.kind == ValueKind::Function;
+}
+
 struct NamedTypeSignature {
     std::string name;
     SignatureValue body;
@@ -116,6 +143,13 @@ struct FunctionSignature {
     ValueKind return_type{ValueKind::Int64};
     std::vector<SignatureValue> parameter_types;
     std::optional<SignatureValue> return_type_detail;
+};
+
+struct ClosureLayout {
+    std::size_t function_index{0};
+    SignatureValue function_type{signature_value(ValueKind::Nil)};
+    std::vector<SignatureValue> capture_types;
+    std::vector<bool> capture_map;
 };
 
 struct StackMap {
@@ -129,6 +163,7 @@ struct Function {
     std::vector<Instruction> code;
     std::vector<StackMap> stack_maps;
     std::uint32_t local_count{0};
+    std::optional<std::size_t> closure_layout;
 };
 
 struct Module {
@@ -136,6 +171,7 @@ struct Module {
     std::size_t entry_function{0};
     std::vector<NamedTypeSignature> named_types;
     std::vector<std::string> string_constants;
+    std::vector<ClosureLayout> closure_layouts;
 };
 
 struct VerificationResult {
@@ -198,6 +234,14 @@ enum class VerifierReason {
     InvalidOpcode,             // Instruction opcode is not a known OpCode value.
     BadStringConstantIndex,    // PushStr operand is outside the module string pool.
     BadStringOperation,        // String operation consumes the wrong stack shape or kind.
+    BadClosureLayoutIndex,     // AllocClosure operand/layout metadata is invalid.
+    BadClosureCaptureArity,    // AllocClosure stack lacks the layout's capture count.
+    BadClosureCaptureType,     // AllocClosure capture value violates its static type.
+    CallClosureOnNonFunction,  // CallClosure callee slot is not a structural fn value.
+    BadClosureCallArity,       // CallClosure stack lacks the structural fn arguments.
+    BadClosureCallArgKind,     // CallClosure argument violates the structural fn type.
+    LoadCaptureOutOfRange,     // LoadCapture index is outside the current layout.
+    LoadCaptureOutsideClosureBody, // LoadCapture occurs in a non-closure function.
 };
 
 struct VerifierDiagnostic {

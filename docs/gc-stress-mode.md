@@ -28,7 +28,9 @@ Implementation details:
 - Every stress-triggered major or minor collection runs the same root/field/reference and
   remembered-set validation as explicit collection. The after-barrier mode specifically
   protects the invariant that old-to-young stores cannot bypass `Heap::store_pair_field`
-  or `Heap::store_ref_array_element`. Immutable strings have no barrier trigger.
+  or `Heap::store_ref_array_element`. Immutable strings have no barrier trigger. Closure
+  captures are immutable, so closure promotion records any resulting old-to-young capture
+  edges inside the collector before the same exact remembered-set validation runs.
 
 ## Differential GC-timing fuzzing
 
@@ -190,6 +192,20 @@ indexing, and string/bool/i64 result variants. The string positive corpus runs s
 `1..48` across all 10 schedules for another 480 executions and has its own pinned seed-17
 snapshot.
 
+Iteration 24 adds a fifth isolated source grammar, selected in replay as `closures`. It
+emits deterministic higher-order programs with structural `fn(i64) -> i64` types, named
+functions used as zero-capture values, lambdas with deterministic interleaved scalar and
+reference captures, returned closures, post-allocation assignment that tests snapshot
+semantics, and closures stored in typed pairs and RefArrays. Every generated source must
+compile to a verifier-accepted module before execution. Seeds `1..48` run across the same
+10 schedules for another 480 executions, with an independent pinned seed-17 snapshot.
+
+The shared id-free object oracle renders closure nodes as their validated layout index plus
+their ordered canonical capture values. Captured object values enter the same deterministic
+node-number traversal as pair fields and RefArray elements, while scalar captures remain
+literal scalar tokens. Consequently relocation and allocation-specific `ObjectId` values
+cannot affect closure results, sharing, or cycles in the canonical observable.
+
 The negative corpus checks the frontend gate with deterministic mutations of generated
 legacy sources. Seeds `1..12` are each mutated three ways:
 
@@ -221,8 +237,17 @@ The strings grammar adds five mutation operators over seeds `1..12`:
 - index an `i64` with an i64 index.
 - attempt indexed assignment into an immutable string.
 
+The closures grammar adds five positioned mutation operators over seeds `1..12`:
+
+- call an array-loaded closure with the wrong arity.
+- call an array-loaded closure with a bool where its structural type requires `i64`.
+- change a lambda body to the wrong return type.
+- call a captured scalar as though it were a function.
+- use a captured pair as an `i64` operand.
+
 Each mutant must reject with at least one diagnostic and must not crash the frontend. The
-combined source-level CTest run now covers 1920 positive executions and 192 negative
+closure mutants additionally require a concrete source position. The combined source-level
+CTest run now covers 2400 positive executions and 252 negative
 frontend-rejection checks.
 
 Replay a positive source finding with:
@@ -249,6 +274,12 @@ Replay a positive string-source finding with:
 ./build/lang_iteration10_source_fuzz --grammar strings --seed <uint64> --schedule <schedule-name>
 ```
 
+Replay a positive closure-source finding with:
+
+```bash
+./build/lang_iteration10_source_fuzz --grammar closures --seed <uint64> --schedule <schedule-name>
+```
+
 Replay a negative mutant check with:
 
 ```bash
@@ -273,11 +304,18 @@ Replay a string negative mutant check with:
 ./build/lang_iteration10_source_fuzz --grammar strings --seed <uint64> --mutant <0..4>
 ```
 
-Dump either source corpus for byte-identity checks with:
+Replay a closure negative mutant check with:
+
+```bash
+./build/lang_iteration10_source_fuzz --grammar closures --seed <uint64> --mutant <0..4>
+```
+
+Dump any source corpus for byte-identity checks with:
 
 ```bash
 ./build/lang_iteration10_source_fuzz --dump-corpus legacy
 ./build/lang_iteration10_source_fuzz --dump-corpus recursive
 ./build/lang_iteration10_source_fuzz --dump-corpus array
 ./build/lang_iteration10_source_fuzz --dump-corpus strings
+./build/lang_iteration10_source_fuzz --dump-corpus closures
 ```

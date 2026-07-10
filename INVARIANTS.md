@@ -13,6 +13,13 @@
   execution resumes.
 - Call depth is bounded by an explicit VM limit and must trap deterministically before
   host stack exhaustion can matter.
+- `AllocClosure`, `CallClosure`, and `LoadCapture` may execute only after the verifier has
+  proved their module layout, structural function signature, capture arity/types, and
+  closure-body capture index. A closure call uses the same frame stack and deterministic
+  call-depth limit as a direct call.
+- Every active closure body frame keeps its closure object in a precise mutable root slot.
+  Moving collection must rewrite that frame-owned closure reference before `LoadCapture`
+  can resume.
 - VM observable behavior must not depend on host pointer addresses.
 
 ## GC
@@ -36,6 +43,12 @@
   marking, forwarding, remembered-set validation, and post-collection validation must not
   interpret it as a reference or rewrite it. Strings expose no payload-store API and have
   no write-barrier path after construction.
+- `Closure` payloads are immutable tagged capture slots plus a raw scalar function index.
+  The module verifier derives each layout's capture bitmap from its ordered static capture
+  types. The heap descriptor visits exactly bitmap-selected object slots; adjacent scalar
+  captures remain opaque even when their payload bits equal live, dead, stale, or forwarded
+  `ObjectId`s. Marking, forwarding, remembered-set maintenance, and validation may not
+  inspect closure captures outside the descriptor visitor.
 - Object IDs name object base slots only. Payload/reserved storage slots are never valid
   object headers, and variable-size compaction must advance by the descriptor storage
   width without allowing overlapping live objects.
@@ -46,8 +59,22 @@
   including `Pair` field stores and `RefArray` element stores. Raw `ScalarArray` stores
   are not reference-publishing mutations and must not enter the remembered set; immutable
   strings cannot publish references at all.
+- Closure captures have no post-construction store path and therefore no mutator barrier.
+  If collector promotion creates an old closure with a mapped young capture, the promotion
+  path itself must insert the closure into the remembered set before collection-boundary
+  validation. This GC-internal insertion must be exact, deterministic, and must not count
+  as a mutator write-barrier hit.
 
 ## Frontend
+
+- Structural `fn(T1, ..., Tn) -> R` types must survive the compile boundary in locals,
+  parameters, returns, pair fields, and reference-array elements. Lambda captures are
+  immutable creation-time snapshots in deterministic first-use order; later assignment to
+  the source local cannot alter an existing closure.
+- Every type-checked lambda and named-function value must lower through a verifier-accepted
+  closure layout whose ordered capture types and derived bitmap agree exactly. Function
+  arrays must use `RefArray`, and closure-valued stack slots must carry the existing precise
+  object-root bit.
 
 - `str` values compile to the distinct verifier `Str` kind and runtime `ObjectKind::Str`.
   Literals decode into the per-module constant pool; concat, equality, length, and byte
