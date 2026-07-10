@@ -26,7 +26,8 @@ Frontend implementation files are split by pipeline stage while keeping
 The source language is intentionally small:
 
 - Types are `i64`, `bool`, `str`, opaque `pair`, finite parametric `pair<T, U>`, array
-  types `[T]`, structural function types `fn(T1, ..., Tn) -> R`, and named pair
+  types `[T]`, deterministic maps `map<K, V>`, structural function types
+  `fn(T1, ..., Tn) -> R`, and named pair
   declarations such as `type List = pair<i64, List>;`.
 - Top-level `let name: type = expression;` declarations introduce initialized locals.
 - Assignment supports locals, `pair` fields (`left` and `right`), and array elements
@@ -34,7 +35,8 @@ The source language is intentionally small:
 - Expressions include i64/bool/string literals, variables, numeric/string `+`, `<`, string
   `==`/`!=`, `pair(left, right)`, field access, `[v, ...]` array literals,
   `array<T>(len, init)` sized array construction, array/string indexing, `.len`, and
-  parentheses.
+  parentheses. Maps add `map<K, V>()`, indexed get, indexed insert-or-update,
+  `.has(key)`, and `.len`.
 - `if condition { ... } else { ... }` and `while condition { ... }` are statement forms.
 - Function declarations use `fn name(a: i64, b: pair<i64, pair>) -> pair<i64, bool> { ... }`.
   Function bodies have the same shape as the top level: statements followed by a final
@@ -86,6 +88,15 @@ returns the unsigned byte widened to `i64`. String indexing traps deterministica
 out of bounds; indexed assignment is rejected because no string payload-store operation
 exists.
 
+Source maps are mutable insertion-order association containers. Keys are restricted to
+`i64`, `bool`, and `str`; values may use any source type, including nil-able named pairs,
+nested maps, and structural function values. Lookup is a deterministic linear scan.
+Integers and bools compare by tagged scalar value, while strings compare byte-for-byte, so
+moving a string key cannot invalidate lookup. `m[k] = v` updates the existing entry in
+place or appends a new entry, `m[k]` traps deterministically when absent, `m.has(k)` returns
+`bool`, and `m.len` returns `i64`. Map types remain complete across parameters, returns,
+pair fields, arrays, closures, and nested map values.
+
 ## Runtime scaffold
 
 - `lang::Module` stores a designated entry function, all callable `lang::Function`
@@ -93,7 +104,9 @@ exists.
   carries a `FunctionSignature` of
   coarse parameter/return kinds, optional detailed `SignatureValue` pair-field types,
   array element types, or named-type back-references, bytecode, local count, and optional
-  stack maps. The module also owns a deterministic closure-layout table. Each layout names
+  stack maps. The module also owns deterministic closure-layout and map-layout tables. Each
+  map layout records complete structural key/value types plus the exactly-derived
+  key-reference and value-reference flags. Each closure layout names
   its function body, repeats the body's structural function type, lists capture types in
   slot order, and carries the exactly-derived object-reference bitmap.
 - `lang::VerifiedModule` is the immutable execution proof for module bytecode. It is
@@ -146,12 +159,21 @@ exists.
   capture slots. Its header retains the validated module layout identity and heap-side
   capture-map metadata; its logical storage width is one function-index slot plus N capture
   slots. No closure capture setter exists.
+- `Map` is variable-width mutable storage with ordered tagged `(key, value)` entries and a
+  retained verified layout identity. Its logical width is one header slot plus two slots
+  per current entry. Empty construction therefore starts at width one, and every append
+  grows the logical width by exactly two.
 - All heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two tagged
   fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
   It also scans zero `Str` payload slots. For `Closure`, it consults the capture map and
   visits exactly the statically reference-typed capture slots. Raw scalar elements, scalar
   closure captures, and string bytes are never marked, forwarded, validated as references,
   or entered into remembered-set logic.
+- The same descriptor visitor handles maps. It validates entry-count/slot-tag agreement and
+  visits each inserted key before its value in insertion order, but only when the layout's
+  corresponding reference flag is set. String keys and reference values are therefore
+  traced and forwarded; scalar slots stay opaque even when their payload bits resemble an
+  `ObjectId`.
 - Pair field types, array element types, and named recursive types are verification-time
   metadata only. They do not change `Value`, object layout, stack-map format, root
   tracing, write barriers, forwarding, movement, or heap validation.
@@ -165,6 +187,14 @@ exists.
   Closures likewise expose only construction and const capture access. Their only possible
   old-to-young edge is collector-created during promotion, so that edge is recorded by the
   promotion path rather than a mutator barrier.
+- Map insertion and update are routed through `Heap::store_map_entry`, the only map payload
+  mutation funnel. It records an old owner before publishing an inserted young string key
+  or young reference value; updates keep the original key and barrier the replacement
+  value. When an append cannot claim two adjacent logical slots, the heap relocates that
+  map deterministically to a sufficiently large run and rewrites every precise root,
+  descriptor-declared heap reference, and remembered-set entry through a forwarding table
+  before publishing. This preserves exact current-entry-count width without exposing a
+  stale identity.
 - Deterministic GC stress is configured with explicit counters: before every allocation,
   after every allocation, after every barrier-triggering old-to-young store, every N
   major-collection bytecode instructions, and every N minor-collection bytecode
@@ -281,6 +311,12 @@ Compiler accommodations for verifier strictness:
   signatures, lowers named references to table indices, emits `Nil` for `nil`, and emits
   `IsNil` for nil checks. The type checker and verifier both refine only a checked local,
   so source that reads through a recursive field must bind/check that field explicitly.
+- Maps: every empty constructor appends a deterministic module map layout and emits
+  `AllocMap(layout)`. Indexed assignment/get, `.has`, and `.len` emit `MapSet`, `MapGet`,
+  `MapHas`, and `MapLen`. `SignatureValue` carries complete map key/value structure, so
+  nested map results and function-valued map entries recover their exact types after
+  lookup. The type checker, compiler boundary assertion, layout validator, and verifier
+  all restrict keys to `i64`, `bool`, or `str` and derive the same two reference flags.
 
 ## Design bias
 
@@ -331,7 +367,9 @@ Collection is mark, forward, rewrite, install, validate:
 2. Compaction scans the slot vector in ascending order and copies marked objects into the
    lowest base slots. This deterministic sliding pass builds a forwarding table indexed by
    old base slot and advances its free cursor by each object's descriptor storage width,
-   so non-uniform arrays slide without overlapping later live objects.
+   so non-uniform arrays and grown maps slide without overlapping later live objects. The
+   width used for a map is derived from its current entry count and asserted unchanged for
+   the duration of the collection.
 3. A moved survivor receives `new_slot | new_generation << 32`. If it moves into another
    slot, that destination slot's generation is advanced before the new ID is minted, so an
    old stale ID for the destination slot cannot alias the moved object. The old source slot
@@ -376,10 +414,13 @@ The heap has two logical object generations on top of the same slot vector:
   during a minor collection, but never forever: major collection traces only mutator roots,
   so the dead old graph is swept and remembered-set pruning drops the entry.
 - `Heap::store_pair_field` and `Heap::store_ref_array_element` are the only
-  reference-publishing mutation hooks exposed to bytecode. On every store of a young
-  object into an old pair field or old RefArray element they record the old owner before
-  publishing the value. The public heap API does not expose mutable pair fields or
-  RefArray elements directly, protecting the barrier-completeness invariant. Scalar arrays
+  fixed-width reference-publishing mutation hooks exposed to bytecode, and
+  `Heap::store_map_entry` is the only growing-container mutation hook. On every store of a
+  young object into an old pair field or old RefArray element they record the old owner
+  before publishing the value; map insertion does the same if either the stored string key
+  or value is young, and map update does the same for the replacement value. The public
+  heap API does not expose mutable pair fields, RefArray elements, or map entries directly,
+  protecting the barrier-completeness invariant. Scalar arrays
   do not contain reference slots, so `ArraySet` cannot publish an object reference.
   Strings are immutable and therefore have no mutation hook or remembered-set entry.
 - Closure captures are also immutable and have no mutation hook. The compaction promotion
@@ -424,15 +465,22 @@ remembered-set entries.
   post-collection validation; destroying or moving a handle removes or transfers exactly
   that slot registration.
 - Generational barrier safety: old-to-young stores are recorded in
-  `Heap::store_pair_field` and `Heap::store_ref_array_element`, minor collection traces
+  `Heap::store_pair_field`, `Heap::store_ref_array_element`, and
+  `Heap::store_map_entry`, minor collection traces
   young objects from mutator roots plus remembered old objects, remembered-set entries are
   rewritten/pruned after movement, and validation traps any valid old-to-young
-  descriptor-declared field, RefArray element, or mapped closure capture absent from the
-  remembered set. Promotion-created closure edges are inserted by the collector itself.
+  descriptor-declared field, RefArray element, map key/value slot, or mapped closure capture
+  absent from the remembered set. Promotion-created edges are inserted by the collector
+  itself.
 - Capture-map precision: verification requires every closure layout bitmap to equal the
   ordered capture types. Every heap phase uses the descriptor visitor, which sees mapped
   reference captures and never sees scalar captures, even when adjacent scalar bits equal
   current or stale object IDs.
+- Map-layout precision: verification requires every map layout's key/value signatures to be
+  well formed, its key to be `i64`, `bool`, or `str`, and both reference flags to equal the
+  derived static types. Every heap phase uses the descriptor visitor, which sees exactly
+  those flagged ordered slots. Map growth preserves `1 + 2N` width and rewrites the owner
+  identity before an append whenever adjacent storage is unavailable.
 - Signature safety: call sites are checked against the callee signature only; returns are
   checked against the current function signature. This keeps bytecode verification
   modular and rejects out-of-range calls, wrong arity, wrong argument kind, wrong
@@ -455,10 +503,11 @@ remembered-set entries.
 - Stack height is invariant at a merge; different heights reject immediately to protect
   stack-depth safety.
 - Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `RefArray`, `Str`, `Function`,
-  `Nil`, and `Poison`; recursive
+  `Map`, `Nil`, and `Poison`; recursive
   named values use `Object` with an explicit nullable bit rather than a new runtime kind.
 - Equal scalar/string kinds join to themselves; structural function values join only when
   their complete parameter/return types are equal; array kinds join only to array;
+  map values join only when their complete key/value signatures are equal;
   object kinds join to object with the union of possible allocation sites, an opaque-object
   bit, an optional nil bit, optional signature-derived pair fields, and optional
   named-type references.

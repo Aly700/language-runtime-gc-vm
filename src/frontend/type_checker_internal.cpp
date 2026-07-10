@@ -90,13 +90,20 @@ bool is_scalar_array_element_type(const TypeSpec& type) {
 bool is_reference_array_element_type(const TypeSpec& type) {
     return type.kind == TypeSpec::Kind::Pair || type.kind == TypeSpec::Kind::Named ||
            type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str ||
-           type.kind == TypeSpec::Kind::Function;
+           type.kind == TypeSpec::Kind::Function || type.kind == TypeSpec::Kind::Map;
+}
+
+bool is_valid_map_key_type(const TypeSpec& type) {
+    return type.kind == TypeSpec::Kind::Int64 ||
+           type.kind == TypeSpec::Kind::Bool ||
+           type.kind == TypeSpec::Kind::Str;
 }
 
 bool is_known_nonnil_reference(const TypedValue& value) {
     if (value.type.kind == TypeSpec::Kind::Array ||
         value.type.kind == TypeSpec::Kind::Str ||
-        value.type.kind == TypeSpec::Kind::Function) {
+        value.type.kind == TypeSpec::Kind::Function ||
+        value.type.kind == TypeSpec::Kind::Map) {
         return true;
     }
     return is_pair(value.type) && value.type.kind != TypeSpec::Kind::Nil &&
@@ -417,6 +424,16 @@ private:
             resolve_type(*type.function_return);
             return;
         }
+        if (type.kind == TypeSpec::Kind::Map && type.key != nullptr &&
+            type.value != nullptr) {
+            resolve_type(*type.key);
+            resolve_type(*type.value);
+            if (!is_invalid(*type.key) && !is_valid_map_key_type(*type.key)) {
+                diagnose(type.key->position,
+                         "map key type must be i64, bool, or str");
+            }
+            return;
+        }
         if (type.kind != TypeSpec::Kind::Named) {
             return;
         }
@@ -604,6 +621,11 @@ private:
             }
             return *value.type.element == *target.element;
         }
+        if (target.kind == TypeSpec::Kind::Map) {
+            return !value.includes_nil && value.type == target &&
+                   target.key != nullptr && target.value != nullptr &&
+                   is_valid_map_key_type(*target.key);
+        }
         if (target.kind == TypeSpec::Kind::Named) {
             if (value.type.kind == TypeSpec::Kind::Nil) {
                 return true;
@@ -747,6 +769,27 @@ private:
 
         if (final_step.kind == LValueStep::Kind::Index) {
             const auto index = check_expr(*final_step.index, state);
+            if (receiver.type.kind == TypeSpec::Kind::Map &&
+                receiver.type.key != nullptr && receiver.type.value != nullptr) {
+                if (!is_invalid(index.type) &&
+                    !value_conforms_to_type(index, *receiver.type.key, state)) {
+                    diagnose(final_step.index->position,
+                             "map key expects " + type_name(*receiver.type.key) +
+                                 " but got " + type_name(index.type));
+                    return;
+                }
+                statement.target.receiver_type = receiver.type;
+                statement.target.element_type = *receiver.type.value;
+                final_step.element_type = *receiver.type.value;
+                if (!value_conforms_to_type(assigned, *receiver.type.value,
+                                            state)) {
+                    diagnose(statement.equals_position,
+                             "cannot assign " + type_name(assigned.type) +
+                                 " to map value of type " +
+                                 type_name(*receiver.type.value));
+                }
+                return;
+            }
             if (!is_invalid(index.type) && index.type != int64_type()) {
                 diagnose(final_step.index->position,
                          receiver.type.kind == TypeSpec::Kind::Str
@@ -897,6 +940,10 @@ private:
             return check_lambda(expression, state);
         case Expr::Kind::IsNil:
             return check_is_nil(expression, state);
+        case Expr::Kind::MapEmpty:
+            return check_map_empty(expression);
+        case Expr::Kind::MapHas:
+            return check_map_has(expression, state);
         }
         return annotate(expression, invalid_value());
     }
@@ -1121,6 +1168,39 @@ private:
                                                 std::move(coerced_element)));
     }
 
+    TypedValue check_map_empty(Expr& expression) {
+        resolve_type(expression.map_key_type);
+        resolve_type(expression.map_value_type);
+        if (is_invalid(expression.map_key_type) ||
+            is_invalid(expression.map_value_type) ||
+            !is_valid_map_key_type(expression.map_key_type)) {
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression,
+                        value_from_type(map_type(expression.map_key_type,
+                                                 expression.map_value_type)));
+    }
+
+    TypedValue check_map_has(Expr& expression, FlowState& state) {
+        const auto receiver = check_expr(*expression.receiver, state);
+        const auto key = check_expr(*expression.left, state);
+        if (is_invalid(receiver.type) || is_invalid(key.type)) {
+            return annotate(expression, invalid_value());
+        }
+        if (receiver.type.kind != TypeSpec::Kind::Map ||
+            receiver.type.key == nullptr || receiver.type.value == nullptr) {
+            diagnose(expression.position, "has requires map");
+            return annotate(expression, invalid_value());
+        }
+        if (!value_conforms_to_type(key, *receiver.type.key, state)) {
+            diagnose(expression.left->position,
+                     "map key expects " + type_name(*receiver.type.key) +
+                         " but got " + type_name(key.type));
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, scalar_value(bool_type()));
+    }
+
     TypedValue load_array_element(const TypedValue& receiver, SourcePosition position) {
         if (is_invalid(receiver.type)) {
             return invalid_value();
@@ -1143,6 +1223,18 @@ private:
     TypedValue check_array_index(Expr& expression, FlowState& state) {
         const auto receiver = check_expr(*expression.receiver, state);
         const auto index = check_expr(*expression.left, state);
+        if (receiver.type.kind == TypeSpec::Kind::Map &&
+            receiver.type.key != nullptr && receiver.type.value != nullptr) {
+            if (!is_invalid(index.type) &&
+                !value_conforms_to_type(index, *receiver.type.key, state)) {
+                diagnose(expression.left->position,
+                         "map key expects " + type_name(*receiver.type.key) +
+                             " but got " + type_name(index.type));
+                return annotate(expression, invalid_value());
+            }
+            return annotate(expression,
+                            value_from_type(*receiver.type.value));
+        }
         if (!is_invalid(index.type) && index.type != int64_type()) {
             diagnose(expression.left->position,
                      receiver.type.kind == TypeSpec::Kind::Str
@@ -1155,7 +1247,8 @@ private:
         }
         if (!is_invalid(receiver.type) &&
             receiver.type.kind != TypeSpec::Kind::Array) {
-            diagnose(expression.position, "indexing requires array or str");
+            diagnose(expression.position,
+                     "indexing requires array or str or map");
             return annotate(expression, invalid_value());
         }
         return annotate(expression, load_array_element(receiver, expression.position));
@@ -1165,9 +1258,10 @@ private:
         const auto receiver = check_expr(*expression.receiver, state);
         if (!is_invalid(receiver.type) &&
             receiver.type.kind != TypeSpec::Kind::Str &&
+            receiver.type.kind != TypeSpec::Kind::Map &&
             (receiver.type.kind != TypeSpec::Kind::Array ||
              receiver.type.element == nullptr)) {
-            diagnose(expression.position, "len requires array or str");
+            diagnose(expression.position, "len requires array, str, or map");
             return annotate(expression, invalid_value());
         }
         return annotate(expression, scalar_value(int64_type()));
@@ -1336,6 +1430,20 @@ private:
                 current = load_field(current, step.name, step.position, state);
             } else {
                 const auto index = check_expr(*step.index, state);
+                if (current.type.kind == TypeSpec::Kind::Map &&
+                    current.type.key != nullptr && current.type.value != nullptr) {
+                    if (!is_invalid(index.type) &&
+                        !value_conforms_to_type(index, *current.type.key, state)) {
+                        diagnose(step.index->position,
+                                 "map key expects " +
+                                     type_name(*current.type.key) + " but got " +
+                                     type_name(index.type));
+                        return invalid_value();
+                    }
+                    current = value_from_type(*current.type.value);
+                    step.element_type = current.type;
+                    continue;
+                }
                 if (!is_invalid(index.type) && index.type != int64_type()) {
                     diagnose(step.index->position, "array index must be i64");
                     return invalid_value();

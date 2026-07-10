@@ -208,6 +208,23 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             }
             rendered << "])";
             break;
+        case lang::gc::ObjectKind::Map:
+            rendered << "map[" << heap.map_length(order[i]) << "](";
+            for (std::size_t entry = 0; entry < heap.map_length(order[i]);
+                 ++entry) {
+                if (entry != 0) {
+                    rendered << ", ";
+                }
+                rendered << "("
+                         << value_token(heap, heap.map_key_at(order[i], entry),
+                                        indexes, order)
+                         << " => "
+                         << value_token(heap, heap.map_value_at(order[i], entry),
+                                        indexes, order)
+                         << ")";
+            }
+            rendered << ")";
+            break;
         }
         objects.push_back(rendered.str());
     }

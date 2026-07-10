@@ -20,6 +20,10 @@
 - Every active closure body frame keeps its closure object in a precise mutable root slot.
   Moving collection must rewrite that frame-owned closure reference before `LoadCapture`
   can resume.
+- `AllocMap`, `MapSet`, `MapGet`, `MapHas`, and `MapLen` may execute only after the
+  verifier has proved the module layout index, restricted key type, complete structural
+  key/value types, and receiver/operand agreement. Missing-key `MapGet` traps with the
+  stable `map key not found` diagnostic.
 - VM observable behavior must not depend on host pointer addresses.
 
 ## GC
@@ -49,6 +53,13 @@
   captures remain opaque even when their payload bits equal live, dead, stale, or forwarded
   `ObjectId`s. Marking, forwarding, remembered-set maintenance, and validation may not
   inspect closure captures outside the descriptor visitor.
+- `Map` payloads are mutable ordered `(key, value)` tagged-slot pairs. Each heap map retains
+  its verified layout index plus `key-is-ref` and `value-is-ref` flags. The descriptor
+  visitor visits exactly the flagged slots in insertion order: string keys and reference
+  values are traced and forwarded, while scalar key/value slots remain opaque even when
+  their payload bits equal a live, dead, stale, or forwarded `ObjectId`. Descriptor shape
+  validation requires the entry count to match the payload and every slot tag to agree
+  with its static reference flag; reference values may carry `Object` or `Nil`.
 - Object IDs name object base slots only. Payload/reserved storage slots are never valid
   object headers, and variable-size compaction must advance by the descriptor storage
   width without allowing overlapping live objects.
@@ -59,6 +70,19 @@
   including `Pair` field stores and `RefArray` element stores. Raw `ScalarArray` stores
   are not reference-publishing mutations and must not enter the remembered set; immutable
   strings cannot publish references at all.
+- Every map insertion or update flows through `Heap::store_map_entry`. Before publishing
+  an inserted young string key or a young reference value into an old map, that single
+  funnel records the old owner in the remembered set. Updates barrier the replacement
+  value and preserve the original key slot and insertion position. No mutable map payload
+  is exposed outside this funnel, and remembered-set validation must reject every omitted
+  old-map-to-young edge.
+- A map's logical storage width is `1 + 2 * current_entry_count` and may grow only between
+  collections. Every allocator, storage-layout validator, growth relocation, compaction
+  cursor, and forwarding pass computes that same width from the current entry count. The
+  collector asserts that an object's width is unchanged within one collection. If an
+  append cannot claim the adjacent two logical slots, deterministic relocation rewrites
+  all roots, descriptor-declared references, and remembered-set entries before the entry
+  is published.
 - Closure captures have no post-construction store path and therefore no mutator barrier.
   If collector promotion creates an old closure with a mapped young capture, the promotion
   path itself must insert the closure into the remembered set before collection-boundary
@@ -82,6 +106,11 @@
   must be marked as precise object roots.
 - String indexing is read-only and returns an unsigned byte widened to `i64`. The frontend
   must reject indexed string assignment before bytecode generation.
+- `map<K, V>` accepts only `i64`, `bool`, or `str` for `K`; the type checker and compile
+  boundary enforce exactly the same restriction as the verifier. `map<K, V>()`, indexed
+  get/set, `.has(key)`, and `.len` preserve complete nested `K`/`V` facts through function
+  signatures, pair fields, arrays, captures, and map values. String keys compare by bytes,
+  never by `ObjectId`, so lookup remains valid after moving collection.
 
 - A source array type's element type determines its runtime representation at the compile
   boundary: `[i64]` and `[bool]` must emit only scalar `AllocArray`/`ArrayGet`/`ArraySet`

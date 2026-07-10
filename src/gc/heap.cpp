@@ -66,6 +66,8 @@ std::size_t storage_slot_count(const Object& object) {
                        kStorageSlotBytes;
     case ObjectKind::Closure:
         return 1 + static_cast<std::size_t>(object.length);
+    case ObjectKind::Map:
+        return 1 + 2 * static_cast<std::size_t>(object.length);
     }
     throw std::logic_error("unknown object kind");
 }
@@ -76,7 +78,8 @@ void validate_descriptor_shape(const Object& object) {
         if (object.length != 2 || !object.scalar_elements.empty() ||
             !object.ref_elements.empty() || !object.string_bytes.empty() ||
             !object.closure_captures.empty() ||
-            !object.closure_capture_map.empty()) {
+            !object.closure_capture_map.empty() ||
+            !object.map_entries.empty()) {
             throw std::logic_error("pair object descriptor does not match pair payload");
         }
         return;
@@ -84,7 +87,8 @@ void validate_descriptor_shape(const Object& object) {
         if (object.scalar_elements.size() != object.length ||
             !object.ref_elements.empty() || !object.string_bytes.empty() ||
             !object.closure_captures.empty() ||
-            !object.closure_capture_map.empty()) {
+            !object.closure_capture_map.empty() ||
+            !object.map_entries.empty()) {
             throw std::logic_error("scalar array descriptor length does not match payload");
         }
         return;
@@ -92,7 +96,8 @@ void validate_descriptor_shape(const Object& object) {
         if (!object.scalar_elements.empty() ||
             object.ref_elements.size() != object.length ||
             !object.string_bytes.empty() || !object.closure_captures.empty() ||
-            !object.closure_capture_map.empty()) {
+            !object.closure_capture_map.empty() ||
+            !object.map_entries.empty()) {
             throw std::logic_error("ref array descriptor length does not match payload");
         }
         return;
@@ -102,7 +107,8 @@ void validate_descriptor_shape(const Object& object) {
             object.left.tag() != Value::Tag::Nil ||
             object.right.tag() != Value::Tag::Nil ||
             !object.closure_captures.empty() ||
-            !object.closure_capture_map.empty()) {
+            !object.closure_capture_map.empty() ||
+            !object.map_entries.empty()) {
             throw std::logic_error("string descriptor length does not match opaque byte payload");
         }
         return;
@@ -112,7 +118,8 @@ void validate_descriptor_shape(const Object& object) {
             object.closure_captures.size() != object.length ||
             object.closure_capture_map.size() != object.length ||
             object.left.tag() != Value::Tag::Nil ||
-            object.right.tag() != Value::Tag::Nil) {
+            object.right.tag() != Value::Tag::Nil ||
+            !object.map_entries.empty()) {
             throw std::logic_error(
                 "closure descriptor length does not match capture-map payload");
         }
@@ -126,6 +133,43 @@ void validate_descriptor_shape(const Object& object) {
             } else if (tag == Value::Tag::Object) {
                 throw std::logic_error(
                     "closure capture map marks a reference payload as scalar");
+            }
+        }
+        return;
+    case ObjectKind::Map:
+        if (!object.scalar_elements.empty() || !object.ref_elements.empty() ||
+            !object.string_bytes.empty() || !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty() ||
+            object.map_entries.size() != object.length ||
+            object.left.tag() != Value::Tag::Nil ||
+            object.right.tag() != Value::Tag::Nil) {
+            throw std::logic_error(
+                "map descriptor entry count does not match ordered payload");
+        }
+        for (const auto& entry : object.map_entries) {
+            const auto key_tag = entry.key.tag();
+            if (object.map_key_is_ref) {
+                if (key_tag != Value::Tag::Object) {
+                    throw std::logic_error(
+                        "map descriptor marks a scalar key slot as a reference");
+                }
+            } else if (key_tag != Value::Tag::Int64 &&
+                       key_tag != Value::Tag::Bool) {
+                throw std::logic_error(
+                    "map descriptor marks a reference key slot as scalar");
+            }
+
+            const auto value_tag = entry.value.tag();
+            if (object.map_value_is_ref) {
+                if (value_tag != Value::Tag::Object &&
+                    value_tag != Value::Tag::Nil) {
+                    throw std::logic_error(
+                        "map descriptor marks a scalar value slot as a reference");
+                }
+            } else if (value_tag != Value::Tag::Int64 &&
+                       value_tag != Value::Tag::Bool) {
+                throw std::logic_error(
+                    "map descriptor marks a reference value slot as scalar");
             }
         }
         return;
@@ -163,6 +207,16 @@ void visit_reference_fields(Object& object, Fn&& fn) {
             }
         }
         return;
+    case ObjectKind::Map:
+        for (auto& entry : object.map_entries) {
+            if (object.map_key_is_ref) {
+                fn(entry.key);
+            }
+            if (object.map_value_is_ref) {
+                fn(entry.value);
+            }
+        }
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -188,6 +242,16 @@ void visit_reference_fields(const Object& object, Fn&& fn) {
         for (std::size_t i = 0; i < object.closure_captures.size(); ++i) {
             if (object.closure_capture_map[i]) {
                 fn(object.closure_captures[i]);
+            }
+        }
+        return;
+    case ObjectKind::Map:
+        for (const auto& entry : object.map_entries) {
+            if (object.map_key_is_ref) {
+                fn(entry.key);
+            }
+            if (object.map_value_is_ref) {
+                fn(entry.value);
             }
         }
         return;
@@ -220,6 +284,17 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
         for (std::size_t i = object.closure_captures.size(); i > 0; --i) {
             if (object.closure_capture_map[i - 1]) {
                 fn(object.closure_captures[i - 1]);
+            }
+        }
+        return;
+    case ObjectKind::Map:
+        for (std::size_t i = object.map_entries.size(); i > 0; --i) {
+            const auto& entry = object.map_entries[i - 1];
+            if (object.map_value_is_ref) {
+                fn(entry.value);
+            }
+            if (object.map_key_is_ref) {
+                fn(entry.key);
             }
         }
         return;
@@ -297,6 +372,23 @@ Object Object::closure(std::size_t layout_index, std::size_t function_index,
     object.closure_function_index = static_cast<std::uint32_t>(function_index);
     object.closure_captures = std::move(captures);
     object.closure_capture_map = std::move(capture_map);
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object Object::map(std::size_t layout_index, bool key_is_ref,
+                   bool value_is_ref) {
+    if (layout_index > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("map layout index exceeds object header limit");
+    }
+    Object object;
+    object.kind = ObjectKind::Map;
+    object.length = 0;
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.map_layout_index = static_cast<std::uint32_t>(layout_index);
+    object.map_key_is_ref = key_is_ref;
+    object.map_value_is_ref = value_is_ref;
     validate_descriptor_shape(object);
     return object;
 }
@@ -561,6 +653,23 @@ ObjectId Heap::allocate_closure(std::size_t layout_index,
     return id;
 }
 
+ObjectId Heap::allocate_map(std::size_t layout_index, bool key_is_ref,
+                            bool value_is_ref) {
+    if (stress_config_.collect_before_every_allocation) {
+        collect_with_extra_roots({});
+    }
+
+    auto id = allocate_object(Object::map(layout_index, key_is_ref,
+                                          value_is_ref));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+    return id;
+}
+
 Handle Heap::make_handle(Value value) {
     if (value.is_object()) {
         (void)checked_slot(value.as_object());
@@ -734,6 +843,24 @@ const Object& Heap::checked_closure(ObjectId id) const {
     return object;
 }
 
+const Object& Heap::checked_map(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Map) {
+        throw std::logic_error("object is not a map");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object& Heap::checked_map(ObjectId id) {
+    auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Map) {
+        throw std::logic_error("object is not a map");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
 void Heap::register_handle_root(Value* slot) {
     assert(slot != nullptr && "cannot register a null GC handle root slot");
     handle_roots_.push_back(slot);
@@ -864,6 +991,217 @@ Value Heap::closure_capture(ObjectId id, std::size_t index) const {
     return object.closure_captures[index];
 }
 
+std::size_t Heap::map_layout_index(ObjectId id) const {
+    return checked_map(id).map_layout_index;
+}
+
+std::size_t Heap::map_length(ObjectId id) const {
+    return checked_map(id).map_entries.size();
+}
+
+void Heap::validate_map_key(const Object& map, Value key) const {
+    if (map.map_key_is_ref) {
+        if (!key.is_object()) {
+            throw std::logic_error("map string key must be an object reference");
+        }
+        (void)checked_string(key.as_object());
+        return;
+    }
+    if (key.tag() != Value::Tag::Int64 && key.tag() != Value::Tag::Bool) {
+        throw std::logic_error("map scalar key must be i64 or bool");
+    }
+}
+
+void Heap::validate_map_value(const Object& map, Value value) const {
+    if (map.map_value_is_ref) {
+        if (value.tag() != Value::Tag::Object &&
+            value.tag() != Value::Tag::Nil) {
+            throw std::logic_error(
+                "map reference value must carry Object or Nil tag");
+        }
+        if (value.is_object()) {
+            (void)checked_slot(value.as_object());
+        }
+        return;
+    }
+    if (value.tag() != Value::Tag::Int64 && value.tag() != Value::Tag::Bool) {
+        throw std::logic_error("map scalar value must be i64 or bool");
+    }
+}
+
+std::optional<std::size_t> Heap::find_map_entry(ObjectId id, Value key) const {
+    const auto& map = checked_map(id);
+    validate_map_key(map, key);
+    for (std::size_t i = 0; i < map.map_entries.size(); ++i) {
+        const auto stored = map.map_entries[i].key;
+        bool equal = false;
+        if (map.map_key_is_ref) {
+            equal = string_equal(stored.as_object(), key.as_object());
+        } else if (stored.tag() == key.tag() &&
+                   stored.tag() == Value::Tag::Int64) {
+            equal = stored.as_i64() == key.as_i64();
+        } else if (stored.tag() == key.tag() &&
+                   stored.tag() == Value::Tag::Bool) {
+            equal = stored.as_bool() == key.as_bool();
+        }
+        if (equal) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+bool Heap::map_has(ObjectId id, Value key) const {
+    return find_map_entry(id, key).has_value();
+}
+
+Value Heap::map_get(ObjectId id, Value key) const {
+    const auto entry = find_map_entry(id, key);
+    if (!entry.has_value()) {
+        throw std::out_of_range("map key not found");
+    }
+    return checked_map(id).map_entries[*entry].value;
+}
+
+Value Heap::map_key_at(ObjectId id, std::size_t index) const {
+    const auto& map = checked_map(id);
+    if (index >= map.map_entries.size()) {
+        throw std::out_of_range("map entry index out of bounds");
+    }
+    return map.map_entries[index].key;
+}
+
+Value Heap::map_value_at(ObjectId id, std::size_t index) const {
+    const auto& map = checked_map(id);
+    if (index >= map.map_entries.size()) {
+        throw std::out_of_range("map entry index out of bounds");
+    }
+    return map.map_entries[index].value;
+}
+
+void Heap::map_set(ObjectId id, Value key, Value value) {
+    store_map_entry(id, key, value);
+}
+
+void Heap::ensure_map_growth_storage(Value& owner, Value& key, Value& value,
+                                     std::size_t required_width) {
+    const auto owner_slot = checked_slot(owner.as_object());
+    const auto current_width = storage_slot_count(checked_map(owner.as_object()));
+    assert(required_width == current_width + 2 &&
+           "map insert must grow by exactly one key/value entry");
+
+    bool adjacent_run_is_free = true;
+    const auto existing_limit = std::min(objects_.size(), owner_slot + required_width);
+    for (std::size_t slot = owner_slot + current_width;
+         slot < existing_limit; ++slot) {
+        if (!is_storage_slot_free(slot)) {
+            adjacent_run_is_free = false;
+            break;
+        }
+    }
+    if (!adjacent_run_is_free) {
+        relocate_map_for_growth(owner, key, value, required_width);
+        return;
+    }
+
+    if (owner_slot + required_width > objects_.size()) {
+        objects_.resize(owner_slot + required_width);
+        generations_.resize(owner_slot + required_width, 0);
+        if (objects_.size() > metrics_.heap_peak_slots) {
+            metrics_.heap_peak_slots = objects_.size();
+        }
+    }
+}
+
+void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
+                                   std::size_t required_width) {
+    const auto old_id = owner.as_object();
+    const auto old_slot = checked_slot(old_id);
+    const auto old_size = objects_.size();
+    if (old_size > std::numeric_limits<std::uint32_t>::max() ||
+        required_width >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) -
+                old_size + 1) {
+        throw std::length_error("map growth exceeds heap object slot limit");
+    }
+
+    ForwardingTable forwarding(old_size);
+    for (std::size_t slot = 0; slot < old_size; ++slot) {
+        if (!objects_[slot].has_value()) {
+            continue;
+        }
+        forwarding[slot] = make_object_id(
+            static_cast<std::uint32_t>(slot), generations_[slot]);
+    }
+
+    auto relocated_objects = objects_;
+    auto relocated_generations = generations_;
+    relocated_objects.resize(old_size + required_width);
+    relocated_generations.resize(old_size + required_width, 0);
+    const auto new_slot = old_size;
+    relocated_generations[new_slot] =
+        generation_for_new_base(relocated_generations[new_slot]);
+    const auto new_id = make_object_id(static_cast<std::uint32_t>(new_slot),
+                                       relocated_generations[new_slot]);
+    forwarding[old_slot] = new_id;
+
+    auto moved = *objects_[old_slot];
+    relocated_objects[old_slot].reset();
+    relocated_objects[new_slot] = std::move(moved);
+
+    const auto rewritten_remembered = rewrite_remembered_set(forwarding);
+    std::array<Value*, 3> growth_roots{&owner, &key, &value};
+    rewrite_references(forwarding, relocated_objects, nullptr, growth_roots);
+
+    objects_ = std::move(relocated_objects);
+    generations_ = std::move(relocated_generations);
+    remembered_set_ = rewritten_remembered;
+    ++metrics_.objects_moved;
+    if (objects_.size() > metrics_.heap_peak_slots) {
+        metrics_.heap_peak_slots = objects_.size();
+    }
+    validate_heap_storage_layout();
+    validate_remembered_set();
+}
+
+void Heap::store_map_entry(ObjectId id, Value key, Value value) {
+    Value owner = Value::object(id);
+    const auto existing = find_map_entry(id, key);
+    validate_map_value(checked_map(id), value);
+
+    if (!existing.has_value()) {
+        const auto& before = checked_map(owner.as_object());
+        if (before.map_entries.size() >=
+            std::numeric_limits<std::uint32_t>::max()) {
+            throw std::length_error("map entry count exceeds object header limit");
+        }
+        const auto required_width = storage_slot_count(before) + 2;
+        ensure_map_growth_storage(owner, key, value, required_width);
+    }
+
+    const bool barrier_triggered = record_map_write_barrier_if_needed(
+        owner.as_object(), existing.has_value() ? std::nullopt
+                                                : std::optional<Value>(key),
+        value);
+    auto& map = checked_map(owner.as_object());
+    if (existing.has_value()) {
+        map.map_entries[*existing].value = value;
+    } else {
+        map.map_entries.push_back(MapEntry{key, value});
+        map.length = static_cast<std::uint32_t>(map.map_entries.size());
+    }
+    validate_descriptor_shape(map);
+
+    if (barrier_triggered &&
+        stress_config_.collect_minor_after_every_write_barrier) {
+        std::array<Value*, 3> mutation_roots{&owner, &key, &value};
+        collect_impl(CollectionKind::Minor, nullptr, mutation_roots);
+    } else {
+        validate_heap_storage_layout();
+        validate_remembered_set();
+    }
+}
+
 void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     // Barrier hook: every pair field mutation must flow through this method. The public
     // heap API intentionally exposes only const object inspection plus set_left/set_right,
@@ -906,6 +1244,39 @@ bool Heap::record_write_barrier_if_needed(ObjectId owner, Value value) {
     const auto target_slot = checked_slot(value.as_object());
     const bool must_remember = is_old_slot(owner_slot) && is_young_slot(target_slot);
     if (!must_remember) {
+        return false;
+    }
+
+    if (TEST_ONLY_skip_next_write_barrier_) {
+        TEST_ONLY_skip_next_write_barrier_ = false;
+        return false;
+    }
+
+    ++metrics_.write_barrier_hits;
+    record_remembered_object(owner);
+    return true;
+}
+
+bool Heap::record_map_write_barrier_if_needed(
+    ObjectId owner, std::optional<Value> inserted_key, Value value) {
+    const auto owner_slot = checked_slot(owner);
+    if (!is_old_slot(owner_slot)) {
+        return false;
+    }
+
+    bool has_young_target = false;
+    const auto consider = [&](Value candidate) {
+        if (!candidate.is_object()) {
+            return;
+        }
+        const auto target_slot = checked_slot(candidate.as_object());
+        has_young_target = has_young_target || is_young_slot(target_slot);
+    };
+    if (inserted_key.has_value()) {
+        consider(*inserted_key);
+    }
+    consider(value);
+    if (!has_young_target) {
         return false;
     }
 
@@ -1115,6 +1486,7 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
             continue;
         }
 
+        const auto width_at_collection_start = storage_slot_count(*slot);
         auto moved = *slot;
         moved.marked = false;
         if (moved.generation == ObjectGeneration::Young) {
@@ -1123,6 +1495,8 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
         }
 
         const auto required_slots = storage_slot_count(moved);
+        assert(required_slots == width_at_collection_start &&
+               "object storage width changed within one collection");
         if (next_live_slot + required_slots > result.objects.size()) {
             throw std::logic_error("compaction cursor exceeded heap storage capacity");
         }
@@ -1334,6 +1708,10 @@ bool Heap::TEST_ONLY_is_string(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_closure(ObjectId id) const {
     return object(id).kind == ObjectKind::Closure;
+}
+
+bool Heap::TEST_ONLY_is_map(ObjectId id) const {
+    return object(id).kind == ObjectKind::Map;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {
