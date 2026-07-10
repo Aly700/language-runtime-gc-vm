@@ -233,3 +233,27 @@ by about 18.4ms. The runtime workloads are still reported for the full protocol;
 their medians moved favorably in this capture, but they do not pay verifier work
 inside the timed execution path after iteration 17, so those changes should be
 treated as informational host-run variance rather than the design justification.
+
+## Iteration 20: Variable-Sized Objects and Scalar Arrays (2026-07-10)
+
+Counter command:
+
+```bash
+build/lang_bench --counters-only
+```
+
+The full deterministic counter output is unchanged from the machine-readable
+baseline above. In particular, `heap_peak_slots` and `heap_capacity_slots` did
+not drift for the existing pair-only workloads:
+
+- `alloc_churn`: `12` / `12`
+- `survivor_heavy`: `908` / `908`
+- `mutation_heavy`: `768` / `768`
+- `deep_recursion_alloc`: `141` / `141`
+- `verifier_compile`: `0` / `0`
+
+Reason: iteration 20 adds kind/length headers and descriptor-driven variable-size
+storage, but preserves the existing logical slot accounting for `Pair` objects.
+`ScalarArray` reserves descriptor-sized storage and raw `i64` payload, but the
+current benchmark workloads are pair-only and do not allocate arrays. No
+deterministic counter rebaseline is required.

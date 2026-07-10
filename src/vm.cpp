@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -201,6 +202,69 @@ Value VM::execute_verified(const Module& module,
             auto right = pop(frame);
             auto left = pop(frame);
             push(frame, Value::object(heap_.allocate_pair(left, right)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::AllocArray: {
+            const auto init_value = pop(frame);
+            const auto length_value = pop(frame);
+            assert(init_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: AllocArray init must be i64");
+            assert(length_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: AllocArray length must be i64");
+            const auto length = length_value.as_i64();
+            if (length < 0) {
+                throw std::out_of_range("scalar array length out of bounds");
+            }
+            push(frame, Value::object(heap_.allocate_scalar_array(
+                            static_cast<std::size_t>(length), init_value.as_i64())));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::ArrayGet: {
+            const auto index_value = pop(frame);
+            const auto receiver = pop(frame);
+            assert(index_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: ArrayGet index must be i64");
+            assert(receiver.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: ArrayGet receiver must be object");
+            const auto index = index_value.as_i64();
+            if (index < 0) {
+                throw std::out_of_range("scalar array index out of bounds");
+            }
+            push(frame, Value::int64(heap_.array_get(receiver.as_object(),
+                                                     static_cast<std::size_t>(index))));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::ArraySet: {
+            const auto stored_value = pop(frame);
+            const auto index_value = pop(frame);
+            const auto receiver = pop(frame);
+            assert(stored_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: ArraySet value must be i64");
+            assert(index_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: ArraySet index must be i64");
+            assert(receiver.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: ArraySet receiver must be object");
+            const auto index = index_value.as_i64();
+            if (index < 0) {
+                throw std::out_of_range("scalar array index out of bounds");
+            }
+            heap_.array_set(receiver.as_object(), static_cast<std::size_t>(index),
+                            stored_value.as_i64());
+            ++frame.pc;
+            break;
+        }
+        case OpCode::ArrayLen: {
+            const auto receiver = pop(frame);
+            assert(receiver.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: ArrayLen receiver must be object");
+            const auto length = heap_.array_length(receiver.as_object());
+            if (length > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+                throw std::length_error("scalar array length exceeds i64 result range");
+            }
+            push(frame, Value::int64(static_cast<std::int64_t>(length)));
             ++frame.pc;
             break;
         }

@@ -19,6 +19,16 @@
 
 - Every live object is reachable from an explicit root or another live object at collection start.
 - The collector must never treat non-reference values as references.
+- Every heap object has a descriptor derived from its header kind and length. The
+  collector may inspect only descriptor-declared reference slots: `Pair` scans its two
+  tagged `Value` fields, while `ScalarArray` scans zero payload slots.
+- `ScalarArray` payload elements are raw `i64` values, not tagged `Value`s. Even if a raw
+  element's bit pattern equals a valid or stale `ObjectId`, marking, forwarding,
+  remembered-set validation, and post-collection validation must not interpret it as a
+  reference or rewrite it.
+- Object IDs name object base slots only. Payload/reserved storage slots are never valid
+  object headers, and variable-size compaction must advance by the descriptor storage
+  width without allowing overlapping live objects.
 - No object may be swept while reachable.
 - If a moving collector is introduced, every root and heap reference must be updated before mutator execution resumes.
 - Every live embedder handle is a precise mutable root slot; handle destruction removes that slot before the next collection, and the heap must outlive all handles.

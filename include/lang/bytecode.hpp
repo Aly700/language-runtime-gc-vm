@@ -19,6 +19,10 @@ enum class OpCode {
     GetRight,
     SetLeft,
     SetRight,
+    AllocArray,
+    ArrayGet,
+    ArraySet,
+    ArrayLen,
     LoadLocal,
     StoreLocal,
     Jump,
@@ -39,6 +43,7 @@ enum class ValueKind {
     Int64,
     Bool,
     Object,
+    Array,
     Nil,
 };
 
@@ -162,6 +167,7 @@ enum class VerifierReason {
     UnreachableCode,           // A bytecode pc has no verifier state after analysis.
     BadPairFieldRead,          // Pair field facts are absent, opaque, or poisoned.
     BadPairFieldWrite,         // Pair field write violates available field facts.
+    BadArrayOperation,         // Array operation consumes the wrong stack shape or kind.
     BadCallTarget,             // Call operand does not name a function in the module.
     BadCallArity,              // Call stack does not contain all callee arguments.
     BadCallArgKind,            // Call argument kind or detailed pair shape is invalid.

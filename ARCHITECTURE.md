@@ -102,12 +102,21 @@ check. This preserves the old non-nil guarantees for anonymous `pair<T, U>` and 
   generation-tagged object IDs. The low bits identify the storage slot and the high bits
   identify that slot's current generation, so a swept or moved ID cannot alias a later
   object in the same slot.
+- Heap object headers carry an `ObjectKind` plus descriptor length. `Pair` keeps the
+  existing pair behavior and pair-only slot accounting: its descriptor length is two
+  tagged `Value` fields and its logical storage width remains one base slot. `ScalarArray`
+  is bytecode-only in this iteration; it reserves a descriptor-sized logical storage run
+  and stores a raw contiguous `std::int64_t` payload that is not a `Value` sequence.
+- All heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two tagged
+  fields and scans zero `ScalarArray` payload slots, so raw array elements are never
+  marked, forwarded, validated as references, or entered into the remembered-set logic.
 - Pair field types and named recursive types are verification-time metadata only. They do
   not change `Value`, object layout, stack-map format, root tracing, write barriers,
   forwarding, movement, or heap validation.
 - Pair field mutation is routed through `Heap::store_pair_field`. That method is the
   single hook point where the generational old-to-young write barrier runs before the new
-  field value is published.
+  field value is published. `ArraySet` writes raw scalar payload and therefore does not run
+  the write barrier.
 - Deterministic GC stress is configured with explicit counters: before every allocation,
   after every allocation, after every barrier-triggering old-to-young store, every N
   major-collection bytecode instructions, and every N minor-collection bytecode
@@ -246,21 +255,24 @@ ownership. Move-only handles keep C++ root lifetimes visible.
 
 Collection is mark, forward, rewrite, install, validate:
 
-1. Marking uses an explicit vector worklist. Roots are visited in provider order, pair
-   fields are traced left before right, and no unordered container participates in tracing.
+1. Marking uses an explicit vector worklist. Roots are visited in provider order, object
+   payloads are visited through their kind descriptor, pair fields are traced left before
+   right, and no unordered container participates in tracing.
 2. Compaction scans the slot vector in ascending order and copies marked objects into the
-   lowest slots. This deterministic sliding pass builds a forwarding table indexed by old
-   slot.
+   lowest base slots. This deterministic sliding pass builds a forwarding table indexed by
+   old base slot and advances its free cursor by each object's descriptor storage width,
+   so non-uniform arrays slide without overlapping later live objects.
 3. A moved survivor receives `new_slot | new_generation << 32`. If it moves into another
    slot, that destination slot's generation is advanced before the new ID is minted, so an
    old stale ID for the destination slot cannot alias the moved object. The old source slot
    is emptied, so the pre-move ID also traps.
 4. Before installing the compacted slot vector, the collector rewrites all roots
    (`RootProvider` roots from every VM frame, heap handle slots, plus allocation extra
-   roots) and every copied live pair field through the forwarding table while the old
-   layout can still validate old IDs.
-5. After installation, validation walks all roots and all live-object fields and checks that
-   every object reference resolves through the current generation table.
+   roots) and every descriptor-declared reference slot in every copied live object through
+   the forwarding table while the old layout can still validate old IDs.
+5. After installation, validation walks all roots and all descriptor-declared live-object
+   reference slots, checks that every object reference resolves through the current
+   generation table, and verifies variable-size storage runs do not overlap.
 
 Rejected alternative: a permanent handle-indirection table where ObjectIds never change.
 That would preserve external numeric handles, but it would not exercise the root and heap
@@ -271,7 +283,7 @@ makes missed updates fail as stale IDs.
 
 The heap has two logical object generations on top of the same slot vector:
 
-- New pair allocations are young.
+- New pair and scalar-array allocations are young.
 - Any young object that survives one collection is promoted to old. This one-survival
   policy keeps the phase deterministic and makes promotion independent of wall-clock age or
   allocation rate.
@@ -285,14 +297,17 @@ The heap has two logical object generations on top of the same slot vector:
   table before mutator execution resumes.
 - The remembered set is a `std::vector<ObjectId>`, not an unordered container. Barrier
   insertion is stable and duplicate-free by linear scan; collection-time pruning rebuilds it
-  in slot order by keeping only valid old objects that still contain a young field.
+  in slot order by keeping only valid old objects whose descriptor-declared reference
+  slots still contain a young reference.
 - A dead old object in the remembered set can conservatively keep a young referent alive
   during a minor collection, but never forever: major collection traces only mutator roots,
   so the dead old graph is swept and remembered-set pruning drops the entry.
-- `Heap::store_pair_field` is the only mutation hook exposed to bytecode. On every store of
-  a young object into an old pair field it records the old object before publishing the
-  value. The public heap API does not expose mutable pair fields directly, protecting the
-  barrier-completeness invariant.
+- `Heap::store_pair_field` is the only reference-publishing mutation hook exposed to
+  bytecode. On every store of a young object into an old pair field it records the old
+  object before publishing the value. The public heap API does not expose mutable pair
+  fields directly, protecting the barrier-completeness invariant. Scalar arrays do not
+  contain reference slots in this iteration, so `ArraySet` cannot publish an object
+  reference.
 
 Rejected alternative: keep old objects fixed during minor collection and compact only young
 slots. That would reduce forwarding work, but it would leave minor collection unable to
@@ -309,10 +324,10 @@ remembered-set entries.
   `LoadLocal` requires a known initialized kind on every incoming path.
 - Root precision: `verify_with_stack_maps` emits per-function per-pc stack reference maps
   from the verifier's abstract states. A true bit means the slot may contain an object
-  reference; nullable named-pair slots may contain `nil` in the same reference-capable
-  slot. Hand-written maps, when present, must match the verifier state, and VM-controlled
-  collection points assert that the active frame's runtime stack tags agree with the
-  generated map for the current function and pc.
+  reference, including pair objects and scalar arrays; nullable named-pair slots may
+  contain `nil` in the same reference-capable slot. Hand-written maps, when present, must
+  match the verifier state, and VM-controlled collection points assert that the active
+  frame's runtime stack tags agree with the generated map for the current function and pc.
 - Frame-root precision: every live frame's locals and operand stack slots are traced as
   mutable roots. A collection triggered in a deep callee rewrites references held by
   suspended callers before the callee or caller can resume.
@@ -338,8 +353,9 @@ remembered-set entries.
   pair-field kind, malformed named-type references, infinite-unfolding misuse, and wrong
   return kind.
 - GC neutrality: pair-field types and named recursive types never participate in heap
-  layout. Stack maps keep the same single reference/non-reference bit per stack slot, and
-  the VM/heap continue to trace, barrier, forward, and validate by runtime `Value` tags.
+  layout. Scalar arrays add a bytecode-only reference kind, but stack maps keep the same
+  single reference/non-reference bit per stack slot, and the VM/heap continue to trace,
+  barrier, forward, and validate by runtime `Value` tags plus heap object descriptors.
 - Source agreement: `compile_program` does not return bytecode for rejected source, and
   every returned `VerifiedModule` has passed module verification with generated stack
   maps. The returned proof is the single blessed execution product and carries that same
@@ -350,11 +366,12 @@ remembered-set entries.
 
 - Stack height is invariant at a merge; different heights reject immediately to protect
   stack-depth safety.
-- Stack value kinds are `Int64`, `Bool`, `Object`, `Nil`, and `Poison`; recursive named
-  values use `Object` with an explicit nullable bit rather than a new runtime kind.
-- Equal non-object kinds join to themselves; object kinds join to object with the union of
-  possible allocation sites, an opaque-object bit, an optional nil bit, optional
-  signature-derived pair fields, and optional named-type references.
+- Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `Nil`, and `Poison`; recursive
+  named values use `Object` with an explicit nullable bit rather than a new runtime kind.
+- Equal non-object/non-array kinds join to themselves; array kinds join only to array;
+  object kinds join to object with the union of possible allocation sites, an opaque-object
+  bit, an optional nil bit, optional signature-derived pair fields, and optional
+  named-type references.
 - Different kinds join to `Poison`, which cannot be consumed by any instruction or emitted
   into a stack map. This rejects ambiguous object/non-object roots instead of guessing.
 - Local initialization joins by intersection: a local initialized on only one incoming path

@@ -49,13 +49,22 @@ enum class ObjectGeneration {
     Old,
 };
 
+enum class ObjectKind {
+    Pair,
+    ScalarArray,
+};
+
 struct Object {
-    // Object layout assumption: a pair stores two full tagged Values.
-    // The marker must inspect the Value tag before following a field as an ObjectId.
+    static Object pair(Value left, Value right);
+    static Object scalar_array(std::size_t length, std::int64_t init);
+
     bool marked{false};
     ObjectGeneration generation{ObjectGeneration::Young};
+    ObjectKind kind{ObjectKind::Pair};
+    std::uint32_t length{2};
     Value left{Value::nil()};
     Value right{Value::nil()};
+    std::vector<std::int64_t> scalar_elements;
 };
 
 class Handle {
@@ -94,6 +103,7 @@ public:
     Heap& operator=(Heap&&) = delete;
 
     ObjectId allocate_pair(Value left, Value right);
+    ObjectId allocate_scalar_array(std::size_t length, std::int64_t init);
     [[nodiscard]] Handle make_handle(Value value);
     [[nodiscard]] Handle make_handle(ObjectId id);
     void set_root_provider(RootProvider* provider) { root_provider_ = provider; }
@@ -108,6 +118,9 @@ public:
     [[nodiscard]] Value right(ObjectId id) const;
     void set_left(ObjectId id, Value value);
     void set_right(ObjectId id, Value value);
+    [[nodiscard]] std::size_t array_length(ObjectId id) const;
+    [[nodiscard]] std::int64_t array_get(ObjectId id, std::size_t index) const;
+    void array_set(ObjectId id, std::size_t index, std::int64_t value);
     [[nodiscard]] std::size_t live_count() const;
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
@@ -115,6 +128,7 @@ public:
 
     [[nodiscard]] bool TEST_ONLY_is_young_object(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_old_object(ObjectId id) const;
+    [[nodiscard]] bool TEST_ONLY_is_scalar_array(ObjectId id) const;
     [[nodiscard]] std::size_t TEST_ONLY_remembered_set_size() const {
         return remembered_set_.size();
     }
@@ -144,9 +158,16 @@ private:
         std::uint64_t objects_moved{0};
     };
 
-    ObjectId allocate_slot(Value left, Value right);
+    ObjectId allocate_object(Object object);
+    [[nodiscard]] std::optional<std::size_t> find_free_storage_run(
+        std::size_t required_slots) const;
+    [[nodiscard]] bool is_storage_slot_free(std::size_t slot) const;
     [[nodiscard]] std::size_t checked_slot(ObjectId id) const;
     [[nodiscard]] Object& mutable_object(ObjectId id);
+    [[nodiscard]] const Object& checked_pair(ObjectId id) const;
+    [[nodiscard]] Object& checked_pair(ObjectId id);
+    [[nodiscard]] const Object& checked_scalar_array(ObjectId id) const;
+    [[nodiscard]] Object& checked_scalar_array(ObjectId id);
     void register_handle_root(Value* slot);
     void deregister_handle_root(Value* slot) noexcept;
     void move_handle_root(Value* from, Value* to) noexcept;
@@ -172,6 +193,7 @@ private:
     [[nodiscard]] std::vector<ObjectId> rewrite_remembered_set(
         const ForwardingTable& forwarding) const;
     void prune_remembered_set();
+    void validate_heap_storage_layout() const;
     void validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const;
     void validate_remembered_set() const;
     void validate_value(Value value) const;

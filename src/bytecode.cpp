@@ -21,6 +21,7 @@ enum class AbstractKind {
     Int64,
     Bool,
     Object,
+    Array,
     Nil,
     Poison,
 };
@@ -73,6 +74,14 @@ const char* op_name(OpCode op) {
         return "SetLeft";
     case OpCode::SetRight:
         return "SetRight";
+    case OpCode::AllocArray:
+        return "AllocArray";
+    case OpCode::ArrayGet:
+        return "ArrayGet";
+    case OpCode::ArraySet:
+        return "ArraySet";
+    case OpCode::ArrayLen:
+        return "ArrayLen";
     case OpCode::LoadLocal:
         return "LoadLocal";
     case OpCode::StoreLocal:
@@ -103,6 +112,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Bool";
     case ValueKind::Object:
         return "Object";
+    case ValueKind::Array:
+        return "Array";
     case ValueKind::Nil:
         return "Nil";
     }
@@ -117,6 +128,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "Bool";
     case AbstractKind::Object:
         return "Object";
+    case AbstractKind::Array:
+        return "Array";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -150,6 +163,7 @@ AbstractValue value_with_kind(AbstractKind kind) {
 
 AbstractValue int64_value() { return value_with_kind(AbstractKind::Int64); }
 AbstractValue bool_value() { return value_with_kind(AbstractKind::Bool); }
+AbstractValue array_value() { return value_with_kind(AbstractKind::Array); }
 AbstractValue poison_value() { return value_with_kind(AbstractKind::Poison); }
 
 AbstractValue nil_object_value() {
@@ -199,6 +213,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Bool;
     case ValueKind::Object:
         return AbstractKind::Object;
+    case ValueKind::Array:
+        return AbstractKind::Array;
     case ValueKind::Nil:
         return AbstractKind::Nil;
     }
@@ -226,6 +242,10 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
         return value;
     }
     return value_from_signature(signature.kind);
+}
+
+bool is_reference_kind(AbstractKind kind) {
+    return kind == AbstractKind::Object || kind == AbstractKind::Array;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -436,7 +456,7 @@ bool stack_map_matches(const StackMap& map, const std::vector<AbstractValue>& st
         if (is_poison(stack[i])) {
             return false;
         }
-        const bool is_object = stack[i].kind == AbstractKind::Object;
+        const bool is_object = is_reference_kind(stack[i].kind);
         if (map.object_slots[i] != is_object) {
             return false;
         }
@@ -451,7 +471,7 @@ std::optional<StackMap> stack_map_from_state(const AbstractState& state) {
         if (is_poison(value)) {
             return std::nullopt;
         }
-        map.object_slots.push_back(value.kind == AbstractKind::Object);
+        map.object_slots.push_back(is_reference_kind(value.kind));
     }
     return map;
 }
@@ -814,6 +834,53 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
+    case OpCode::AllocArray:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation, "array init value") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation, "array length")) {
+            return false;
+        }
+        state.stack.push_back(array_value());
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
+                                          successors, diagnostics);
+    case OpCode::ArrayGet:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation, "array index") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Array, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation, "array receiver")) {
+            return false;
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
+                                          successors, diagnostics);
+    case OpCode::ArraySet:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation, "array stored value") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation, "array index") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Array, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation, "array receiver")) {
+            return false;
+        }
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
+                                          successors, diagnostics);
+    case OpCode::ArrayLen:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Array, VerifierReason::StackUnderflow,
+                                  VerifierReason::BadArrayOperation, "array receiver")) {
+            return false;
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(pc, function, function_index, std::move(state),
+                                          successors, diagnostics);
     case OpCode::GetLeft:
     case OpCode::GetRight: {
         AbstractValue receiver;
@@ -1179,6 +1246,8 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "BadPairFieldRead";
     case VerifierReason::BadPairFieldWrite:
         return "BadPairFieldWrite";
+    case VerifierReason::BadArrayOperation:
+        return "BadArrayOperation";
     case VerifierReason::BadCallTarget:
         return "BadCallTarget";
     case VerifierReason::BadCallArity:

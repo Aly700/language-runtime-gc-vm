@@ -61,6 +61,9 @@ target_link_libraries(lang_iteration14_recursive_types PRIVATE lang_runtime)
 add_executable(lang_iteration17_verified_module tests/iteration17_verified_module.cpp)
 target_link_libraries(lang_iteration17_verified_module PRIVATE lang_runtime)
 
+add_executable(lang_iteration20_arrays tests/iteration20_arrays.cpp)
+target_link_libraries(lang_iteration20_arrays PRIVATE lang_runtime)
+
 add_executable(lang_bench src/bench.cpp)
 target_link_libraries(lang_bench PRIVATE lang_runtime)
 
@@ -79,4 +82,5 @@ add_test(NAME lang_iteration12_handles COMMAND lang_iteration12_handles)
 add_test(NAME lang_iteration13_verifier_diagnostics COMMAND lang_iteration13_verifier_diagnostics)
 add_test(NAME lang_iteration14_recursive_types COMMAND lang_iteration14_recursive_types)
 add_test(NAME lang_iteration17_verified_module COMMAND lang_iteration17_verified_module)
+add_test(NAME lang_iteration20_arrays COMMAND lang_iteration20_arrays)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

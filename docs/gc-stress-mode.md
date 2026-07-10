@@ -57,7 +57,14 @@ entry starts from `2..5`; the optional i64 helper can add at most two, so recurs
 at most `7` recursive frames plus the entry frame, well below the VM's default call-depth
 limit of `1024`.
 
-CTest runs two corpora, each across these schedules:
+The array grammar is isolated from the legacy bytecode grammars. It emits bytecode-only
+scalar-array programs that promote an anchor pair, publish a young `ScalarArray` through
+that old pair, drop the direct reference, retrieve the array through pair field facts, and
+exercise `ArrayLen`, `ArraySet`, and `ArrayGet` around deterministic collections. Its
+seed-17 bytecode listing is pinned separately from the original single-function and call
+snapshots.
+
+CTest runs three corpora, each across these schedules:
 
 - `no_stress`
 - `before_every_alloc`
@@ -70,16 +77,18 @@ CTest runs two corpora, each across these schedules:
 
 The single-function corpus runs seeds `1..64`. The call corpus also runs seeds `1..64`;
 the module size is derived from the seed so those 64 seeds cover 2, 3, 4, and 5-function
-modules evenly. The call grammar has its own pinned seed-17 module snapshot.
+modules evenly. The array corpus runs seeds `1..64` as a third isolated bytecode corpus.
+The call grammar and array grammar each have their own pinned seed-17 snapshot.
 
 The oracle executes the same generated program under every schedule and compares the
 observable return value to `no_stress`. Scalar returns compare by tag and value. Object
 returns compare a canonical deep graph serialization from the returned object: traversal
-assigns schedule-local node numbers in left-before-right order, records pair fields, and
-preserves sharing and cycles through repeated node references instead of comparing
-`ObjectId` values. Any divergence, verifier rejection, unexpected trap, stale id, or GC
-validator failure prints the seed, schedule, full bytecode listing, and a one-line replay
-command.
+assigns schedule-local node numbers in descriptor order, records pair fields and scalar
+array raw elements, and preserves sharing and cycles through repeated node references
+instead of comparing `ObjectId` values. Raw array elements are printed as integers only;
+they are never interpreted as references by the oracle or collector. Any divergence,
+verifier rejection, unexpected trap, stale id, or GC validator failure prints the seed,
+schedule, full bytecode listing, and a one-line replay command.
 
 Replay a single-function finding with:
 
@@ -91,6 +100,20 @@ Replay a call-grammar finding with:
 
 ```bash
 ./build/lang_iteration5_fuzz --grammar calls --seed <uint64> --schedule <schedule-name>
+```
+
+Replay an array-grammar finding with:
+
+```bash
+./build/lang_iteration5_fuzz --grammar arrays --seed <uint64> --schedule <schedule-name>
+```
+
+Dump bytecode corpora for byte-identity checks with:
+
+```bash
+./build/lang_iteration5_fuzz --dump-corpus single
+./build/lang_iteration5_fuzz --dump-corpus calls
+./build/lang_iteration5_fuzz --dump-corpus arrays
 ```
 
 ## Source-level differential fuzzing
