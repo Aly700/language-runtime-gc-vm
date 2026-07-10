@@ -167,6 +167,23 @@ void add_statement_array_counts(const Statement& statement,
             add_statement_array_counts(inner, counts);
         }
         break;
+    case Statement::Kind::ForIn:
+        add_expr_array_counts(*statement.iterable, counts);
+        if (statement.range_upper != nullptr) {
+            add_expr_array_counts(*statement.range_upper, counts);
+        }
+        for (const auto& inner : statement.body) {
+            add_statement_array_counts(inner, counts);
+        }
+        if (statement.range_upper == nullptr &&
+            statement.iterable->inferred_type.kind == TypeSpec::Kind::Array) {
+            if (is_ref_array_type(statement.iterable->inferred_type)) {
+                ++counts.get_ref;
+            } else {
+                ++counts.get_scalar;
+            }
+        }
+        break;
     }
 }
 
@@ -386,6 +403,9 @@ private:
         case Statement::Kind::While:
             compile_while(statement);
             break;
+        case Statement::Kind::ForIn:
+            compile_for_in(statement);
+            break;
         }
     }
 
@@ -447,6 +467,105 @@ private:
         }
         // Verifier accommodation: loop bodies are stack-neutral and locals keep their
         // declared source type, matching the verifier's strict merge at the backedge.
+        emit(OpCode::Jump, static_cast<std::int64_t>(header));
+        patch(jump_to_exit, pc());
+    }
+
+    void emit_increment_local(std::uint32_t local) {
+        emit(OpCode::LoadLocal, local);
+        emit(OpCode::ConstantI64, 1);
+        emit(OpCode::AddI64, 0);
+        emit(OpCode::StoreLocal, local);
+    }
+
+    void compile_for_in(const Statement& statement) {
+        assert(!statement.loop_local_indices.empty() &&
+               "type-checked for-in must own loop locals");
+        const auto index = allocate_temp_local();
+        const auto bound = allocate_temp_local();
+
+        if (statement.range_upper != nullptr) {
+            // Range bounds are evaluated exactly once, left-to-right. The lower value is
+            // the compiler-managed induction local and the upper value is its fixed bound.
+            compile_expr(*statement.iterable);
+            emit(OpCode::StoreLocal, index);
+            compile_expr(*statement.range_upper);
+            emit(OpCode::StoreLocal, bound);
+
+            const auto header = pc();
+            emit(OpCode::LoadLocal, index);
+            emit(OpCode::LoadLocal, bound);
+            emit(OpCode::LessI64, 0);
+            const auto jump_to_exit = emit(OpCode::JumpIfFalse, -1);
+            emit(OpCode::LoadLocal, index);
+            emit(OpCode::StoreLocal, statement.loop_local_indices[0]);
+            for (const auto& inner : statement.body) {
+                compile_statement(inner);
+            }
+            emit_increment_local(index);
+            emit(OpCode::Jump, static_cast<std::int64_t>(header));
+            patch(jump_to_exit, pc());
+            return;
+        }
+
+        const auto container = allocate_temp_local();
+        compile_expr(*statement.iterable);
+        emit(OpCode::StoreLocal, container);
+        emit(OpCode::LoadLocal, container);
+        emit(statement.iterable->inferred_type.kind == TypeSpec::Kind::Map
+                 ? OpCode::MapLen
+                 : OpCode::ArrayLen,
+             0);
+        emit(OpCode::StoreLocal, bound);
+        emit(OpCode::ConstantI64, 0);
+        emit(OpCode::StoreLocal, index);
+
+        const auto header = pc();
+        if (statement.iterable->inferred_type.kind == TypeSpec::Kind::Map) {
+            // Maps cannot shrink. A larger current count therefore proves a new key was
+            // inserted. The deliberately invalid positional read provides one stable,
+            // deterministic runtime trap using the accessor's ordinary OOB boundary.
+            emit(OpCode::LoadLocal, bound);
+            emit(OpCode::LoadLocal, container);
+            emit(OpCode::MapLen, 0);
+            emit(OpCode::LessI64, 0);
+            const auto unchanged = emit(OpCode::JumpIfFalse, -1);
+            emit(OpCode::LoadLocal, container);
+            emit(OpCode::ConstantI64, -1);
+            emit(OpCode::MapKeyAt, 0);
+            emit(OpCode::StoreLocal, statement.loop_local_indices[0]);
+            patch(unchanged, pc());
+        }
+
+        emit(OpCode::LoadLocal, index);
+        emit(OpCode::LoadLocal, bound);
+        emit(OpCode::LessI64, 0);
+        const auto jump_to_exit = emit(OpCode::JumpIfFalse, -1);
+
+        emit(OpCode::LoadLocal, container);
+        emit(OpCode::LoadLocal, index);
+        if (statement.iterable->inferred_type.kind == TypeSpec::Kind::Map) {
+            emit(OpCode::MapKeyAt, 0);
+            emit(OpCode::StoreLocal, statement.loop_local_indices[0]);
+            emit(OpCode::LoadLocal, container);
+            emit(OpCode::LoadLocal, index);
+            emit(OpCode::MapValueAt, 0);
+            emit(OpCode::StoreLocal, statement.loop_local_indices[1]);
+        } else {
+            const auto& element = *statement.iterable->inferred_type.element;
+            emit(is_scalar_array_element_type(element) ? OpCode::ArrayGet
+                                                       : OpCode::RefArrayGet,
+                 0);
+            if (element.kind == TypeSpec::Kind::Bool) {
+                emit(OpCode::ConstantI64, 1);
+                emit(OpCode::LessI64, 0);
+            }
+            emit(OpCode::StoreLocal, statement.loop_local_indices[0]);
+        }
+        for (const auto& inner : statement.body) {
+            compile_statement(inner);
+        }
+        emit_increment_local(index);
         emit(OpCode::Jump, static_cast<std::int64_t>(header));
         patch(jump_to_exit, pc());
     }

@@ -11,6 +11,11 @@
 - Every live VM frame's operand stack and locals are precise mutable roots. Moving
   collection must rewrite references in active and suspended frames before bytecode
   execution resumes.
+- Generated per-pc stack maps carry exact reference bits for both operand-stack slots and
+  ordinary local slots. Definite initialization remains separate: a loop header may mark
+  a local reference-capable because it is `Nil` on entry and an object on a backedge while
+  still rejecting `LoadLocal` until every incoming path initializes it. The VM asserts
+  both operand and local bits at every active-frame instruction boundary.
 - Call depth is bounded by an explicit VM limit and must trap deterministically before
   host stack exhaustion can matter.
 - `AllocClosure`, `CallClosure`, and `LoadCapture` may execute only after the verifier has
@@ -24,6 +29,11 @@
   verifier has proved the module layout index, restricted key type, complete structural
   key/value types, and receiver/operand agreement. Missing-key `MapGet` traps with the
   stable `map key not found` diagnostic.
+- `MapKeyAt` and `MapValueAt` are append-only positional accessors used by compiler-lowered
+  map iteration. The verifier requires a typed map receiver plus an `i64` index and derives
+  the exact result from the map layout. Runtime out-of-bounds access traps with the stable
+  `map entry index out of bounds` diagnostic; lowered iteration deliberately reaches that
+  boundary when the entry count grows after its entry snapshot.
 - VM observable behavior must not depend on host pointer addresses.
 
 ## GC
@@ -131,6 +141,17 @@
   get/set, `.has(key)`, and `.len` preserve complete nested `K`/`V` facts through function
   signatures, pair fields, arrays, captures, and map values. String keys compare by bytes,
   never by `ObjectId`, so lookup remains valid after moving collection.
+- `for x in array`, `for k, v in map`, and `for i in lo..hi` are statement-only forms
+  lowered to index-based control flow and ordinary compiler-managed locals. Loop bindings
+  are immutable and lexically scoped; hidden names contain characters the lexer cannot
+  produce. Array and map sources must be proven non-nil before lowering, using the same
+  `is_nil` refinement boundary as existing object operations. Container references remain
+  precise local roots across every loop boundary.
+- Array iteration snapshots length but loads each element through the live forwarded
+  container, so element writes are visible. Map iteration snapshots entry count, observes
+  ADR-0004 insertion order, sees existing-value updates, and traps if a new key grows the
+  map. Range bounds are evaluated once left-to-right and `[lo, hi)` executes zero times
+  when `hi <= lo`. Compiler and verifier must agree on every hidden local and boundary map.
 
 - A source array type's element type determines its runtime representation at the compile
   boundary: `[i64]` and `[bool]` must emit only scalar `AllocArray`/`ArrayGet`/`ArraySet`

@@ -59,6 +59,11 @@ struct PairFields {
 struct AbstractState {
     std::vector<AbstractValue> stack;
     std::vector<std::optional<AbstractValue>> locals;
+    // Root category is tracked independently from definite initialization. At a loop
+    // header an unread local may contain Nil on the entry edge and a reference on the
+    // backedge; the local still needs a precise reference bit while LoadLocal remains
+    // forbidden until every incoming edge initializes it.
+    std::vector<std::optional<bool>> local_reference_kinds;
     std::map<std::size_t, PairFields> fields_by_site;
     std::map<std::size_t, AbstractValue> ref_array_elements_by_site;
 };
@@ -149,6 +154,10 @@ const char* op_name(OpCode op) {
         return "AllocWeak";
     case OpCode::WeakGet:
         return "WeakGet";
+    case OpCode::MapKeyAt:
+        return "MapKeyAt";
+    case OpCode::MapValueAt:
+        return "MapValueAt";
     }
     return "<invalid>";
 }
@@ -1027,7 +1036,9 @@ bool join_ref_array_element_into(AbstractValue& destination,
 
 JoinOutcome join_state_into(AbstractState& destination, const AbstractState& incoming) {
     if (destination.stack.size() != incoming.stack.size() ||
-        destination.locals.size() != incoming.locals.size()) {
+        destination.locals.size() != incoming.locals.size() ||
+        destination.local_reference_kinds.size() !=
+            incoming.local_reference_kinds.size()) {
         return JoinOutcome::Invalid;
     }
 
@@ -1053,6 +1064,22 @@ JoinOutcome join_state_into(AbstractState& destination, const AbstractState& inc
         changed = join_value_into(*dest_local, *incoming_local) || changed;
     }
 
+    for (std::size_t i = 0; i < destination.local_reference_kinds.size(); ++i) {
+        auto& destination_kind = destination.local_reference_kinds[i];
+        const auto incoming_kind = incoming.local_reference_kinds[i];
+        if (!incoming_kind.has_value()) {
+            continue;
+        }
+        if (!destination_kind.has_value()) {
+            destination_kind = incoming_kind;
+            changed = true;
+            continue;
+        }
+        if (*destination_kind != *incoming_kind) {
+            return JoinOutcome::Invalid;
+        }
+    }
+
     for (const auto& [site, incoming_fields] : incoming.fields_by_site) {
         auto [it, inserted] = destination.fields_by_site.emplace(site, incoming_fields);
         if (inserted) {
@@ -1076,17 +1103,31 @@ JoinOutcome join_state_into(AbstractState& destination, const AbstractState& inc
     return changed ? JoinOutcome::Changed : JoinOutcome::Unchanged;
 }
 
-bool stack_map_matches(const StackMap& map, const std::vector<AbstractValue>& stack) {
-    if (map.object_slots.size() != stack.size()) {
+bool stack_map_matches(const StackMap& map, const AbstractState& state) {
+    if (map.object_slots.size() != state.stack.size()) {
         return false;
     }
-    for (std::size_t i = 0; i < stack.size(); ++i) {
-        if (is_poison(stack[i])) {
+    for (std::size_t i = 0; i < state.stack.size(); ++i) {
+        if (is_poison(state.stack[i])) {
             return false;
         }
-        const bool is_object = is_reference_kind(stack[i].kind);
+        const bool is_object = is_reference_kind(state.stack[i].kind);
         if (map.object_slots[i] != is_object) {
             return false;
+        }
+    }
+    // An empty local map is the legacy hand-written format. Generated maps always carry
+    // exact local bits; a supplied non-empty map must agree completely.
+    if (!map.local_object_slots.empty()) {
+        if (map.local_object_slots.size() != state.locals.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < state.locals.size(); ++i) {
+            const bool is_object =
+                state.local_reference_kinds[i].value_or(false);
+            if (map.local_object_slots[i] != is_object) {
+                return false;
+            }
         }
     }
     return true;
@@ -1100,6 +1141,10 @@ std::optional<StackMap> stack_map_from_state(const AbstractState& state) {
             return std::nullopt;
         }
         map.object_slots.push_back(is_reference_kind(value.kind));
+    }
+    map.local_object_slots.reserve(state.locals.size());
+    for (const auto local_kind : state.local_reference_kinds) {
+        map.local_object_slots.push_back(local_kind.value_or(false));
     }
     return map;
 }
@@ -1970,6 +2015,34 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
                                           std::move(state), successors,
                                           diagnostics);
     }
+    case OpCode::MapKeyAt:
+    case OpCode::MapValueAt: {
+        AbstractValue receiver;
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BadMapPositionAccess,
+                                  "map positional index") ||
+            !pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow,
+                               "map positional receiver", &receiver)) {
+            return false;
+        }
+        if (receiver.kind != AbstractKind::Map ||
+            receiver.signature_map == nullptr ||
+            !receiver.signature_map->has_map_entries()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadMapPositionAccess,
+                          instruction_message(function, pc,
+                                              "receiver is not a typed map"));
+        }
+        state.stack.push_back(value_from_signature(
+            ins.op == OpCode::MapKeyAt ? *receiver.signature_map->key
+                                       : *receiver.signature_map->value));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
     case OpCode::GetLeft:
     case OpCode::GetRight: {
         AbstractValue receiver;
@@ -2067,6 +2140,8 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         }
         state.locals[static_cast<std::size_t>(ins.operand)] =
             without_provenance(stored);
+        state.local_reference_kinds[static_cast<std::size_t>(ins.operand)] =
+            is_reference_kind(stored.kind);
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
@@ -2352,8 +2427,11 @@ std::optional<VerificationResult> verify_function_with_stack_maps(
 
     AbstractState initial;
     initial.locals.resize(function.local_count);
+    initial.local_reference_kinds.resize(function.local_count);
     for (std::size_t i = 0; i < function.signature.parameters.size(); ++i) {
         initial.locals[i] = value_from_signature(parameter_signature(function.signature, i));
+        initial.local_reference_kinds[i] =
+            is_reference_kind(initial.locals[i]->kind);
     }
     states[0] = initial;
     worklist.push_back(0);
@@ -2423,7 +2501,7 @@ std::optional<VerificationResult> verify_function_with_stack_maps(
             return std::nullopt;
         }
         if (!function.stack_maps.empty() &&
-            !stack_map_matches(function.stack_maps[pc], states[pc]->stack)) {
+            !stack_map_matches(function.stack_maps[pc], *states[pc])) {
             reject(diagnostics, function_index, pc, VerifierReason::BadStackMap,
                    "supplied stack map does not match verifier state");
             return std::nullopt;
@@ -2518,6 +2596,8 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "WeakOperationOnNonWeak";
     case VerifierReason::WeakTargetMayBeNil:
         return "WeakTargetMayBeNil";
+    case VerifierReason::BadMapPositionAccess:
+        return "BadMapPositionAccess";
     }
     return "<unknown>";
 }

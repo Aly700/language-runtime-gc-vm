@@ -166,6 +166,7 @@ struct Statement {
         Assign,
         If,
         While,
+        ForIn,
     };
 
     Kind kind{Kind::Let};
@@ -181,6 +182,12 @@ struct Statement {
     std::vector<Statement> then_branch;
     std::vector<Statement> else_branch;
     std::vector<Statement> body;
+    std::vector<std::string> loop_names;
+    std::vector<SourcePosition> loop_name_positions;
+    std::vector<std::uint32_t> loop_local_indices;
+    std::unique_ptr<Expr> iterable;
+    std::unique_ptr<Expr> range_upper;
+    bool loop_locals_allocated{false};
 };
 
 struct CaptureSpec {
