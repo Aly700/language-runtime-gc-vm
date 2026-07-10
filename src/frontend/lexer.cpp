@@ -199,6 +199,10 @@ private:
             kind = TokenKind::For;
         } else if (text == "in") {
             kind = TokenKind::In;
+        } else if (text == "break") {
+            kind = TokenKind::Break;
+        } else if (text == "continue") {
+            kind = TokenKind::Continue;
         } else if (text == "true") {
             kind = TokenKind::True;
         } else if (text == "false") {

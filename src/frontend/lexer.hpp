@@ -22,6 +22,8 @@ enum class TokenKind {
     While,
     For,
     In,
+    Break,
+    Continue,
     True,
     False,
     Nil,

@@ -169,6 +169,8 @@ struct Statement {
         If,
         While,
         ForIn,
+        Break,
+        Continue,
         Print,
     };
 

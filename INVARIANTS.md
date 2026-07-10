@@ -155,6 +155,11 @@
   produce. Array and map sources must be proven non-nil before lowering, using the same
   `is_nil` refinement boundary as existing object operations. Container references remain
   precise local roots across every loop boundary.
+- Unlabeled `break` and `continue` bind only the nearest enclosing while/for-in and lower
+  exclusively to existing jumps. Break targets the post-loop pc; for-in continue must
+  execute the hidden index increment before returning to the header, and map continue must
+  re-enter through the mutation check. Every target retains verifier-exact operand and
+  local root bits.
 - Array iteration snapshots length but loads each element through the live forwarded
   container, so element writes are visible. Map iteration snapshots entry count, observes
   ADR-0004 insertion order, sees existing-value updates, and traps if a new key grows the

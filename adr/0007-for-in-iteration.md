@@ -48,6 +48,41 @@ on the entry edge and an object on a backedge without becoming readable before i
 The VM asserts both maps at instruction boundaries around stress collection. This makes the
 container snapshot a loud precise-root boundary rather than relying only on dynamic tags.
 
+Iteration 30 adds unlabeled `break;` and `continue;` without changing this runtime
+representation. Both bind to the nearest lexically enclosing `while` or `for-in`; a use
+outside a loop is rejected at the keyword with the stable diagnostic `'break' is only
+allowed inside a loop` or `'continue' is only allowed inside a loop`. A lambda is a new
+function boundary, so loop control in its body cannot bind a loop surrounding the lambda
+expression.
+
+The compiler lowers both statements to ordinary `Jump` instructions through a stack of
+loop patch contexts. Break targets the first instruction after its loop. While-continue
+targets the condition header. Range-, array-, and map-continue target the four-instruction
+hidden-index increment preamble (`LoadLocal`, `ConstantI64 1`, `AddI64`, `StoreLocal`),
+whose backedge then reaches the loop header. The map header performs its entry-count
+mutation check before the next bounds check or positional read, so continue cannot bypass
+the insertion trap. A literal-`true` while omits the condition and false edge entirely;
+this lets its post-loop state be derived solely from reachable breaks.
+
+Type flow keeps the existing `FlowState` value and initialization lattice. A block has an
+optional fallthrough state: break contributes its incoming state to the loop-exit set,
+continue contributes its incoming state to the backedge set, and either ends that path.
+Statements lexically following an unconditional terminator are accepted but excluded from
+flow joins and bytecode emission. `if` joins only branches that fall through. At a loop
+fixed point, body fallthrough plus continue states join into the header; break states plus
+the ordinary condition/trip-count exhaustion state join after the loop. For-in always has
+the zero-iteration exhaustion edge. A literal-true while has no exhaustion edge, so a
+value assigned or refined on every break path remains initialized/refined afterward,
+while a missing assignment on any break path is conservatively rejected by the existing
+lattice.
+
+The verifier receives no loop-specific rule or reason code. Every new edge goes through
+the existing target validation, stack-height equality, definite-local intersection,
+abstract-value join, reachability check, fixpoint worklist, and generated-stack-map path.
+Hidden loop locals keep their iteration-28 slots and reference categories. Consequently a
+collection at a break-exit pc or continue-increment pc sees the exact same ordinary local
+root vector the verifier proved for that target.
+
 ## Consequences
 
 - For-in adds no object descriptor, allocation path, strong or weak edge category, write
@@ -57,14 +92,15 @@ container snapshot a loud precise-root boundary rather than relying only on dyna
   leak into following source statements, and nested loops receive distinct local slots.
 - Compiler-produced loops remain subject to ordinary jump, initialized-local, type,
   compile-boundary agreement, and exact stack-map checks.
-- The iteration-28 fuzzer is isolated from all legacy generators and provides pinned source,
-  schedule replay, nesting, and positioned mutant classes.
+- The iteration-28 fuzzer remains isolated from all legacy generators. Iteration 30
+  deliberately updates only its pin to mix both loop-control statements with all loop
+  forms, heap-graph and output oracles, schedule replay, nesting, and positioned mutants.
 
 ## Deferred work
 
-`break` and `continue` are future work. They require explicit lowering rules for cleanup,
-backedge targets, fixed-point flow, and stack-map boundaries and are not inferred from the
-current statement forms.
+Labeled loops and labeled `break`/`continue` remain future work. Adding them requires an
+explicit label namespace and target-resolution rules; unlabeled nearest-loop binding is
+not generalized implicitly.
 
 ## Rejected alternatives
 

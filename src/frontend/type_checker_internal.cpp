@@ -254,9 +254,7 @@ public:
         auto* previous_local_context = local_context_;
         local_context_ = &entry_context;
         state_ = initial_state();
-        for (auto& statement : program.statements) {
-            check_statement(statement, state_, true);
-        }
+        (void)check_block(program.statements, state_, true);
         const auto result = check_expr(*program.result, state_);
         if (result.type.kind == TypeSpec::Kind::Nil) {
             diagnose(program.result->position,
@@ -290,6 +288,11 @@ private:
         FlowState* outer_state{nullptr};
         LambdaExpr* lambda{nullptr};
         CaptureContext* parent{nullptr};
+    };
+
+    struct LoopFlowContext {
+        std::vector<FlowState> break_states;
+        std::vector<FlowState> continue_states;
     };
 
     FlowState initial_state() const {
@@ -422,9 +425,7 @@ private:
                 value_from_type(parameter.type), parameter.position);
         }
 
-        for (auto& statement : function.statements) {
-            check_statement(statement, state, true);
-        }
+        (void)check_block(function.statements, state, true);
         const auto result = check_expr(*function.result, state);
         if (!is_invalid(result.type) &&
             !value_conforms_to_type(result, function.return_type, state)) {
@@ -776,23 +777,24 @@ private:
                value_conforms_to_type(*right, *target.right, state, assumptions);
     }
 
-    void check_statement(Statement& statement, FlowState& state, bool allow_let) {
+    bool check_statement(Statement& statement, FlowState& state, bool allow_let) {
         switch (statement.kind) {
         case Statement::Kind::Let:
             check_let(statement, state, allow_let);
-            break;
+            return true;
         case Statement::Kind::Assign:
             check_assignment(statement, state);
-            break;
+            return true;
         case Statement::Kind::If:
-            check_if(statement, state);
-            break;
+            return check_if(statement, state);
         case Statement::Kind::While:
-            check_while(statement, state);
-            break;
+            return check_while(statement, state);
         case Statement::Kind::ForIn:
             check_for_in(statement, state);
-            break;
+            return true;
+        case Statement::Kind::Break:
+        case Statement::Kind::Continue:
+            return check_loop_control(statement, state);
         case Statement::Kind::Print: {
             const auto value = check_expr(*statement.value, state);
             if (!is_invalid(value.type) &&
@@ -802,9 +804,40 @@ private:
                              ? "print requires non-nil str"
                              : "print expects str");
             }
-            break;
+            return true;
         }
         }
+        return true;
+    }
+
+    bool check_block(std::vector<Statement>& statements, FlowState& state,
+                     bool allow_let) {
+        bool falls_through = true;
+        for (auto& statement : statements) {
+            if (!falls_through) {
+                break;
+            }
+            falls_through = check_statement(statement, state, allow_let);
+        }
+        return falls_through;
+    }
+
+    bool check_loop_control(const Statement& statement,
+                            const FlowState& state) {
+        if (loop_contexts_.empty()) {
+            diagnose(statement.position,
+                     statement.kind == Statement::Kind::Break
+                         ? "'break' is only allowed inside a loop"
+                         : "'continue' is only allowed inside a loop");
+            return true;
+        }
+        auto& context = *loop_contexts_.back();
+        if (statement.kind == Statement::Kind::Break) {
+            context.break_states.push_back(state);
+        } else {
+            context.continue_states.push_back(state);
+        }
+        return false;
     }
 
     void check_let(Statement& statement, FlowState& state, bool allow_let) {
@@ -969,7 +1002,7 @@ private:
         store_field(receiver, field.name, assigned, state);
     }
 
-    void check_if(Statement& statement, FlowState& state) {
+    bool check_if(Statement& statement, FlowState& state) {
         const auto condition = check_expr(*statement.condition, state);
         if (!is_invalid(condition.type) && condition.type != bool_type()) {
             diagnose(statement.condition->position, "if condition must be bool");
@@ -978,20 +1011,25 @@ private:
         auto then_state = state;
         auto else_state = state;
         refine_is_nil_condition(*statement.condition, then_state, else_state);
-        for (auto& inner : statement.then_branch) {
-            check_statement(inner, then_state, false);
-        }
+        const bool then_falls =
+            check_block(statement.then_branch, then_state, false);
         sync_locals(then_state);
         sync_locals(else_state);
-        for (auto& inner : statement.else_branch) {
-            check_statement(inner, else_state, false);
-        }
+        const bool else_falls =
+            check_block(statement.else_branch, else_state, false);
         sync_locals(then_state);
         sync_locals(else_state);
-        state = join_states(then_state, else_state);
+        if (then_falls && else_falls) {
+            state = join_states(then_state, else_state);
+        } else if (then_falls) {
+            state = std::move(then_state);
+        } else if (else_falls) {
+            state = std::move(else_state);
+        }
+        return then_falls || else_falls;
     }
 
-    void check_while(Statement& statement, FlowState& state) {
+    bool check_while(Statement& statement, FlowState& state) {
         FlowState head = state;
         for (std::size_t iteration = 0; iteration < max_loop_iterations(state); ++iteration) {
             auto body_input = head;
@@ -1001,21 +1039,52 @@ private:
             }
 
             auto body_output = body_input;
-            for (auto& inner : statement.body) {
-                check_statement(inner, body_output, false);
-            }
+            LoopFlowContext loop;
+            loop_contexts_.push_back(&loop);
+            const bool body_falls =
+                check_block(statement.body, body_output, false);
+            loop_contexts_.pop_back();
 
             sync_locals(head);
             sync_locals(body_output);
-            auto joined = join_states(head, body_output);
+            for (auto& continued : loop.continue_states) {
+                sync_locals(continued);
+            }
+            for (auto& broken : loop.break_states) {
+                sync_locals(broken);
+            }
+
+            auto joined = head;
+            if (body_falls) {
+                joined = join_states(joined, body_output);
+            }
+            for (const auto& continued : loop.continue_states) {
+                joined = join_states(joined, continued);
+            }
             if (joined == head) {
-                state = joined;
-                return;
+                const bool condition_is_true_literal =
+                    statement.condition->kind == Expr::Kind::BoolLiteral &&
+                    statement.condition->bool_value;
+                std::optional<FlowState> exit;
+                if (!condition_is_true_literal) {
+                    exit = head;
+                }
+                for (const auto& broken : loop.break_states) {
+                    exit = exit.has_value() ? join_states(*exit, broken)
+                                            : std::optional<FlowState>(broken);
+                }
+                if (exit.has_value()) {
+                    state = std::move(*exit);
+                    return true;
+                }
+                state = std::move(joined);
+                return false;
             }
             head = std::move(joined);
         }
         diagnose(statement.position, "while type state did not reach a fixed point");
         state = std::move(head);
+        return true;
     }
 
     bool loop_name_conflicts(const Statement& statement, std::size_t name_index,
@@ -1174,15 +1243,41 @@ private:
              iteration < max_loop_iterations(state); ++iteration) {
             auto body_output = head;
             activate_loop_locals(statement, body_output, variable_values);
-            for (auto& inner : statement.body) {
-                check_statement(inner, body_output, false);
+            LoopFlowContext loop;
+            loop_contexts_.push_back(&loop);
+            const bool body_falls =
+                check_block(statement.body, body_output, false);
+            loop_contexts_.pop_back();
+            if (body_falls) {
+                deactivate_loop_locals(statement, body_output);
             }
-            deactivate_loop_locals(statement, body_output);
+            for (auto& continued : loop.continue_states) {
+                deactivate_loop_locals(statement, continued);
+            }
+            for (auto& broken : loop.break_states) {
+                deactivate_loop_locals(statement, broken);
+            }
             sync_locals(head);
             sync_locals(body_output);
-            auto joined = join_states(head, body_output);
+            for (auto& continued : loop.continue_states) {
+                sync_locals(continued);
+            }
+            for (auto& broken : loop.break_states) {
+                sync_locals(broken);
+            }
+            auto joined = head;
+            if (body_falls) {
+                joined = join_states(joined, body_output);
+            }
+            for (const auto& continued : loop.continue_states) {
+                joined = join_states(joined, continued);
+            }
             if (joined == head) {
-                state = std::move(joined);
+                auto exit = head;
+                for (const auto& broken : loop.break_states) {
+                    exit = join_states(exit, broken);
+                }
+                state = std::move(exit);
                 return;
             }
             head = std::move(joined);
@@ -1344,10 +1439,11 @@ private:
         CaptureContext context{&outer_state, &lambda, capture_context_};
         auto* previous_context = capture_context_;
         capture_context_ = &context;
-        for (auto& statement : lambda.statements) {
-            check_statement(statement, state, true);
-        }
+        auto outer_loop_contexts = std::move(loop_contexts_);
+        loop_contexts_.clear();
+        (void)check_block(lambda.statements, state, true);
         const auto result = check_expr(*lambda.result, state);
+        loop_contexts_ = std::move(outer_loop_contexts);
         capture_context_ = previous_context;
 
         if (!is_invalid(result.type) &&
@@ -1918,6 +2014,7 @@ private:
     std::vector<FunctionSymbol> functions_;
     CaptureContext* capture_context_{nullptr};
     LocalContext* local_context_{nullptr};
+    std::vector<LoopFlowContext*> loop_contexts_;
     std::vector<Diagnostic> diagnostics_;
 };
 

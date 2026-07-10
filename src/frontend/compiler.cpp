@@ -106,6 +106,57 @@ bool operator==(const ArrayOpcodeCounts& lhs, const ArrayOpcodeCounts& rhs) {
 
 void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts);
 
+bool add_statement_array_counts(const Statement& statement,
+                                ArrayOpcodeCounts& counts);
+
+std::pair<bool, bool> block_fallthrough_and_current_break(
+    const std::vector<Statement>& statements) {
+    bool falls_through = true;
+    bool has_break = false;
+    for (const auto& statement : statements) {
+        if (!falls_through) {
+            break;
+        }
+        switch (statement.kind) {
+        case Statement::Kind::Break:
+            has_break = true;
+            falls_through = false;
+            break;
+        case Statement::Kind::Continue:
+            falls_through = false;
+            break;
+        case Statement::Kind::If: {
+            const auto then_flow =
+                block_fallthrough_and_current_break(statement.then_branch);
+            const auto else_flow =
+                block_fallthrough_and_current_break(statement.else_branch);
+            has_break = has_break || then_flow.second || else_flow.second;
+            falls_through = then_flow.first || else_flow.first;
+            break;
+        }
+        case Statement::Kind::Let:
+        case Statement::Kind::Assign:
+        case Statement::Kind::While:
+        case Statement::Kind::ForIn:
+        case Statement::Kind::Print:
+            break;
+        }
+    }
+    return {falls_through, has_break};
+}
+
+bool add_block_array_counts(const std::vector<Statement>& statements,
+                            ArrayOpcodeCounts& counts) {
+    bool falls_through = true;
+    for (const auto& statement : statements) {
+        if (!falls_through) {
+            break;
+        }
+        falls_through = add_statement_array_counts(statement, counts);
+    }
+    return falls_through;
+}
+
 void add_lvalue_prefix_array_counts(const LValue& lvalue,
                                     std::size_t step_count,
                                     ArrayOpcodeCounts& counts) {
@@ -125,12 +176,12 @@ void add_lvalue_prefix_array_counts(const LValue& lvalue,
     }
 }
 
-void add_statement_array_counts(const Statement& statement,
+bool add_statement_array_counts(const Statement& statement,
                                 ArrayOpcodeCounts& counts) {
     switch (statement.kind) {
     case Statement::Kind::Let:
         add_expr_array_counts(*statement.initializer, counts);
-        break;
+        return true;
     case Statement::Kind::Assign:
         add_expr_array_counts(*statement.value, counts);
         if (!statement.target.steps.empty()) {
@@ -151,30 +202,28 @@ void add_statement_array_counts(const Statement& statement,
                 }
             }
         }
-        break;
+        return true;
     case Statement::Kind::If:
         add_expr_array_counts(*statement.condition, counts);
-        for (const auto& inner : statement.then_branch) {
-            add_statement_array_counts(inner, counts);
+        {
+            const bool then_falls =
+                add_block_array_counts(statement.then_branch, counts);
+            const bool else_falls =
+                add_block_array_counts(statement.else_branch, counts);
+            return then_falls || else_falls;
         }
-        for (const auto& inner : statement.else_branch) {
-            add_statement_array_counts(inner, counts);
-        }
-        break;
     case Statement::Kind::While:
         add_expr_array_counts(*statement.condition, counts);
-        for (const auto& inner : statement.body) {
-            add_statement_array_counts(inner, counts);
-        }
-        break;
+        (void)add_block_array_counts(statement.body, counts);
+        return statement.condition->kind != Expr::Kind::BoolLiteral ||
+               !statement.condition->bool_value ||
+               block_fallthrough_and_current_break(statement.body).second;
     case Statement::Kind::ForIn:
         add_expr_array_counts(*statement.iterable, counts);
         if (statement.range_upper != nullptr) {
             add_expr_array_counts(*statement.range_upper, counts);
         }
-        for (const auto& inner : statement.body) {
-            add_statement_array_counts(inner, counts);
-        }
+        (void)add_block_array_counts(statement.body, counts);
         if (statement.range_upper == nullptr &&
             statement.iterable->inferred_type.kind == TypeSpec::Kind::Array) {
             if (is_ref_array_type(statement.iterable->inferred_type)) {
@@ -183,11 +232,15 @@ void add_statement_array_counts(const Statement& statement,
                 ++counts.get_scalar;
             }
         }
-        break;
+        return true;
+    case Statement::Kind::Break:
+    case Statement::Kind::Continue:
+        return false;
     case Statement::Kind::Print:
         add_expr_array_counts(*statement.value, counts);
-        break;
+        return true;
     }
+    return true;
 }
 
 void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
@@ -201,10 +254,9 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
         return;
     case Expr::Kind::Lambda:
         assert(expression.lambda != nullptr);
-        for (const auto& statement : expression.lambda->statements) {
-            add_statement_array_counts(statement, counts);
+        if (add_block_array_counts(expression.lambda->statements, counts)) {
+            add_expr_array_counts(*expression.lambda->result, counts);
         }
-        add_expr_array_counts(*expression.lambda->result, counts);
         return;
     case Expr::Kind::PairLiteral:
     case Expr::Kind::Binary:
@@ -277,15 +329,13 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
 
 ArrayOpcodeCounts expected_array_opcode_counts(const Program& program) {
     ArrayOpcodeCounts counts;
-    for (const auto& statement : program.statements) {
-        add_statement_array_counts(statement, counts);
+    if (add_block_array_counts(program.statements, counts)) {
+        add_expr_array_counts(*program.result, counts);
     }
-    add_expr_array_counts(*program.result, counts);
     for (const auto& function : program.functions) {
-        for (const auto& statement : function.statements) {
-            add_statement_array_counts(statement, counts);
+        if (add_block_array_counts(function.statements, counts)) {
+            add_expr_array_counts(*function.result, counts);
         }
-        add_expr_array_counts(*function.result, counts);
     }
     return counts;
 }
@@ -361,14 +411,20 @@ public:
     }
 
     Function compile(const std::vector<Statement>& statements, const Expr& result) {
+        bool falls_through = true;
         for (const auto& statement : statements) {
-            compile_statement(statement);
+            if (!falls_through) {
+                break;
+            }
+            falls_through = compile_statement(statement);
         }
-        compile_expr(result);
-        // Verifier accommodation: source programs always end in a final expression, and
-        // the compiler emits an explicit Return immediately after it so bytecode cannot
-        // fall off the end.
-        emit(OpCode::Return, 0);
+        if (falls_through) {
+            compile_expr(result);
+            // Verifier accommodation: source programs always end in a final expression,
+            // and the compiler emits an explicit Return immediately after it so bytecode cannot
+            // fall off the end.
+            emit(OpCode::Return, 0);
+        }
         return function_;
     }
 
@@ -390,7 +446,23 @@ private:
         return function_.local_count++;
     }
 
-    void compile_statement(const Statement& statement) {
+    struct LoopPatchContext {
+        std::vector<std::size_t> breaks;
+        std::vector<std::size_t> continues;
+    };
+
+    bool compile_block(const std::vector<Statement>& statements) {
+        bool falls_through = true;
+        for (const auto& statement : statements) {
+            if (!falls_through) {
+                break;
+            }
+            falls_through = compile_statement(statement);
+        }
+        return falls_through;
+    }
+
+    bool compile_statement(const Statement& statement) {
         switch (statement.kind) {
         case Statement::Kind::Let:
             // Verifier accommodation: every source local is introduced by a top-level
@@ -398,24 +470,35 @@ private:
             // LoadLocal can be emitted for that local.
             compile_expr(*statement.initializer);
             emit(OpCode::StoreLocal, statement.local_index);
-            break;
+            return true;
         case Statement::Kind::Assign:
             compile_assignment(statement);
-            break;
+            return true;
         case Statement::Kind::If:
-            compile_if(statement);
-            break;
+            return compile_if(statement);
         case Statement::Kind::While:
-            compile_while(statement);
-            break;
+            return compile_while(statement);
         case Statement::Kind::ForIn:
             compile_for_in(statement);
-            break;
+            return true;
+        case Statement::Kind::Break:
+        case Statement::Kind::Continue: {
+            assert(!loop_contexts_.empty() &&
+                   "type checker must reject loop control outside loops");
+            const auto jump = emit(OpCode::Jump, -1);
+            if (statement.kind == Statement::Kind::Break) {
+                loop_contexts_.back()->breaks.push_back(jump);
+            } else {
+                loop_contexts_.back()->continues.push_back(jump);
+            }
+            return false;
+        }
         case Statement::Kind::Print:
             compile_expr(*statement.value);
             emit(OpCode::Print, 0);
-            break;
+            return true;
         }
+        return true;
     }
 
     void compile_assignment(const Statement& statement) {
@@ -449,35 +532,52 @@ private:
         emit(final_step.name == "left" ? OpCode::SetLeft : OpCode::SetRight, 0);
     }
 
-    void compile_if(const Statement& statement) {
+    bool compile_if(const Statement& statement) {
         compile_expr(*statement.condition);
         const auto jump_to_else = emit(OpCode::JumpIfFalse, -1);
-        for (const auto& inner : statement.then_branch) {
-            compile_statement(inner);
-        }
-        // Verifier accommodation: both branches must enter the merge with the same stack
-        // height. Source blocks are statements only, and this jump prevents then fallthrough
-        // from executing else bytecode while still making every emitted pc reachable.
-        const auto jump_to_end = emit(OpCode::Jump, -1);
+        const bool then_falls = compile_block(statement.then_branch);
+        const auto jump_to_end =
+            then_falls ? std::optional<std::size_t>(emit(OpCode::Jump, -1))
+                       : std::nullopt;
         const auto else_pc = pc();
         patch(jump_to_else, else_pc);
-        for (const auto& inner : statement.else_branch) {
-            compile_statement(inner);
+        const bool else_falls = compile_block(statement.else_branch);
+        if (jump_to_end.has_value()) {
+            patch(*jump_to_end, pc());
         }
-        patch(jump_to_end, pc());
+        return then_falls || else_falls;
     }
 
-    void compile_while(const Statement& statement) {
+    bool compile_while(const Statement& statement) {
+        const bool condition_is_true_literal =
+            statement.condition->kind == Expr::Kind::BoolLiteral &&
+            statement.condition->bool_value;
         const auto header = pc();
-        compile_expr(*statement.condition);
-        const auto jump_to_exit = emit(OpCode::JumpIfFalse, -1);
-        for (const auto& inner : statement.body) {
-            compile_statement(inner);
+        std::optional<std::size_t> jump_to_exit;
+        if (!condition_is_true_literal) {
+            compile_expr(*statement.condition);
+            jump_to_exit = emit(OpCode::JumpIfFalse, -1);
+        }
+        LoopPatchContext loop;
+        loop_contexts_.push_back(&loop);
+        const bool body_falls = compile_block(statement.body);
+        loop_contexts_.pop_back();
+        for (const auto continued : loop.continues) {
+            patch(continued, header);
         }
         // Verifier accommodation: loop bodies are stack-neutral and locals keep their
         // declared source type, matching the verifier's strict merge at the backedge.
-        emit(OpCode::Jump, static_cast<std::int64_t>(header));
-        patch(jump_to_exit, pc());
+        if (body_falls) {
+            emit(OpCode::Jump, static_cast<std::int64_t>(header));
+        }
+        const auto exit = pc();
+        if (jump_to_exit.has_value()) {
+            patch(*jump_to_exit, exit);
+        }
+        for (const auto broken : loop.breaks) {
+            patch(broken, exit);
+        }
+        return !condition_is_true_literal || !loop.breaks.empty();
     }
 
     void emit_increment_local(std::uint32_t local) {
@@ -508,12 +608,23 @@ private:
             const auto jump_to_exit = emit(OpCode::JumpIfFalse, -1);
             emit(OpCode::LoadLocal, index);
             emit(OpCode::StoreLocal, statement.loop_local_indices[0]);
-            for (const auto& inner : statement.body) {
-                compile_statement(inner);
+            LoopPatchContext loop;
+            loop_contexts_.push_back(&loop);
+            const bool body_falls = compile_block(statement.body);
+            loop_contexts_.pop_back();
+            const auto increment = pc();
+            for (const auto continued : loop.continues) {
+                patch(continued, increment);
             }
-            emit_increment_local(index);
-            emit(OpCode::Jump, static_cast<std::int64_t>(header));
-            patch(jump_to_exit, pc());
+            if (body_falls || !loop.continues.empty()) {
+                emit_increment_local(index);
+                emit(OpCode::Jump, static_cast<std::int64_t>(header));
+            }
+            const auto exit = pc();
+            patch(jump_to_exit, exit);
+            for (const auto broken : loop.breaks) {
+                patch(broken, exit);
+            }
             return;
         }
 
@@ -571,12 +682,23 @@ private:
             }
             emit(OpCode::StoreLocal, statement.loop_local_indices[0]);
         }
-        for (const auto& inner : statement.body) {
-            compile_statement(inner);
+        LoopPatchContext loop;
+        loop_contexts_.push_back(&loop);
+        const bool body_falls = compile_block(statement.body);
+        loop_contexts_.pop_back();
+        const auto increment = pc();
+        for (const auto continued : loop.continues) {
+            patch(continued, increment);
         }
-        emit_increment_local(index);
-        emit(OpCode::Jump, static_cast<std::int64_t>(header));
-        patch(jump_to_exit, pc());
+        if (body_falls || !loop.continues.empty()) {
+            emit_increment_local(index);
+            emit(OpCode::Jump, static_cast<std::int64_t>(header));
+        }
+        const auto exit = pc();
+        patch(jump_to_exit, exit);
+        for (const auto broken : loop.breaks) {
+            patch(broken, exit);
+        }
     }
 
     void compile_expr(const Expr& expression) {
@@ -860,6 +982,7 @@ private:
     }
 
     Function function_;
+    std::vector<LoopPatchContext*> loop_contexts_;
     std::vector<std::string>& string_constants_;
     std::vector<MapLayout>& map_layouts_;
 };

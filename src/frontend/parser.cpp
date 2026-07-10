@@ -399,7 +399,8 @@ private:
 
     [[nodiscard]] bool starts_statement() const {
         if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While) ||
-            check(TokenKind::For) || check(TokenKind::Print)) {
+            check(TokenKind::For) || check(TokenKind::Break) ||
+            check(TokenKind::Continue) || check(TokenKind::Print)) {
             return true;
         }
         return assignment_ahead();
@@ -447,6 +448,14 @@ private:
         }
         if (match(TokenKind::For)) {
             return parse_for_in(previous());
+        }
+        if (match(TokenKind::Break)) {
+            return parse_loop_control(previous(), Statement::Kind::Break,
+                                      "expected ';' after 'break'");
+        }
+        if (match(TokenKind::Continue)) {
+            return parse_loop_control(previous(), Statement::Kind::Continue,
+                                      "expected ';' after 'continue'");
         }
         if (match(TokenKind::Print)) {
             return parse_print(previous());
@@ -634,6 +643,16 @@ private:
         statement.value = parse_expression();
         expect(TokenKind::RParen, "expected ')' after print operand");
         expect(TokenKind::Semicolon, "expected ';' after print statement");
+        return statement;
+    }
+
+    std::optional<Statement> parse_loop_control(
+        const Token& keyword, Statement::Kind kind,
+        const std::string& semicolon_message) {
+        Statement statement;
+        statement.kind = kind;
+        statement.position = keyword.position;
+        expect(TokenKind::Semicolon, semicolon_message);
         return statement;
     }
 
