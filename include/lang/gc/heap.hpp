@@ -42,6 +42,32 @@ struct HeapMetrics {
     std::uint64_t write_barrier_hits{0};
     std::uint64_t remembered_set_peak{0};
     std::uint64_t heap_peak_slots{0};
+    std::uint64_t map_lookup_entries_examined{0};
+    std::uint64_t map_descriptor_entries_scanned{0};
+    std::uint64_t closure_capture_slots_scanned{0};
+    std::uint64_t weak_targets_processed{0};
+    std::uint64_t weak_targets_forwarded{0};
+    std::uint64_t weak_targets_cleared{0};
+    std::uint64_t major_weak_targets_forwarded{0};
+    std::uint64_t major_weak_targets_cleared{0};
+    std::uint64_t minor_weak_targets_forwarded{0};
+    std::uint64_t minor_weak_targets_cleared{0};
+    std::uint64_t allocation_candidate_slots_examined{0};
+    std::uint64_t allocation_storage_slots_checked{0};
+    std::uint64_t storage_occupancy_headers_examined{0};
+    std::uint64_t heap_layout_objects_checked{0};
+    std::uint64_t heap_layout_slots_checked{0};
+    std::uint64_t remembered_set_entries_checked{0};
+    std::uint64_t remembered_set_heap_slots_examined{0};
+    std::uint64_t remembered_set_reference_fields_checked{0};
+    std::uint64_t compaction_objects_copied{0};
+    std::uint64_t compaction_pair_bytes{0};
+    std::uint64_t compaction_scalar_array_bytes{0};
+    std::uint64_t compaction_ref_array_bytes{0};
+    std::uint64_t compaction_string_bytes{0};
+    std::uint64_t compaction_closure_bytes{0};
+    std::uint64_t compaction_map_bytes{0};
+    std::uint64_t compaction_weak_ref_bytes{0};
 };
 
 enum class ObjectGeneration {
@@ -282,7 +308,8 @@ private:
     void rewrite_value(Value& value, const ForwardingTable& forwarding) const;
     [[nodiscard]] std::vector<ObjectId> process_weak_targets(
         const ForwardingTable& forwarding,
-        std::vector<std::optional<Object>>& moved_objects) const;
+        std::vector<std::optional<Object>>& moved_objects,
+        std::optional<CollectionKind> collection_kind) const;
     [[nodiscard]] std::vector<ObjectId> rewrite_remembered_set(
         const ForwardingTable& forwarding) const;
     void prune_remembered_set();
@@ -300,7 +327,9 @@ private:
     std::vector<ObjectId> remembered_set_;
     std::vector<ObjectId> weak_refs_;
     std::vector<Value*> handle_roots_;
-    HeapMetrics metrics_{};
+    // Performance metrics are passive observations, including logically-const
+    // validation and lookup work. No metric participates in runtime control flow.
+    mutable HeapMetrics metrics_{};
     bool TEST_ONLY_skip_next_write_barrier_{false};
     mutable std::uint64_t TEST_ONLY_validation_count_{0};
 };
