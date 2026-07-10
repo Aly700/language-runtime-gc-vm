@@ -16,6 +16,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
         return ValueKind::Int64;
     case TypeSpec::Kind::Bool:
         return ValueKind::Bool;
+    case TypeSpec::Kind::Str:
+        return ValueKind::Str;
     case TypeSpec::Kind::Pair:
     case TypeSpec::Kind::Named:
         return ValueKind::Object;
@@ -134,6 +136,7 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     switch (expression.kind) {
     case Expr::Kind::IntLiteral:
     case Expr::Kind::BoolLiteral:
+    case Expr::Kind::StringLiteral:
     case Expr::Kind::NilLiteral:
     case Expr::Kind::Variable:
         return;
@@ -168,6 +171,9 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::ArrayIndex:
         add_expr_array_counts(*expression.receiver, counts);
         add_expr_array_counts(*expression.left, counts);
+        if (expression.receiver->inferred_type.kind == TypeSpec::Kind::Str) {
+            return;
+        }
         if (is_ref_array_type(expression.receiver->inferred_type)) {
             ++counts.get_ref;
         } else {
@@ -253,7 +259,9 @@ FunctionSignature signature_from_types(const std::vector<Parameter>& parameters,
 
 class Compiler {
 public:
-    Compiler(std::uint32_t local_count, FunctionSignature signature) {
+    Compiler(std::uint32_t local_count, FunctionSignature signature,
+             std::vector<std::string>& string_constants)
+        : string_constants_(string_constants) {
         function_.signature = std::move(signature);
         function_.local_count = local_count;
     }
@@ -374,6 +382,15 @@ private:
         case Expr::Kind::BoolLiteral:
             compile_bool_literal(expression.bool_value);
             break;
+        case Expr::Kind::StringLiteral:
+            assert(string_constants_.size() <=
+                       static_cast<std::size_t>(
+                           std::numeric_limits<std::int64_t>::max()) &&
+                   "module string constant pool index exceeds bytecode operand range");
+            emit(OpCode::PushStr,
+                 static_cast<std::int64_t>(string_constants_.size()));
+            string_constants_.push_back(expression.string_value);
+            break;
         case Expr::Kind::NilLiteral:
             emit(OpCode::Nil, 0);
             break;
@@ -396,12 +413,27 @@ private:
             break;
         case Expr::Kind::ArrayLen:
             compile_expr(*expression.receiver);
-            emit(OpCode::ArrayLen, 0);
+            emit(expression.receiver->inferred_type.kind == TypeSpec::Kind::Str
+                     ? OpCode::StrLen
+                     : OpCode::ArrayLen,
+                 0);
             break;
         case Expr::Kind::Binary:
             compile_expr(*expression.left);
             compile_expr(*expression.right);
-            emit(expression.binary_op == '+' ? OpCode::AddI64 : OpCode::LessI64, 0);
+            if (expression.binary_op == '+') {
+                emit(expression.left->inferred_type.kind == TypeSpec::Kind::Str
+                         ? OpCode::StrConcat
+                         : OpCode::AddI64,
+                     0);
+            } else if (expression.binary_op == '<') {
+                emit(OpCode::LessI64, 0);
+            } else {
+                emit(OpCode::StrEq, 0);
+                if (expression.binary_op == '!') {
+                    invert_bool_on_stack();
+                }
+            }
             break;
         case Expr::Kind::Field:
             compile_expr(*expression.receiver);
@@ -427,6 +459,15 @@ private:
         emit(OpCode::ConstantI64, value ? 0 : 1);
         emit(OpCode::ConstantI64, value ? 1 : 0);
         emit(OpCode::LessI64, 0);
+    }
+
+    void invert_bool_on_stack() {
+        const auto jump_to_true = emit(OpCode::JumpIfFalse, -1);
+        compile_bool_literal(false);
+        const auto jump_to_end = emit(OpCode::Jump, -1);
+        patch(jump_to_true, pc());
+        compile_bool_literal(true);
+        patch(jump_to_end, pc());
     }
 
     void compile_bool_as_scalar_storage(const Expr& expression) {
@@ -488,11 +529,15 @@ private:
     }
 
     void compile_array_index(const Expr& expression) {
-        assert(expression.receiver != nullptr &&
-               expression.receiver->inferred_type.kind == TypeSpec::Kind::Array &&
-               expression.receiver->inferred_type.element != nullptr);
+        assert(expression.receiver != nullptr);
         compile_expr(*expression.receiver);
         compile_expr(*expression.left);
+        if (expression.receiver->inferred_type.kind == TypeSpec::Kind::Str) {
+            emit(OpCode::StrIndex, 0);
+            return;
+        }
+        assert(expression.receiver->inferred_type.kind == TypeSpec::Kind::Array &&
+               expression.receiver->inferred_type.element != nullptr);
         const auto& element_type = *expression.receiver->inferred_type.element;
         emit(is_scalar_array_element_type(element_type) ? OpCode::ArrayGet
                                                         : OpCode::RefArrayGet,
@@ -520,6 +565,7 @@ private:
     }
 
     Function function_;
+    std::vector<std::string>& string_constants_;
 };
 
 } // namespace
@@ -536,18 +582,25 @@ CompileModuleResult compile_checked_program(const Program& program,
     }
     module.functions.reserve(program.functions.size() + 1);
 
-    FunctionSignature entry_signature;
-    entry_signature.return_type = bytecode_kind(result_type);
-    entry_signature.return_type_detail = signature_value_from_type(result_type);
-    Compiler entry_compiler(program.entry_local_count, std::move(entry_signature));
-    module.functions.push_back(entry_compiler.compile(program.statements, *program.result));
-
+    std::vector<Function> compiled_functions;
+    compiled_functions.reserve(program.functions.size());
     for (const auto& declaration : program.functions) {
         Compiler function_compiler(declaration.local_count,
                                    signature_from_types(declaration.parameters,
-                                                        declaration.return_type));
-        module.functions.push_back(
+                                                        declaration.return_type),
+                                   module.string_constants);
+        compiled_functions.push_back(
             function_compiler.compile(declaration.statements, *declaration.result));
+    }
+
+    FunctionSignature entry_signature;
+    entry_signature.return_type = bytecode_kind(result_type);
+    entry_signature.return_type_detail = signature_value_from_type(result_type);
+    Compiler entry_compiler(program.entry_local_count, std::move(entry_signature),
+                            module.string_constants);
+    module.functions.push_back(entry_compiler.compile(program.statements, *program.result));
+    for (auto& function : compiled_functions) {
+        module.functions.push_back(std::move(function));
     }
 
     assert(expected_array_opcode_counts(program) == actual_array_opcode_counts(module) &&

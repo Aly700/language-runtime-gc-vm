@@ -27,7 +27,8 @@ Implementation details:
   map for the current pc agrees with the runtime stack's object tags before collecting.
 - Every stress-triggered major or minor collection runs the same root/field/reference and
   remembered-set validation as explicit collection. The after-barrier mode specifically
-  protects the invariant that old-to-young stores cannot bypass `Heap::store_pair_field`.
+  protects the invariant that old-to-young stores cannot bypass `Heap::store_pair_field`
+  or `Heap::store_ref_array_element`. Immutable strings have no barrier trigger.
 
 ## Differential GC-timing fuzzing
 
@@ -85,10 +86,11 @@ The oracle executes the same generated program under every schedule and compares
 observable return value to `no_stress`. Scalar returns compare by tag and value. Object
 returns compare a canonical deep graph serialization from the returned object: traversal
 assigns schedule-local node numbers in descriptor order, records pair fields and scalar
-array raw elements, records RefArray element references, and preserves sharing and cycles
-through repeated node references instead of comparing `ObjectId` values. Raw array
-elements are printed as integers only; they are never interpreted as references by the
-oracle or collector. Any divergence, verifier rejection, unexpected trap, stale id, or GC
+array raw elements, records RefArray element references, renders immutable string bytes as
+fixed-width hexadecimal, and preserves sharing and cycles through repeated node references
+instead of comparing `ObjectId` values. Raw array elements and string bytes are never
+interpreted as references by the oracle or collector. Any divergence, verifier rejection,
+unexpected trap, stale id, or GC
 validator failure prints the seed, schedule, full bytecode listing, and a one-line replay
 command.
 
@@ -181,6 +183,13 @@ The array positive corpus also runs seeds `1..48` across all 10 schedules, addin
 480 executions per CTest run. It has its own pinned seed-`17` snapshot; the legacy and
 recursive snapshots are unchanged.
 
+Iteration 23 adds a fourth source grammar, selected in replay as `strings`. It emits
+deterministic programs with immutable escaped/empty literals, string parameters and
+returns, loop-carried concat allocation, structural `==`/`!=`, byte `.len`, in-bounds byte
+indexing, and string/bool/i64 result variants. The string positive corpus runs seeds
+`1..48` across all 10 schedules for another 480 executions and has its own pinned seed-17
+snapshot.
+
 The negative corpus checks the frontend gate with deterministic mutations of generated
 legacy sources. Seeds `1..12` are each mutated three ways:
 
@@ -204,8 +213,16 @@ The array grammar adds four mutation operators over seeds `1..12`:
 - read `.len` from an `i64`.
 - index an `i64` as if it were an array.
 
+The strings grammar adds five mutation operators over seeds `1..12`:
+
+- mix `str` and `i64` operands for `+`.
+- compare a `str` and `i64` with `==`.
+- use a bool string index.
+- index an `i64` with an i64 index.
+- attempt indexed assignment into an immutable string.
+
 Each mutant must reject with at least one diagnostic and must not crash the frontend. The
-combined source-level CTest run now covers 1440 positive executions and 132 negative
+combined source-level CTest run now covers 1920 positive executions and 192 negative
 frontend-rejection checks.
 
 Replay a positive source finding with:
@@ -226,6 +243,12 @@ Replay a positive array-source finding with:
 ./build/lang_iteration10_source_fuzz --grammar array --seed <uint64> --schedule <schedule-name>
 ```
 
+Replay a positive string-source finding with:
+
+```bash
+./build/lang_iteration10_source_fuzz --grammar strings --seed <uint64> --schedule <schedule-name>
+```
+
 Replay a negative mutant check with:
 
 ```bash
@@ -244,10 +267,17 @@ Replay an array negative mutant check with:
 ./build/lang_iteration10_source_fuzz --grammar array --seed <uint64> --mutant <0..3>
 ```
 
+Replay a string negative mutant check with:
+
+```bash
+./build/lang_iteration10_source_fuzz --grammar strings --seed <uint64> --mutant <0..4>
+```
+
 Dump either source corpus for byte-identity checks with:
 
 ```bash
 ./build/lang_iteration10_source_fuzz --dump-corpus legacy
 ./build/lang_iteration10_source_fuzz --dump-corpus recursive
 ./build/lang_iteration10_source_fuzz --dump-corpus array
+./build/lang_iteration10_source_fuzz --dump-corpus strings
 ```

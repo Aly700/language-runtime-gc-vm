@@ -89,11 +89,12 @@ bool is_scalar_array_element_type(const TypeSpec& type) {
 
 bool is_reference_array_element_type(const TypeSpec& type) {
     return type.kind == TypeSpec::Kind::Pair || type.kind == TypeSpec::Kind::Named ||
-           type.kind == TypeSpec::Kind::Array;
+           type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str;
 }
 
 bool is_known_nonnil_reference(const TypedValue& value) {
-    if (value.type.kind == TypeSpec::Kind::Array) {
+    if (value.type.kind == TypeSpec::Kind::Array ||
+        value.type.kind == TypeSpec::Kind::Str) {
         return true;
     }
     return is_pair(value.type) && value.type.kind != TypeSpec::Kind::Nil &&
@@ -555,7 +556,9 @@ private:
             nonnil.includes_nil = false;
             return value_conforms_to_type(nonnil, symbol->body, state, assumptions);
         }
-        if (target.kind == TypeSpec::Kind::Int64 || target.kind == TypeSpec::Kind::Bool) {
+        if (target.kind == TypeSpec::Kind::Int64 ||
+            target.kind == TypeSpec::Kind::Bool ||
+            target.kind == TypeSpec::Kind::Str) {
             return !value.includes_nil && value.type == target;
         }
         if (value.includes_nil || value.type.kind == TypeSpec::Kind::Nil) {
@@ -660,7 +663,14 @@ private:
         if (final_step.kind == LValueStep::Kind::Index) {
             const auto index = check_expr(*final_step.index, state);
             if (!is_invalid(index.type) && index.type != int64_type()) {
-                diagnose(final_step.index->position, "array index must be i64");
+                diagnose(final_step.index->position,
+                         receiver.type.kind == TypeSpec::Kind::Str
+                             ? "string index must be i64"
+                             : "array index must be i64");
+                return;
+            }
+            if (receiver.type.kind == TypeSpec::Kind::Str) {
+                diagnose(final_step.position, "string values are immutable");
                 return;
             }
             if (receiver.type.kind != TypeSpec::Kind::Array ||
@@ -776,6 +786,8 @@ private:
             return annotate(expression, scalar_value(int64_type()));
         case Expr::Kind::BoolLiteral:
             return annotate(expression, scalar_value(bool_type()));
+        case Expr::Kind::StringLiteral:
+            return annotate(expression, scalar_value(str_type()));
         case Expr::Kind::NilLiteral:
             return annotate(expression, nil_value());
         case Expr::Kind::Variable:
@@ -958,7 +970,18 @@ private:
         const auto receiver = check_expr(*expression.receiver, state);
         const auto index = check_expr(*expression.left, state);
         if (!is_invalid(index.type) && index.type != int64_type()) {
-            diagnose(expression.left->position, "array index must be i64");
+            diagnose(expression.left->position,
+                     receiver.type.kind == TypeSpec::Kind::Str
+                         ? "string index must be i64"
+                         : "array index must be i64");
+            return annotate(expression, invalid_value());
+        }
+        if (receiver.type.kind == TypeSpec::Kind::Str) {
+            return annotate(expression, scalar_value(int64_type()));
+        }
+        if (!is_invalid(receiver.type) &&
+            receiver.type.kind != TypeSpec::Kind::Array) {
+            diagnose(expression.position, "indexing requires array or str");
             return annotate(expression, invalid_value());
         }
         return annotate(expression, load_array_element(receiver, expression.position));
@@ -967,9 +990,10 @@ private:
     TypedValue check_array_len(Expr& expression, FlowState& state) {
         const auto receiver = check_expr(*expression.receiver, state);
         if (!is_invalid(receiver.type) &&
+            receiver.type.kind != TypeSpec::Kind::Str &&
             (receiver.type.kind != TypeSpec::Kind::Array ||
              receiver.type.element == nullptr)) {
-            diagnose(expression.position, "len requires array");
+            diagnose(expression.position, "len requires array or str");
             return annotate(expression, invalid_value());
         }
         return annotate(expression, scalar_value(int64_type()));
@@ -979,6 +1003,18 @@ private:
         const auto left = check_expr(*expression.left, state);
         const auto right = check_expr(*expression.right, state);
         if (expression.binary_op == '+') {
+            if (left.type == int64_type() && right.type == int64_type()) {
+                return annotate(expression, scalar_value(int64_type()));
+            }
+            if (left.type == str_type() && right.type == str_type()) {
+                return annotate(expression, scalar_value(str_type()));
+            }
+            if (left.type.kind == TypeSpec::Kind::Str ||
+                right.type.kind == TypeSpec::Kind::Str) {
+                diagnose(expression.operator_position,
+                         "operator '+' requires str + str or i64 + i64");
+                return annotate(expression, invalid_value());
+            }
             if ((!is_invalid(left.type) && left.type != int64_type()) ||
                 (!is_invalid(right.type) && right.type != int64_type())) {
                 diagnose(expression.operator_position, "operator '+' requires i64 operands");
@@ -990,6 +1026,16 @@ private:
             if ((!is_invalid(left.type) && left.type != int64_type()) ||
                 (!is_invalid(right.type) && right.type != int64_type())) {
                 diagnose(expression.operator_position, "operator '<' requires i64 operands");
+                return annotate(expression, invalid_value());
+            }
+            return annotate(expression, scalar_value(bool_type()));
+        }
+        if (expression.binary_op == '=' || expression.binary_op == '!') {
+            if ((!is_invalid(left.type) && left.type != str_type()) ||
+                (!is_invalid(right.type) && right.type != str_type())) {
+                const std::string operation = expression.binary_op == '=' ? "==" : "!=";
+                diagnose(expression.operator_position,
+                         "operator '" + operation + "' requires str operands");
                 return annotate(expression, invalid_value());
             }
             return annotate(expression, scalar_value(bool_type()));

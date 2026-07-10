@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstddef>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -161,6 +162,77 @@ Value VM::execute_verified(const Module& module,
             push(frame, Value::int64(ins.operand));
             ++frame.pc;
             break;
+        case OpCode::PushStr: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.string_constants.size() &&
+                   "verifier invariant violated: PushStr pool index must be in range");
+            const auto& constant =
+                module.string_constants[static_cast<std::size_t>(ins.operand)];
+            const auto bytes = std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(constant.data()),
+                constant.size());
+            push(frame, Value::object(heap_.allocate_string(bytes)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::StrLen: {
+            const auto receiver = pop(frame);
+            assert(receiver.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: StrLen receiver must be object");
+            const auto length = heap_.string_length(receiver.as_object());
+            assert(length <= static_cast<std::size_t>(
+                                 std::numeric_limits<std::int64_t>::max()) &&
+                   "string header length must fit in i64");
+            push(frame, Value::int64(static_cast<std::int64_t>(length)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::StrEq: {
+            const auto right = pop(frame);
+            const auto left = pop(frame);
+            assert(right.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: StrEq rhs must be object");
+            assert(left.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: StrEq lhs must be object");
+            push(frame, Value::boolean(
+                            heap_.string_equal(left.as_object(), right.as_object())));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::StrConcat: {
+            assert(frame.stack.size() >= 2 &&
+                   "verifier invariant violated: StrConcat requires two operands");
+            const auto left = frame.stack[frame.stack.size() - 2];
+            const auto right = frame.stack[frame.stack.size() - 1];
+            assert(right.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: StrConcat rhs must be object");
+            assert(left.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: StrConcat lhs must be object");
+            const auto result = heap_.allocate_string_concat(left, right);
+            (void)pop(frame);
+            (void)pop(frame);
+            push(frame, Value::object(result));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::StrIndex: {
+            const auto index_value = pop(frame);
+            const auto receiver = pop(frame);
+            assert(index_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: StrIndex index must be i64");
+            assert(receiver.tag() == Value::Tag::Object &&
+                   "verifier invariant violated: StrIndex receiver must be object");
+            const auto index = index_value.as_i64();
+            if (index < 0) {
+                throw std::out_of_range("string index out of bounds");
+            }
+            push(frame, Value::int64(static_cast<std::int64_t>(
+                            heap_.string_index(receiver.as_object(),
+                                               static_cast<std::size_t>(index)))));
+            ++frame.pc;
+            break;
+        }
         case OpCode::Nil:
             push(frame, Value::nil());
             ++frame.pc;

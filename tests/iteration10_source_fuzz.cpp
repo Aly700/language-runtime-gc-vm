@@ -26,6 +26,7 @@ enum class SourceGrammar {
     Legacy,
     Recursive,
     Array,
+    Strings,
 };
 
 const char* grammar_name(SourceGrammar grammar) {
@@ -36,6 +37,8 @@ const char* grammar_name(SourceGrammar grammar) {
         return "recursive";
     case SourceGrammar::Array:
         return "array";
+    case SourceGrammar::Strings:
+        return "strings";
     }
     return "<unknown>";
 }
@@ -50,20 +53,26 @@ SourceGrammar parse_grammar(const std::string& value) {
     if (value == "array") {
         return SourceGrammar::Array;
     }
+    if (value == "strings") {
+        return SourceGrammar::Strings;
+    }
     throw std::runtime_error("invalid source grammar: " + value);
 }
 
 constexpr std::uint64_t kSnapshotSeed = 17;
 constexpr std::uint64_t kRecursiveSnapshotSeed = 17;
 constexpr std::uint64_t kArraySnapshotSeed = 17;
+constexpr std::uint64_t kStringSnapshotSeed = 17;
 constexpr std::uint64_t kFirstCorpusSeed = 1;
 constexpr std::uint64_t kPositiveCorpusSize = 48;
 constexpr std::uint64_t kRecursivePositiveCorpusSize = 48;
 constexpr std::uint64_t kArrayPositiveCorpusSize = 48;
+constexpr std::uint64_t kStringPositiveCorpusSize = 48;
 constexpr std::uint64_t kMutantCorpusSize = 12;
 constexpr std::size_t kMutantCount = 3;
 constexpr std::size_t kRecursiveMutantCount = 4;
 constexpr std::size_t kArrayMutantCount = 4;
+constexpr std::size_t kStringMutantCount = 5;
 
 void require(bool condition, const std::string& message) {
     if (!condition) {
@@ -675,6 +684,69 @@ GeneratedProgram generate_array_source_program(std::uint64_t seed) {
     return GeneratedProgram{seed, 3, length, 0, out.str()};
 }
 
+GeneratedProgram generate_string_source_program(std::uint64_t seed) {
+    const auto repeat = static_cast<std::int64_t>(1 + (seed % 4));
+    const auto suffix = static_cast<std::int64_t>(seed % 10);
+    const auto result_variant = seed % 5;
+
+    std::ostringstream out;
+    out << "fn append(a: str, b: str) -> str {\n";
+    out << "  a + b\n";
+    out << "}\n\n";
+    out << "fn same(a: str, b: str) -> bool {\n";
+    out << "  a == b\n";
+    out << "}\n\n";
+    out << "fn byte_at(value: str, index: i64) -> i64 {\n";
+    out << "  value[index]\n";
+    out << "}\n\n";
+    out << "let prefix: str = \"seed-\";\n";
+    out << "let escaped: str = \"\\n\\t\\\\\\\"\";\n";
+    out << "let suffix: str = \"" << suffix << "\";\n";
+    out << "let repeated: str = \"\";\n";
+    out << "let i: i64 = 0;\n";
+    out << "while i < " << repeat << " {\n";
+    out << "  repeated = repeated + suffix;\n";
+    out << "  i = i + 1;\n";
+    out << "}\n";
+    out << "let combined: str = append(prefix, escaped) + repeated;\n";
+    out << "let copy: str = combined + \"\";\n";
+    out << "let size: i64 = combined.len;\n";
+    out << "let first: i64 = combined[0];\n";
+    out << "let equal: bool = same(combined, copy);\n";
+    out << "let different: bool = combined != \"different\";\n";
+    out << "let score: i64 = 0;\n";
+    out << "if equal {\n";
+    out << "  score = first + size;\n";
+    out << "} else {\n";
+    out << "  score = 0;\n";
+    out << "}\n";
+    out << "if different {\n";
+    out << "  score = score + byte_at(escaped, 0);\n";
+    out << "} else {\n";
+    out << "  score = 0;\n";
+    out << "}\n";
+
+    switch (result_variant) {
+    case 0:
+        out << "combined\n";
+        break;
+    case 1:
+        out << "equal\n";
+        break;
+    case 2:
+        out << "size\n";
+        break;
+    case 3:
+        out << "byte_at(combined, 0)\n";
+        break;
+    default:
+        out << "score\n";
+        break;
+    }
+
+    return GeneratedProgram{seed, 3, repeat, 0, out.str()};
+}
+
 GeneratedProgram generate_program(SourceGrammar grammar, std::uint64_t seed) {
     switch (grammar) {
     case SourceGrammar::Legacy:
@@ -683,6 +755,8 @@ GeneratedProgram generate_program(SourceGrammar grammar, std::uint64_t seed) {
         return generate_recursive_source_program(seed);
     case SourceGrammar::Array:
         return generate_array_source_program(seed);
+    case SourceGrammar::Strings:
+        return generate_string_source_program(seed);
     }
     throw std::runtime_error("unknown source grammar");
 }
@@ -931,6 +1005,38 @@ std::string mutate_array_source(const GeneratedProgram& generated,
     }
 }
 
+std::string mutate_string_source(const GeneratedProgram& generated,
+                                 std::size_t mutant_index) {
+    switch (mutant_index) {
+    case 0:
+        return replace_once(generated.source,
+                            "append(prefix, escaped) + repeated",
+                            "append(prefix, escaped).len + repeated",
+                            "mixed string/i64 concatenation");
+    case 1:
+        return replace_once(generated.source,
+                            "same(combined, copy)",
+                            "combined == size",
+                            "mixed string equality");
+    case 2:
+        return replace_once(generated.source,
+                            "value[index]", "value[true]",
+                            "non-i64 string index");
+    case 3:
+        return replace_once(generated.source,
+                            "combined[0]", "size[0]",
+                            "i64 indexed as a string");
+    case 4:
+        return replace_once(generated.source,
+                            "let first: i64 = combined[0];",
+                            "combined[0] = 65;\nlet first: i64 = combined[0];",
+                            "string payload mutation");
+    default:
+        throw std::runtime_error("unknown string mutant index " +
+                                 std::to_string(mutant_index));
+    }
+}
+
 std::size_t mutant_count(SourceGrammar grammar) {
     switch (grammar) {
     case SourceGrammar::Legacy:
@@ -939,6 +1045,8 @@ std::size_t mutant_count(SourceGrammar grammar) {
         return kRecursiveMutantCount;
     case SourceGrammar::Array:
         return kArrayMutantCount;
+    case SourceGrammar::Strings:
+        return kStringMutantCount;
     }
     throw std::runtime_error("unknown source grammar");
 }
@@ -951,6 +1059,8 @@ std::uint64_t positive_corpus_size(SourceGrammar grammar) {
         return kRecursivePositiveCorpusSize;
     case SourceGrammar::Array:
         return kArrayPositiveCorpusSize;
+    case SourceGrammar::Strings:
+        return kStringPositiveCorpusSize;
     }
     throw std::runtime_error("unknown source grammar");
 }
@@ -964,6 +1074,8 @@ std::string mutate_source(SourceGrammar grammar, const GeneratedProgram& generat
         return mutate_recursive_source(generated, mutant_index);
     case SourceGrammar::Array:
         return mutate_array_source(generated, mutant_index);
+    case SourceGrammar::Strings:
+        return mutate_string_source(generated, mutant_index);
     }
     throw std::runtime_error("unknown source grammar");
 }
@@ -1240,6 +1352,54 @@ lists[1].left
                 expected + "actual:\n" + generated.source);
 }
 
+void pinned_string_source_snapshot() {
+    const auto generated = generate_string_source_program(kStringSnapshotSeed);
+    const std::string expected = R"SRC(fn append(a: str, b: str) -> str {
+  a + b
+}
+
+fn same(a: str, b: str) -> bool {
+  a == b
+}
+
+fn byte_at(value: str, index: i64) -> i64 {
+  value[index]
+}
+
+let prefix: str = "seed-";
+let escaped: str = "\n\t\\\"";
+let suffix: str = "7";
+let repeated: str = "";
+let i: i64 = 0;
+while i < 2 {
+  repeated = repeated + suffix;
+  i = i + 1;
+}
+let combined: str = append(prefix, escaped) + repeated;
+let copy: str = combined + "";
+let size: i64 = combined.len;
+let first: i64 = combined[0];
+let equal: bool = same(combined, copy);
+let different: bool = combined != "different";
+let score: i64 = 0;
+if equal {
+  score = first + size;
+} else {
+  score = 0;
+}
+if different {
+  score = score + byte_at(escaped, 0);
+} else {
+  score = 0;
+}
+size
+)SRC";
+    require(generated.source == expected,
+            "string source generator snapshot changed for seed " +
+                std::to_string(kStringSnapshotSeed) + "\nexpected:\n" +
+                expected + "actual:\n" + generated.source);
+}
+
 std::size_t parse_mutant_index(const std::string& value, std::size_t count) {
     std::size_t parsed = 0;
     const auto index = std::stoull(value, &parsed, 10);
@@ -1307,18 +1467,18 @@ int run(int argc, char** argv) {
 
     if (argc != 1) {
         std::cerr << "usage: " << argv[0]
-                  << " --dump-corpus <legacy|recursive|array>\n"
+                  << " --dump-corpus <legacy|recursive|array|strings>\n"
                   << "       " << argv[0]
                   << " [--seed <uint64> --schedule <schedule-name>]\n"
                   << "       " << argv[0]
-                  << " --grammar <legacy|recursive|array> --seed <uint64>"
+                  << " --grammar <legacy|recursive|array|strings> --seed <uint64>"
                      " --schedule <schedule-name>\n"
                   << "       " << argv[0]
                   << " --seed <uint64> --mutant <0.." << (kMutantCount - 1)
                   << ">\n"
                   << "       " << argv[0]
-                  << " --grammar <recursive|array> --seed <uint64> --mutant <0.."
-                  << (std::max(kRecursiveMutantCount, kArrayMutantCount) - 1)
+                  << " --grammar <recursive|array|strings> --seed <uint64> --mutant <0.."
+                  << (kStringMutantCount - 1)
                   << ">\n";
         std::cerr << "schedules:";
         for (const auto& schedule : all_schedules) {
@@ -1331,6 +1491,7 @@ int run(int argc, char** argv) {
     pinned_source_snapshot();
     pinned_recursive_source_snapshot();
     pinned_array_source_snapshot();
+    pinned_string_source_snapshot();
 
     for (std::uint64_t seed = kFirstCorpusSeed;
          seed < kFirstCorpusSeed + kPositiveCorpusSize; ++seed) {
@@ -1344,15 +1505,22 @@ int run(int argc, char** argv) {
          seed < kFirstCorpusSeed + kArrayPositiveCorpusSize; ++seed) {
         run_seed_all_schedules(SourceGrammar::Array, seed, all_schedules);
     }
+    for (std::uint64_t seed = kFirstCorpusSeed;
+         seed < kFirstCorpusSeed + kStringPositiveCorpusSize; ++seed) {
+        run_seed_all_schedules(SourceGrammar::Strings, seed, all_schedules);
+    }
     run_mutant_corpus();
     run_mutant_corpus(SourceGrammar::Recursive);
     run_mutant_corpus(SourceGrammar::Array);
+    run_mutant_corpus(SourceGrammar::Strings);
 
     std::cerr << "[PASS] source_pinned_seed_snapshot seed=" << kSnapshotSeed << "\n";
     std::cerr << "[PASS] recursive_source_pinned_seed_snapshot seed="
               << kRecursiveSnapshotSeed << "\n";
     std::cerr << "[PASS] array_source_pinned_seed_snapshot seed="
               << kArraySnapshotSeed << "\n";
+    std::cerr << "[PASS] string_source_pinned_seed_snapshot seed="
+              << kStringSnapshotSeed << "\n";
     std::cerr << "[PASS] lang_iteration10_source_fuzz positive seeds="
               << kPositiveCorpusSize << " schedules=" << all_schedules.size()
               << " executions=" << (kPositiveCorpusSize * all_schedules.size())
@@ -1365,6 +1533,10 @@ int run(int argc, char** argv) {
               << kArrayPositiveCorpusSize << " schedules="
               << all_schedules.size() << " executions="
               << (kArrayPositiveCorpusSize * all_schedules.size()) << "\n";
+    std::cerr << "[PASS] lang_iteration10_source_fuzz string positive seeds="
+              << kStringPositiveCorpusSize << " schedules="
+              << all_schedules.size() << " executions="
+              << (kStringPositiveCorpusSize * all_schedules.size()) << "\n";
     std::cerr << "[PASS] lang_iteration10_source_fuzz mutants seeds="
               << kMutantCorpusSize << " mutants=" << kMutantCount
               << " checks=" << (kMutantCorpusSize * kMutantCount) << "\n";
@@ -1375,6 +1547,10 @@ int run(int argc, char** argv) {
     std::cerr << "[PASS] lang_iteration10_source_fuzz array mutants seeds="
               << kMutantCorpusSize << " mutants=" << kArrayMutantCount
               << " checks=" << (kMutantCorpusSize * kArrayMutantCount)
+              << "\n";
+    std::cerr << "[PASS] lang_iteration10_source_fuzz string mutants seeds="
+              << kMutantCorpusSize << " mutants=" << kStringMutantCount
+              << " checks=" << (kMutantCorpusSize * kStringMutantCount)
               << "\n";
     return 0;
 }

@@ -23,6 +23,7 @@ enum class AbstractKind {
     Object,
     Array,
     RefArray,
+    Str,
     Nil,
     Poison,
 };
@@ -110,6 +111,16 @@ const char* op_name(OpCode op) {
         return "RefArrayGet";
     case OpCode::RefArraySet:
         return "RefArraySet";
+    case OpCode::PushStr:
+        return "PushStr";
+    case OpCode::StrLen:
+        return "StrLen";
+    case OpCode::StrEq:
+        return "StrEq";
+    case OpCode::StrConcat:
+        return "StrConcat";
+    case OpCode::StrIndex:
+        return "StrIndex";
     }
     return "<invalid>";
 }
@@ -126,6 +137,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Array";
     case ValueKind::Nil:
         return "Nil";
+    case ValueKind::Str:
+        return "Str";
     }
     return "<invalid>";
 }
@@ -142,6 +155,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "Array";
     case AbstractKind::RefArray:
         return "RefArray";
+    case AbstractKind::Str:
+        return "Str";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -177,6 +192,7 @@ AbstractValue int64_value() { return value_with_kind(AbstractKind::Int64); }
 AbstractValue bool_value() { return value_with_kind(AbstractKind::Bool); }
 AbstractValue array_value() { return value_with_kind(AbstractKind::Array); }
 AbstractValue ref_array_value() { return value_with_kind(AbstractKind::RefArray); }
+AbstractValue str_value() { return value_with_kind(AbstractKind::Str); }
 
 AbstractValue ref_array_value(std::size_t site) {
     AbstractValue value;
@@ -241,6 +257,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Array;
     case ValueKind::Nil:
         return AbstractKind::Nil;
+    case ValueKind::Str:
+        return AbstractKind::Str;
     }
     return AbstractKind::Poison;
 }
@@ -255,7 +273,8 @@ AbstractValue value_from_signature(ValueKind kind) {
 bool signature_array_uses_ref_payload(const SignatureValue& signature) {
     return signature.has_array_element() &&
            (signature.element->kind == ValueKind::Object ||
-            signature.element->kind == ValueKind::Array);
+            signature.element->kind == ValueKind::Array ||
+            signature.element->kind == ValueKind::Str);
 }
 
 AbstractValue value_from_signature(const SignatureValue& signature) {
@@ -288,7 +307,7 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
 
 bool is_reference_kind(AbstractKind kind) {
     return kind == AbstractKind::Object || kind == AbstractKind::Array ||
-           kind == AbstractKind::RefArray;
+           kind == AbstractKind::RefArray || kind == AbstractKind::Str;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -983,6 +1002,84 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         state.stack.push_back(int64_value());
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    case OpCode::PushStr:
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                module.string_constants.size()) {
+            std::ostringstream message;
+            message << "string constant operand " << ins.operand
+                    << " is outside pool size " << module.string_constants.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadStringConstantIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        state.stack.push_back(str_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    case OpCode::StrLen:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BadStringOperation,
+                                  "string receiver")) {
+            return false;
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    case OpCode::StrEq:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BadStringOperation,
+                                  "right string operand") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BadStringOperation,
+                                  "left string operand")) {
+            return false;
+        }
+        state.stack.push_back(bool_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    case OpCode::StrConcat:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BadStringOperation,
+                                  "right string operand") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BadStringOperation,
+                                  "left string operand")) {
+            return false;
+        }
+        state.stack.push_back(str_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    case OpCode::StrIndex:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BadStringOperation,
+                                  "string index") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::BadStringOperation,
+                                  "string receiver")) {
+            return false;
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
     case OpCode::Nil:
         state.stack.push_back(nil_object_value());
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
@@ -1548,6 +1645,10 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "BadReturnKind";
     case VerifierReason::InvalidOpcode:
         return "InvalidOpcode";
+    case VerifierReason::BadStringConstantIndex:
+        return "BadStringConstantIndex";
+    case VerifierReason::BadStringOperation:
+        return "BadStringOperation";
     }
     return "<unknown>";
 }

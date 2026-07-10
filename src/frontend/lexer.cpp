@@ -29,10 +29,28 @@ public:
                 tokens.push_back(identifier(start));
                 continue;
             }
+            if (c == '"') {
+                tokens.push_back(string_literal(start));
+                continue;
+            }
             if (c == '-' && offset_ + 1 < source_.size() && source_[offset_ + 1] == '>') {
                 advance();
                 advance();
                 tokens.push_back(simple(TokenKind::Arrow, start, "->"));
+                continue;
+            }
+            if (c == '=' && offset_ + 1 < source_.size() &&
+                source_[offset_ + 1] == '=') {
+                advance();
+                advance();
+                tokens.push_back(simple(TokenKind::EqualEqual, start, "=="));
+                continue;
+            }
+            if (c == '!' && offset_ + 1 < source_.size() &&
+                source_[offset_ + 1] == '=') {
+                advance();
+                advance();
+                tokens.push_back(simple(TokenKind::BangEqual, start, "!="));
                 continue;
             }
             if (std::isdigit(static_cast<unsigned char>(c)) ||
@@ -184,6 +202,8 @@ private:
             kind = TokenKind::I64;
         } else if (text == "bool") {
             kind = TokenKind::Bool;
+        } else if (text == "str") {
+            kind = TokenKind::Str;
         } else if (text == "pair") {
             kind = TokenKind::Pair;
         } else if (text == "left") {
@@ -192,6 +212,55 @@ private:
             kind = TokenKind::Right;
         }
         return Token{kind, start, std::move(text), 0};
+    }
+
+    Token string_literal(SourcePosition start) {
+        advance();
+        std::string decoded;
+        bool terminated = false;
+        while (!at_end()) {
+            if (peek() == '"') {
+                advance();
+                terminated = true;
+                break;
+            }
+            if (peek() != '\\') {
+                decoded.push_back(peek());
+                advance();
+                continue;
+            }
+
+            const auto escape_position = position();
+            advance();
+            if (at_end()) {
+                break;
+            }
+            const char escaped = peek();
+            advance();
+            switch (escaped) {
+            case 'n':
+                decoded.push_back('\n');
+                break;
+            case 't':
+                decoded.push_back('\t');
+                break;
+            case '\\':
+                decoded.push_back('\\');
+                break;
+            case '"':
+                decoded.push_back('"');
+                break;
+            default:
+                add_diagnostic(diagnostics_, escape_position,
+                               std::string("unsupported string escape '\\") +
+                                   escaped + "'");
+                break;
+            }
+        }
+        if (!terminated) {
+            add_diagnostic(diagnostics_, start, "unterminated string literal");
+        }
+        return Token{TokenKind::String, start, std::move(decoded), 0};
     }
 
     Token integer(SourcePosition start) {

@@ -20,6 +20,8 @@ const char* type_name(Type type) {
         return "pair";
     case Type::Array:
         return "array";
+    case Type::Str:
+        return "str";
     case Type::Invalid:
         return "invalid";
     }

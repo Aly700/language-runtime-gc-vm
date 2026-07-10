@@ -17,6 +17,7 @@ TypeSpec type_with_kind(TypeSpec::Kind kind) {
 
 TypeSpec int64_type() { return type_with_kind(TypeSpec::Kind::Int64); }
 TypeSpec bool_type() { return type_with_kind(TypeSpec::Kind::Bool); }
+TypeSpec str_type() { return type_with_kind(TypeSpec::Kind::Str); }
 TypeSpec pair_type() { return type_with_kind(TypeSpec::Kind::Pair); }
 TypeSpec nil_type() { return type_with_kind(TypeSpec::Kind::Nil); }
 TypeSpec invalid_type() { return type_with_kind(TypeSpec::Kind::Invalid); }
@@ -87,6 +88,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Int64;
     case TypeSpec::Kind::Bool:
         return Type::Bool;
+    case TypeSpec::Kind::Str:
+        return Type::Str;
     case TypeSpec::Kind::Pair:
         return Type::Pair;
     case TypeSpec::Kind::Array:
@@ -107,6 +110,8 @@ std::string type_name(const TypeSpec& type) {
         return "i64";
     case TypeSpec::Kind::Bool:
         return "bool";
+    case TypeSpec::Kind::Str:
+        return "str";
     case TypeSpec::Kind::Pair:
         if (type.has_pair_fields()) {
             return "pair<" + type_name(*type.left) + ", " + type_name(*type.right) + ">";
@@ -400,6 +405,11 @@ private:
             type.position = previous().position;
             return type;
         }
+        if (match(TokenKind::Str)) {
+            auto type = str_type();
+            type.position = previous().position;
+            return type;
+        }
         if (match(TokenKind::Pair)) {
             const auto position = previous().position;
             if (match(TokenKind::Less)) {
@@ -419,7 +429,7 @@ private:
             return named_type(previous().text, previous().position);
         }
         add_diagnostic(diagnostics_, peek().position,
-                       "expected type 'i64', 'bool', 'pair', array type, or named type");
+                       "expected type 'i64', 'bool', 'str', 'pair', array type, or named type");
         return invalid_type();
     }
 
@@ -526,7 +536,23 @@ private:
         return value;
     }
 
-    std::unique_ptr<Expr> parse_expression() { return parse_comparison(); }
+    std::unique_ptr<Expr> parse_expression() { return parse_equality(); }
+
+    std::unique_ptr<Expr> parse_equality() {
+        auto expression = parse_comparison();
+        while (match(TokenKind::EqualEqual) || match(TokenKind::BangEqual)) {
+            const auto operation = previous();
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::Binary;
+            node->position = expression->position;
+            node->operator_position = operation.position;
+            node->binary_op = operation.kind == TokenKind::EqualEqual ? '=' : '!';
+            node->left = std::move(expression);
+            node->right = parse_comparison();
+            expression = std::move(node);
+        }
+        return expression;
+    }
 
     std::unique_ptr<Expr> parse_comparison() {
         auto expression = parse_addition();
@@ -627,6 +653,13 @@ private:
             node->kind = Expr::Kind::BoolLiteral;
             node->position = previous().position;
             node->bool_value = previous().kind == TokenKind::True;
+            return node;
+        }
+        if (match(TokenKind::String)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::StringLiteral;
+            node->position = previous().position;
+            node->string_value = previous().text;
             return node;
         }
         if (match(TokenKind::Nil)) {

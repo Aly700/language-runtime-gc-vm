@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstdint>
 #include <exception>
+#include <iomanip>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -181,6 +182,19 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             }
             rendered << ")";
             break;
+        case lang::gc::ObjectKind::Str: {
+            const auto bytes = heap.string_bytes(order[i]);
+            rendered << "str[" << bytes.size() << "](";
+            for (std::size_t byte = 0; byte < bytes.size(); ++byte) {
+                if (byte != 0) {
+                    rendered << " ";
+                }
+                rendered << std::hex << std::setfill('0') << std::setw(2)
+                         << static_cast<unsigned>(bytes[byte]) << std::dec;
+            }
+            rendered << ")";
+            break;
+        }
         }
         objects.push_back(rendered.str());
     }
