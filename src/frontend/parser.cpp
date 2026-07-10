@@ -53,6 +53,14 @@ TypeSpec function_type(std::vector<TypeSpec> parameters, TypeSpec result) {
     return type;
 }
 
+TypeSpec map_type(TypeSpec key, TypeSpec value) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Map;
+    type.key = std::make_shared<TypeSpec>(std::move(key));
+    type.value = std::make_shared<TypeSpec>(std::move(value));
+    return type;
+}
+
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs.kind != rhs.kind) {
         return false;
@@ -81,6 +89,13 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
             }
         }
         return true;
+    }
+    if (lhs.kind == TypeSpec::Kind::Map) {
+        if (lhs.key == nullptr || rhs.key == nullptr || lhs.value == nullptr ||
+            rhs.value == nullptr) {
+            return lhs.key == rhs.key && lhs.value == rhs.value;
+        }
+        return *lhs.key == *rhs.key && *lhs.value == *rhs.value;
     }
     if (!lhs.has_pair_fields() && !rhs.has_pair_fields()) {
         return true;
@@ -117,6 +132,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Array;
     case TypeSpec::Kind::Function:
         return Type::Function;
+    case TypeSpec::Kind::Map:
+        return Type::Map;
     case TypeSpec::Kind::Named:
         return Type::Pair;
     case TypeSpec::Kind::Nil:
@@ -159,6 +176,12 @@ std::string type_name(const TypeSpec& type) {
                         : type_name(*type.function_return);
         return rendered;
     }
+    case TypeSpec::Kind::Map:
+        if (type.key != nullptr && type.value != nullptr) {
+            return "map<" + type_name(*type.key) + ", " +
+                   type_name(*type.value) + ">";
+        }
+        return "map<invalid, invalid>";
     case TypeSpec::Kind::Named:
         return type.name;
     case TypeSpec::Kind::Nil:
@@ -453,6 +476,17 @@ private:
             type.position = previous().position;
             return type;
         }
+        if (match(TokenKind::Map)) {
+            const auto position = previous().position;
+            expect(TokenKind::Less, "expected '<' after 'map'");
+            auto key = parse_type();
+            expect(TokenKind::Comma, "expected ',' between map key and value types");
+            auto value = parse_type();
+            expect(TokenKind::Greater, "expected '>' after map value type");
+            auto type = map_type(std::move(key), std::move(value));
+            type.position = position;
+            return type;
+        }
         if (match(TokenKind::Fn)) {
             const auto position = previous().position;
             expect(TokenKind::LParen, "expected '(' after 'fn' in function type");
@@ -488,7 +522,7 @@ private:
             return named_type(previous().text, previous().position);
         }
         add_diagnostic(diagnostics_, peek().position,
-                       "expected type 'i64', 'bool', 'str', 'pair', function type, array type, or named type");
+                       "expected type 'i64', 'bool', 'str', 'pair', 'map', function type, array type, or named type");
         return invalid_type();
     }
 
@@ -662,9 +696,19 @@ private:
                     node->receiver = std::move(expression);
                     ++current_;
                     expression = std::move(node);
+                } else if (check(TokenKind::Identifier) && peek().text == "has") {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::MapHas;
+                    node->position = peek().position;
+                    node->receiver = std::move(expression);
+                    ++current_;
+                    expect(TokenKind::LParen, "expected '(' after 'has'");
+                    node->left = parse_expression();
+                    expect(TokenKind::RParen, "expected ')' after map key");
+                    expression = std::move(node);
                 } else {
                     add_diagnostic(diagnostics_, peek().position,
-                                   "expected field name 'left', 'right', or 'len'");
+                                   "expected field name 'left', 'right', 'len', or 'has'");
                     break;
                 }
             } else if (match(TokenKind::LBracket)) {
@@ -811,6 +855,20 @@ private:
             expect(TokenKind::Comma, "expected ',' between array length and initializer");
             node->right = parse_expression();
             expect(TokenKind::RParen, "expected ')' after array initializer");
+            return node;
+        }
+        if (match(TokenKind::Map)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::MapEmpty;
+            node->position = previous().position;
+            expect(TokenKind::Less, "expected '<' after 'map'");
+            node->map_key_type = parse_type();
+            expect(TokenKind::Comma,
+                   "expected ',' between map key and value types");
+            node->map_value_type = parse_type();
+            expect(TokenKind::Greater, "expected '>' after map value type");
+            expect(TokenKind::LParen, "expected '(' after map type");
+            expect(TokenKind::RParen, "empty map constructor takes no arguments");
             return node;
         }
         if (match(TokenKind::LBracket)) {

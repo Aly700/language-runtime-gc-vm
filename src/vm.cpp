@@ -412,6 +412,69 @@ Value VM::execute_verified(const Module& module,
             ++frame.pc;
             break;
         }
+        case OpCode::AllocMap: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.map_layouts.size() &&
+                   "verifier invariant violated: AllocMap layout must be in range");
+            const auto layout_index = static_cast<std::size_t>(ins.operand);
+            const auto& layout = module.map_layouts[layout_index];
+            push(frame, Value::object(heap_.allocate_map(
+                            layout_index, layout.key_is_ref,
+                            layout.value_is_ref)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::MapSet: {
+            const auto stored_value = pop(frame);
+            const auto key = pop(frame);
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: MapSet receiver must be object");
+            assert(heap_.TEST_ONLY_is_map(receiver.as_object()) &&
+                   "verifier invariant violated: MapSet receiver must be map");
+            heap_.map_set(receiver.as_object(), key, stored_value);
+            ++frame.pc;
+            break;
+        }
+        case OpCode::MapGet: {
+            const auto key = pop(frame);
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: MapGet receiver must be object");
+            assert(heap_.TEST_ONLY_is_map(receiver.as_object()) &&
+                   "verifier invariant violated: MapGet receiver must be map");
+            push(frame, heap_.map_get(receiver.as_object(), key));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::MapHas: {
+            const auto key = pop(frame);
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: MapHas receiver must be object");
+            assert(heap_.TEST_ONLY_is_map(receiver.as_object()) &&
+                   "verifier invariant violated: MapHas receiver must be map");
+            push(frame, Value::boolean(
+                            heap_.map_has(receiver.as_object(), key)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::MapLen: {
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: MapLen receiver must be object");
+            assert(heap_.TEST_ONLY_is_map(receiver.as_object()) &&
+                   "verifier invariant violated: MapLen receiver must be map");
+            const auto length = heap_.map_length(receiver.as_object());
+            if (length > static_cast<std::size_t>(
+                             std::numeric_limits<std::int64_t>::max())) {
+                throw std::length_error("map length exceeds i64 result range");
+            }
+            push(frame, Value::int64(static_cast<std::int64_t>(length)));
+            ++frame.pc;
+            break;
+        }
         case OpCode::GetLeft: {
             const auto receiver = pop(frame);
             assert(receiver.tag() == Value::Tag::Object &&

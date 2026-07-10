@@ -19,6 +19,7 @@ struct TypeSpec {
         Pair,
         Array,
         Function,
+        Map,
         Named,
         Nil,
         Invalid,
@@ -28,6 +29,8 @@ struct TypeSpec {
     std::shared_ptr<TypeSpec> left;
     std::shared_ptr<TypeSpec> right;
     std::shared_ptr<TypeSpec> element;
+    std::shared_ptr<TypeSpec> key;
+    std::shared_ptr<TypeSpec> value;
     std::vector<TypeSpec> function_parameters;
     std::shared_ptr<TypeSpec> function_return;
     std::string name;
@@ -41,6 +44,10 @@ struct TypeSpec {
     [[nodiscard]] bool has_function_signature() const {
         return kind == Kind::Function && function_return != nullptr;
     }
+
+    [[nodiscard]] bool has_map_entries() const {
+        return kind == Kind::Map && key != nullptr && value != nullptr;
+    }
 };
 
 TypeSpec int64_type();
@@ -53,6 +60,7 @@ TypeSpec invalid_type();
 TypeSpec pair_type(TypeSpec left, TypeSpec right);
 TypeSpec array_type(TypeSpec element);
 TypeSpec function_type(std::vector<TypeSpec> parameters, TypeSpec result);
+TypeSpec map_type(TypeSpec key, TypeSpec value);
 
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs);
 bool operator!=(const TypeSpec& lhs, const TypeSpec& rhs);
@@ -81,6 +89,8 @@ struct Expr {
         Call,
         Lambda,
         IsNil,
+        MapEmpty,
+        MapHas,
     };
 
     Kind kind{Kind::IntLiteral};
@@ -97,6 +107,8 @@ struct Expr {
     std::unique_ptr<Expr> right;
     std::unique_ptr<Expr> receiver;
     TypeSpec array_element_type{invalid_type()};
+    TypeSpec map_key_type{invalid_type()};
+    TypeSpec map_value_type{invalid_type()};
     std::vector<std::unique_ptr<Expr>> arguments;
     TypeSpec inferred_type{invalid_type()};
     std::set<std::size_t> object_sites;

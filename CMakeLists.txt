@@ -76,6 +76,9 @@ target_link_libraries(lang_iteration23_strings PRIVATE lang_runtime)
 add_executable(lang_iteration24_closures tests/iteration24_closures.cpp)
 target_link_libraries(lang_iteration24_closures PRIVATE lang_runtime)
 
+add_executable(lang_iteration25_maps tests/iteration25_maps.cpp)
+target_link_libraries(lang_iteration25_maps PRIVATE lang_runtime)
+
 add_executable(lang_bench src/bench.cpp)
 target_link_libraries(lang_bench PRIVATE lang_runtime)
 
@@ -99,4 +102,5 @@ add_test(NAME lang_iteration21_ref_arrays COMMAND lang_iteration21_ref_arrays)
 add_test(NAME lang_iteration22_source_arrays COMMAND lang_iteration22_source_arrays)
 add_test(NAME lang_iteration23_strings COMMAND lang_iteration23_strings)
 add_test(NAME lang_iteration24_closures COMMAND lang_iteration24_closures)
+add_test(NAME lang_iteration25_maps COMMAND lang_iteration25_maps)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

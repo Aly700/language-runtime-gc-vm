@@ -55,6 +55,12 @@ enum class ObjectKind {
     RefArray,
     Str,
     Closure,
+    Map,
+};
+
+struct MapEntry {
+    Value key{Value::nil()};
+    Value value{Value::nil()};
 };
 
 struct Object {
@@ -65,6 +71,8 @@ struct Object {
     static Object closure(std::size_t layout_index, std::size_t function_index,
                           std::vector<Value> captures,
                           std::vector<bool> capture_map);
+    static Object map(std::size_t layout_index, bool key_is_ref,
+                      bool value_is_ref);
 
     bool marked{false};
     ObjectGeneration generation{ObjectGeneration::Young};
@@ -79,6 +87,10 @@ struct Object {
     std::uint32_t closure_function_index{0};
     std::vector<Value> closure_captures;
     std::vector<bool> closure_capture_map;
+    std::uint32_t map_layout_index{0};
+    bool map_key_is_ref{false};
+    bool map_value_is_ref{false};
+    std::vector<MapEntry> map_entries;
 };
 
 class Handle {
@@ -124,6 +136,8 @@ public:
                               std::size_t function_index,
                               std::vector<Value> captures,
                               std::vector<bool> capture_map);
+    ObjectId allocate_map(std::size_t layout_index, bool key_is_ref,
+                          bool value_is_ref);
     [[nodiscard]] Handle make_handle(Value value);
     [[nodiscard]] Handle make_handle(ObjectId id);
     void set_root_provider(RootProvider* provider) { root_provider_ = provider; }
@@ -153,6 +167,13 @@ public:
     [[nodiscard]] std::size_t closure_function_index(ObjectId id) const;
     [[nodiscard]] std::size_t closure_capture_count(ObjectId id) const;
     [[nodiscard]] Value closure_capture(ObjectId id, std::size_t index) const;
+    [[nodiscard]] std::size_t map_layout_index(ObjectId id) const;
+    [[nodiscard]] std::size_t map_length(ObjectId id) const;
+    [[nodiscard]] bool map_has(ObjectId id, Value key) const;
+    [[nodiscard]] Value map_get(ObjectId id, Value key) const;
+    void map_set(ObjectId id, Value key, Value value);
+    [[nodiscard]] Value map_key_at(ObjectId id, std::size_t index) const;
+    [[nodiscard]] Value map_value_at(ObjectId id, std::size_t index) const;
     [[nodiscard]] std::size_t live_count() const;
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
@@ -164,6 +185,7 @@ public:
     [[nodiscard]] bool TEST_ONLY_is_ref_array(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_string(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_closure(ObjectId id) const;
+    [[nodiscard]] bool TEST_ONLY_is_map(ObjectId id) const;
     [[nodiscard]] std::size_t TEST_ONLY_remembered_set_size() const {
         return remembered_set_.size();
     }
@@ -209,6 +231,8 @@ private:
     [[nodiscard]] Object& checked_ref_array(ObjectId id);
     [[nodiscard]] const Object& checked_string(ObjectId id) const;
     [[nodiscard]] const Object& checked_closure(ObjectId id) const;
+    [[nodiscard]] const Object& checked_map(ObjectId id) const;
+    [[nodiscard]] Object& checked_map(ObjectId id);
     void register_handle_root(Value* slot);
     void deregister_handle_root(Value* slot) noexcept;
     void move_handle_root(Value* from, Value* to) noexcept;
@@ -219,7 +243,18 @@ private:
                                 std::span<Value*> extra_roots) const;
     void store_pair_field(ObjectId id, PairField field, Value value);
     void store_ref_array_element(ObjectId id, std::size_t index, Value value);
+    void store_map_entry(ObjectId id, Value key, Value value);
+    void ensure_map_growth_storage(Value& owner, Value& key, Value& value,
+                                   std::size_t required_width);
+    void relocate_map_for_growth(Value& owner, Value& key, Value& value,
+                                 std::size_t required_width);
+    [[nodiscard]] std::optional<std::size_t> find_map_entry(
+        ObjectId id, Value key) const;
+    void validate_map_key(const Object& map, Value key) const;
+    void validate_map_value(const Object& map, Value value) const;
     [[nodiscard]] bool record_write_barrier_if_needed(ObjectId owner, Value value);
+    [[nodiscard]] bool record_map_write_barrier_if_needed(
+        ObjectId owner, std::optional<Value> inserted_key, Value value);
     void record_remembered_object(ObjectId id);
     void record_promoted_object_edges(std::span<const std::size_t> promoted_slots);
     [[nodiscard]] bool remembered_set_contains(ObjectId id) const;

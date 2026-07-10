@@ -24,6 +24,8 @@ const char* type_name(Type type) {
         return "str";
     case Type::Function:
         return "function";
+    case Type::Map:
+        return "map";
     case Type::Invalid:
         return "invalid";
     }

@@ -25,6 +25,7 @@ enum class TokenKind {
     Nil,
     IsNil,
     Array,
+    Map,
     I64,
     Bool,
     Str,

@@ -25,6 +25,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
         return ValueKind::Array;
     case TypeSpec::Kind::Function:
         return ValueKind::Function;
+    case TypeSpec::Kind::Map:
+        return ValueKind::Map;
     case TypeSpec::Kind::Nil:
         return ValueKind::Nil;
     case TypeSpec::Kind::Invalid:
@@ -54,6 +56,15 @@ SignatureValue signature_value_from_type(const TypeSpec& type) {
         return function_signature(
             std::move(parameters),
             signature_value_from_type(*type.function_return));
+    }
+    if (type.kind == TypeSpec::Kind::Map && type.key != nullptr &&
+        type.value != nullptr) {
+        assert((type.key->kind == TypeSpec::Kind::Int64 ||
+                type.key->kind == TypeSpec::Kind::Bool ||
+                type.key->kind == TypeSpec::Kind::Str) &&
+               "compile boundary rejected an invalid map key type");
+        return map_signature(signature_value_from_type(*type.key),
+                             signature_value_from_type(*type.value));
     }
     return signature_value(bytecode_kind(type));
 }
@@ -95,6 +106,9 @@ void add_lvalue_prefix_array_counts(const LValue& lvalue,
         const auto& step = lvalue.steps[i];
         if (step.kind == LValueStep::Kind::Index) {
             add_expr_array_counts(*step.index, counts);
+            if (step.receiver_type.kind == TypeSpec::Kind::Map) {
+                continue;
+            }
             if (is_ref_array_type(step.receiver_type)) {
                 ++counts.get_ref;
             } else {
@@ -119,6 +133,10 @@ void add_statement_array_counts(const Statement& statement,
                                            counts);
             if (final_step.kind == LValueStep::Kind::Index) {
                 add_expr_array_counts(*final_step.index, counts);
+                if (statement.target.receiver_type.kind ==
+                    TypeSpec::Kind::Map) {
+                    break;
+                }
                 if (is_ref_array_type(statement.target.receiver_type)) {
                     ++counts.set_ref;
                 } else {
@@ -152,6 +170,7 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::StringLiteral:
     case Expr::Kind::NilLiteral:
     case Expr::Kind::Variable:
+    case Expr::Kind::MapEmpty:
         return;
     case Expr::Kind::Lambda:
         assert(expression.lambda != nullptr);
@@ -194,6 +213,9 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
         if (expression.receiver->inferred_type.kind == TypeSpec::Kind::Str) {
             return;
         }
+        if (expression.receiver->inferred_type.kind == TypeSpec::Kind::Map) {
+            return;
+        }
         if (is_ref_array_type(expression.receiver->inferred_type)) {
             ++counts.get_ref;
         } else {
@@ -206,6 +228,10 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::Field:
     case Expr::Kind::IsNil:
         add_expr_array_counts(*expression.receiver, counts);
+        return;
+    case Expr::Kind::MapHas:
+        add_expr_array_counts(*expression.receiver, counts);
+        add_expr_array_counts(*expression.left, counts);
         return;
     case Expr::Kind::Call:
         for (const auto& argument : expression.arguments) {
@@ -295,8 +321,9 @@ class Compiler {
 public:
     Compiler(std::uint32_t local_count, FunctionSignature signature,
              std::vector<std::string>& string_constants,
+             std::vector<MapLayout>& map_layouts,
              std::optional<std::size_t> closure_layout = std::nullopt)
-        : string_constants_(string_constants) {
+        : string_constants_(string_constants), map_layouts_(map_layouts) {
         function_.signature = std::move(signature);
         function_.local_count = local_count;
         function_.closure_layout = closure_layout;
@@ -364,6 +391,11 @@ private:
         compile_lvalue_receiver(statement.target);
         if (final_step.kind == LValueStep::Kind::Index) {
             compile_expr(*final_step.index);
+            if (statement.target.receiver_type.kind == TypeSpec::Kind::Map) {
+                compile_expr(*statement.value);
+                emit(OpCode::MapSet, 0);
+                return;
+            }
             compile_expr_as_array_storage(*statement.value,
                                           statement.target.element_type);
             emit(is_ref_array_type(statement.target.receiver_type)
@@ -461,10 +493,14 @@ private:
             break;
         case Expr::Kind::ArrayLen:
             compile_expr(*expression.receiver);
-            emit(expression.receiver->inferred_type.kind == TypeSpec::Kind::Str
-                     ? OpCode::StrLen
-                     : OpCode::ArrayLen,
-                 0);
+            if (expression.receiver->inferred_type.kind == TypeSpec::Kind::Str) {
+                emit(OpCode::StrLen, 0);
+            } else if (expression.receiver->inferred_type.kind ==
+                       TypeSpec::Kind::Map) {
+                emit(OpCode::MapLen, 0);
+            } else {
+                emit(OpCode::ArrayLen, 0);
+            }
             break;
         case Expr::Kind::Binary:
             compile_expr(*expression.left);
@@ -503,6 +539,14 @@ private:
             compile_expr(*expression.receiver);
             emit(OpCode::IsNil, 0);
             break;
+        case Expr::Kind::MapEmpty:
+            compile_map_empty(expression);
+            break;
+        case Expr::Kind::MapHas:
+            compile_expr(*expression.receiver);
+            compile_expr(*expression.left);
+            emit(OpCode::MapHas, 0);
+            break;
         }
     }
 
@@ -513,6 +557,24 @@ private:
         emit(OpCode::ConstantI64, value ? 0 : 1);
         emit(OpCode::ConstantI64, value ? 1 : 0);
         emit(OpCode::LessI64, 0);
+    }
+
+    void compile_map_empty(const Expr& expression) {
+        assert((expression.map_key_type.kind == TypeSpec::Kind::Int64 ||
+                expression.map_key_type.kind == TypeSpec::Kind::Bool ||
+                expression.map_key_type.kind == TypeSpec::Kind::Str) &&
+               "compile boundary must enforce the map key restriction");
+        auto key = signature_value_from_type(expression.map_key_type);
+        auto value = signature_value_from_type(expression.map_value_type);
+        assert(map_layouts_.size() <=
+                   static_cast<std::size_t>(
+                       std::numeric_limits<std::int64_t>::max()) &&
+               "module map layout index exceeds bytecode operand range");
+        const auto layout_index = map_layouts_.size();
+        map_layouts_.push_back(MapLayout{key, value,
+                                         signature_value_is_reference(key),
+                                         signature_value_is_reference(value)});
+        emit(OpCode::AllocMap, static_cast<std::int64_t>(layout_index));
     }
 
     void compile_lambda(const Expr& expression) {
@@ -605,6 +667,10 @@ private:
             emit(OpCode::StrIndex, 0);
             return;
         }
+        if (expression.receiver->inferred_type.kind == TypeSpec::Kind::Map) {
+            emit(OpCode::MapGet, 0);
+            return;
+        }
         assert(expression.receiver->inferred_type.kind == TypeSpec::Kind::Array &&
                expression.receiver->inferred_type.element != nullptr);
         const auto& element_type = *expression.receiver->inferred_type.element;
@@ -625,16 +691,21 @@ private:
                 emit(step.name == "left" ? OpCode::GetLeft : OpCode::GetRight, 0);
             } else {
                 compile_expr(*step.index);
-                emit(is_ref_array_type(step.receiver_type)
-                         ? OpCode::RefArrayGet
-                         : OpCode::ArrayGet,
-                     0);
+                if (step.receiver_type.kind == TypeSpec::Kind::Map) {
+                    emit(OpCode::MapGet, 0);
+                } else {
+                    emit(is_ref_array_type(step.receiver_type)
+                             ? OpCode::RefArrayGet
+                             : OpCode::ArrayGet,
+                         0);
+                }
             }
         }
     }
 
     Function function_;
     std::vector<std::string>& string_constants_;
+    std::vector<MapLayout>& map_layouts_;
 };
 
 } // namespace
@@ -680,7 +751,7 @@ CompileModuleResult compile_checked_program(const Program& program,
         Compiler function_compiler(declaration.local_count,
                                    signature_from_types(declaration.parameters,
                                                         declaration.return_type),
-                                   module.string_constants,
+                                   module.string_constants, module.map_layouts,
                                    declaration.closure_layout_index);
         compiled_functions.push_back(
             function_compiler.compile(declaration.statements, *declaration.result));
@@ -689,7 +760,8 @@ CompileModuleResult compile_checked_program(const Program& program,
         Compiler lambda_compiler(
             lambda->local_count,
             signature_from_types(lambda->parameters, lambda->return_type),
-            module.string_constants, lambda->closure_layout_index);
+            module.string_constants, module.map_layouts,
+            lambda->closure_layout_index);
         compiled_functions.push_back(
             lambda_compiler.compile(lambda->statements, *lambda->result));
     }
@@ -698,7 +770,7 @@ CompileModuleResult compile_checked_program(const Program& program,
     entry_signature.return_type = bytecode_kind(result_type);
     entry_signature.return_type_detail = signature_value_from_type(result_type);
     Compiler entry_compiler(program.entry_local_count, std::move(entry_signature),
-                            module.string_constants);
+                            module.string_constants, module.map_layouts);
     module.functions.push_back(entry_compiler.compile(program.statements, *program.result));
     for (auto& function : compiled_functions) {
         module.functions.push_back(std::move(function));

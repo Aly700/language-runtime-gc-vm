@@ -26,6 +26,7 @@ enum class AbstractKind {
     RefArray,
     Str,
     Function,
+    Map,
     Nil,
     Poison,
 };
@@ -41,6 +42,7 @@ struct AbstractValue {
     std::shared_ptr<const PairFields> signature_fields;
     std::shared_ptr<const AbstractValue> signature_array_element;
     std::shared_ptr<const SignatureValue> signature_function;
+    std::shared_ptr<const SignatureValue> signature_map;
     std::optional<std::size_t> signature_named_type;
     std::optional<std::size_t> source_local;
     std::optional<std::size_t> nil_test_local;
@@ -130,6 +132,16 @@ const char* op_name(OpCode op) {
         return "CallClosure";
     case OpCode::LoadCapture:
         return "LoadCapture";
+    case OpCode::AllocMap:
+        return "AllocMap";
+    case OpCode::MapSet:
+        return "MapSet";
+    case OpCode::MapGet:
+        return "MapGet";
+    case OpCode::MapHas:
+        return "MapHas";
+    case OpCode::MapLen:
+        return "MapLen";
     }
     return "<invalid>";
 }
@@ -150,6 +162,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Str";
     case ValueKind::Function:
         return "Function";
+    case ValueKind::Map:
+        return "Map";
     }
     return "<invalid>";
 }
@@ -170,6 +184,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "Str";
     case AbstractKind::Function:
         return "Function";
+    case AbstractKind::Map:
+        return "Map";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -207,6 +223,14 @@ AbstractValue array_value() { return value_with_kind(AbstractKind::Array); }
 AbstractValue ref_array_value() { return value_with_kind(AbstractKind::RefArray); }
 AbstractValue str_value() { return value_with_kind(AbstractKind::Str); }
 
+AbstractValue map_value(SignatureValue signature) {
+    AbstractValue value;
+    value.kind = AbstractKind::Map;
+    value.signature_map =
+        std::make_shared<const SignatureValue>(std::move(signature));
+    return value;
+}
+
 bool signature_values_equal(const SignatureValue& lhs,
                             const SignatureValue& rhs);
 
@@ -225,6 +249,8 @@ bool signature_values_equal(const SignatureValue& lhs,
         !signature_value_ptr_equal(lhs.left, rhs.left) ||
         !signature_value_ptr_equal(lhs.right, rhs.right) ||
         !signature_value_ptr_equal(lhs.element, rhs.element) ||
+        !signature_value_ptr_equal(lhs.key, rhs.key) ||
+        !signature_value_ptr_equal(lhs.value, rhs.value) ||
         !signature_value_ptr_equal(lhs.function_return, rhs.function_return)) {
         return false;
     }
@@ -304,6 +330,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Str;
     case ValueKind::Function:
         return AbstractKind::Function;
+    case ValueKind::Map:
+        return AbstractKind::Map;
     }
     return AbstractKind::Poison;
 }
@@ -317,10 +345,7 @@ AbstractValue value_from_signature(ValueKind kind) {
 
 bool signature_array_uses_ref_payload(const SignatureValue& signature) {
     return signature.has_array_element() &&
-           (signature.element->kind == ValueKind::Object ||
-            signature.element->kind == ValueKind::Array ||
-            signature.element->kind == ValueKind::Str ||
-            signature.element->kind == ValueKind::Function);
+           signature_value_is_reference(*signature.element);
 }
 
 AbstractValue value_from_signature(const SignatureValue& signature) {
@@ -330,6 +355,9 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
         value.signature_function =
             std::make_shared<const SignatureValue>(signature);
         return value;
+    }
+    if (signature.has_map_entries()) {
+        return map_value(signature);
     }
     if (signature.is_named_type_reference()) {
         return named_signature_object_value(*signature.named_type);
@@ -361,7 +389,7 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
 bool is_reference_kind(AbstractKind kind) {
     return kind == AbstractKind::Object || kind == AbstractKind::Array ||
            kind == AbstractKind::RefArray || kind == AbstractKind::Str ||
-           kind == AbstractKind::Function;
+           kind == AbstractKind::Function || kind == AbstractKind::Map;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -397,7 +425,8 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
         return signature.kind == ValueKind::Object &&
                *signature.named_type < module.named_types.size() &&
                signature.left == nullptr && signature.right == nullptr &&
-               signature.element == nullptr &&
+               signature.element == nullptr && signature.key == nullptr &&
+               signature.value == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty();
     }
@@ -407,6 +436,7 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature_shape_matches_kind(*signature.right, signature.right->kind,
                                             module) &&
                signature.element == nullptr &&
+               signature.key == nullptr && signature.value == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty();
     }
@@ -415,6 +445,7 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature_shape_matches_kind(*signature.element,
                                             signature.element->kind, module) &&
                signature.left == nullptr && signature.right == nullptr &&
+               signature.key == nullptr && signature.value == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty();
     }
@@ -431,12 +462,132 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
         }
         return true;
     }
+    if (signature.has_map_entries()) {
+        return signature_shape_matches_kind(*signature.key,
+                                            signature.key->kind, module) &&
+               signature_shape_matches_kind(*signature.value,
+                                            signature.value->kind, module);
+    }
     if (signature.kind == ValueKind::Function) {
+        return false;
+    }
+    if (signature.kind == ValueKind::Map) {
         return false;
     }
     return signature.left == nullptr && signature.right == nullptr &&
            signature.element == nullptr && signature.function_return == nullptr &&
+           signature.key == nullptr && signature.value == nullptr &&
            signature.function_parameters.empty() && !signature.named_type.has_value();
+}
+
+bool is_valid_map_key_type(const SignatureValue& key) {
+    return key.kind == ValueKind::Int64 || key.kind == ValueKind::Bool ||
+           key.kind == ValueKind::Str;
+}
+
+bool signature_has_invalid_map_key(const SignatureValue& signature) {
+    if (signature.has_map_entries()) {
+        return !is_valid_map_key_type(*signature.key) ||
+               signature_has_invalid_map_key(*signature.key) ||
+               signature_has_invalid_map_key(*signature.value);
+    }
+    if (signature.has_pair_fields()) {
+        return signature_has_invalid_map_key(*signature.left) ||
+               signature_has_invalid_map_key(*signature.right);
+    }
+    if (signature.has_array_element()) {
+        return signature_has_invalid_map_key(*signature.element);
+    }
+    if (signature.has_function_signature()) {
+        if (signature_has_invalid_map_key(*signature.function_return)) {
+            return true;
+        }
+        for (const auto& parameter : signature.function_parameters) {
+            if (signature_has_invalid_map_key(parameter)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool module_map_key_types_are_valid(
+    const Module& module, std::vector<VerifierDiagnostic>& diagnostics) {
+    for (const auto& type : module.named_types) {
+        if (signature_has_invalid_map_key(type.body)) {
+            return reject(diagnostics, 0, std::nullopt,
+                          VerifierReason::InvalidMapKeyType,
+                          "module named type contains a map key other than i64, bool, or str");
+        }
+    }
+    for (std::size_t function_index = 0;
+         function_index < module.functions.size(); ++function_index) {
+        const auto& signature = module.functions[function_index].signature;
+        for (std::size_t i = 0; i < signature.parameters.size(); ++i) {
+            if (signature_has_invalid_map_key(parameter_signature(signature, i))) {
+                return reject(diagnostics, function_index, std::nullopt,
+                              VerifierReason::InvalidMapKeyType,
+                              "function parameter contains a map key other than i64, bool, or str");
+            }
+        }
+        if (signature_has_invalid_map_key(return_signature(signature))) {
+            return reject(diagnostics, function_index, std::nullopt,
+                          VerifierReason::InvalidMapKeyType,
+                          "function return contains a map key other than i64, bool, or str");
+        }
+    }
+    for (const auto& layout : module.closure_layouts) {
+        if (signature_has_invalid_map_key(layout.function_type)) {
+            return reject(diagnostics, layout.function_index, std::nullopt,
+                          VerifierReason::InvalidMapKeyType,
+                          "closure function type contains an invalid map key");
+        }
+        for (const auto& capture : layout.capture_types) {
+            if (signature_has_invalid_map_key(capture)) {
+                return reject(diagnostics, layout.function_index, std::nullopt,
+                              VerifierReason::InvalidMapKeyType,
+                              "closure capture type contains an invalid map key");
+            }
+        }
+    }
+    for (const auto& layout : module.map_layouts) {
+        if (!is_valid_map_key_type(layout.key_type) ||
+            signature_has_invalid_map_key(layout.value_type)) {
+            return reject(diagnostics, 0, std::nullopt,
+                          VerifierReason::InvalidMapKeyType,
+                          "map layout contains a key type other than i64, bool, or str");
+        }
+    }
+    return true;
+}
+
+bool map_layouts_are_well_formed(
+    const Module& module, std::vector<VerifierDiagnostic>& diagnostics) {
+    for (std::size_t i = 0; i < module.map_layouts.size(); ++i) {
+        const auto& layout = module.map_layouts[i];
+        if (!is_valid_map_key_type(layout.key_type)) {
+            std::ostringstream message;
+            message << "map layout " << i
+                    << " key type must be i64, bool, or str";
+            return reject(diagnostics, 0, std::nullopt,
+                          VerifierReason::InvalidMapKeyType, message.str());
+        }
+        if (!signature_shape_matches_kind(layout.key_type,
+                                          layout.key_type.kind, module) ||
+            !signature_shape_matches_kind(layout.value_type,
+                                          layout.value_type.kind, module) ||
+            layout.key_is_ref !=
+                signature_value_is_reference(layout.key_type) ||
+            layout.value_is_ref !=
+                signature_value_is_reference(layout.value_type)) {
+            std::ostringstream message;
+            message << "map layout " << i
+                    << " type shape or derived reference flags are invalid";
+            return reject(diagnostics, 0, std::nullopt,
+                          VerifierReason::BadMapLayoutIndex, message.str());
+        }
+    }
+    return true;
 }
 
 bool named_types_are_well_formed(const Module& module) {
@@ -552,6 +703,10 @@ bool operator==(const AbstractValue& lhs, const AbstractValue& rhs) {
              rhs.signature_function != nullptr &&
              signature_values_equal(*lhs.signature_function,
                                     *rhs.signature_function))) &&
+           ((lhs.signature_map == nullptr && rhs.signature_map == nullptr) ||
+            (lhs.signature_map != nullptr && rhs.signature_map != nullptr &&
+             signature_values_equal(*lhs.signature_map,
+                                    *rhs.signature_map))) &&
            lhs.signature_named_type == rhs.signature_named_type &&
            lhs.source_local == rhs.source_local &&
            lhs.nil_test_local == rhs.nil_test_local;
@@ -639,6 +794,12 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
             rhs.signature_function == nullptr ||
             !signature_values_equal(*lhs.signature_function,
                                     *rhs.signature_function)) {
+            return poison_value();
+        }
+    } else if (joined.kind == AbstractKind::Map) {
+        if (lhs.signature_map == nullptr || rhs.signature_map == nullptr ||
+            !signature_values_equal(*lhs.signature_map,
+                                    *rhs.signature_map)) {
             return poison_value();
         }
     }
@@ -1043,6 +1204,12 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
         }
         return value.signature_array_element != nullptr ||
                !value.ref_array_sites.empty();
+    }
+    if (expected.kind == AbstractKind::Map) {
+        return value.signature_map != nullptr &&
+               expected.signature_map != nullptr &&
+               signature_values_equal(*value.signature_map,
+                                      *expected.signature_map);
     }
     if (expected.kind == AbstractKind::Function) {
         return value.signature_function != nullptr &&
@@ -1453,6 +1620,119 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         }
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    }
+    case OpCode::AllocMap: {
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                module.map_layouts.size()) {
+            std::ostringstream message;
+            message << "map layout operand " << ins.operand
+                    << " is outside layout count " << module.map_layouts.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadMapLayoutIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto& layout =
+            module.map_layouts[static_cast<std::size_t>(ins.operand)];
+        state.stack.push_back(map_value(map_signature(layout.key_type,
+                                                      layout.value_type)));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
+    case OpCode::MapGet:
+    case OpCode::MapHas: {
+        AbstractValue key;
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "map key", &key) ||
+            !pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "map receiver",
+                               &receiver)) {
+            return false;
+        }
+        if (receiver.kind != AbstractKind::Map ||
+            receiver.signature_map == nullptr ||
+            !receiver.signature_map->has_map_entries()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::MapOperationOnNonMap,
+                          instruction_message(function, pc,
+                                              "receiver is not a typed map"));
+        }
+        if (!value_conforms_to_signature(module, state, key,
+                                         *receiver.signature_map->key)) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::MapKeyTypeMismatch,
+                          instruction_message(function, pc,
+                                              "key does not match map key type"));
+        }
+        state.stack.push_back(
+            ins.op == OpCode::MapHas
+                ? bool_value()
+                : value_from_signature(*receiver.signature_map->value));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
+    case OpCode::MapSet: {
+        AbstractValue stored;
+        AbstractValue key;
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow,
+                               "map stored value", &stored) ||
+            !pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "map key", &key) ||
+            !pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "map receiver",
+                               &receiver)) {
+            return false;
+        }
+        if (receiver.kind != AbstractKind::Map ||
+            receiver.signature_map == nullptr ||
+            !receiver.signature_map->has_map_entries()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::MapOperationOnNonMap,
+                          instruction_message(function, pc,
+                                              "receiver is not a typed map"));
+        }
+        if (!value_conforms_to_signature(module, state, key,
+                                         *receiver.signature_map->key)) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::MapKeyTypeMismatch,
+                          instruction_message(function, pc,
+                                              "key does not match map key type"));
+        }
+        if (!value_conforms_to_signature(module, state, stored,
+                                         *receiver.signature_map->value)) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::MapValueTypeMismatch,
+                          instruction_message(function, pc,
+                                              "value does not match map value type"));
+        }
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
+    case OpCode::MapLen: {
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "map receiver",
+                               &receiver)) {
+            return false;
+        }
+        if (receiver.kind != AbstractKind::Map ||
+            receiver.signature_map == nullptr ||
+            !receiver.signature_map->has_map_entries()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::MapOperationOnNonMap,
+                          instruction_message(function, pc,
+                                              "receiver is not a typed map"));
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
     }
     case OpCode::GetLeft:
     case OpCode::GetRight: {
@@ -1976,6 +2256,16 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "LoadCaptureOutOfRange";
     case VerifierReason::LoadCaptureOutsideClosureBody:
         return "LoadCaptureOutsideClosureBody";
+    case VerifierReason::BadMapLayoutIndex:
+        return "BadMapLayoutIndex";
+    case VerifierReason::InvalidMapKeyType:
+        return "InvalidMapKeyType";
+    case VerifierReason::MapOperationOnNonMap:
+        return "MapOperationOnNonMap";
+    case VerifierReason::MapKeyTypeMismatch:
+        return "MapKeyTypeMismatch";
+    case VerifierReason::MapValueTypeMismatch:
+        return "MapValueTypeMismatch";
     }
     return "<unknown>";
 }
@@ -2023,6 +2313,12 @@ ModuleVerifierReport verify_with_diagnostics(const Module& module) {
                 << " is outside function count " << module.functions.size();
         reject(report.diagnostics, module.entry_function, std::nullopt,
                VerifierReason::ModuleShapeMismatch, message.str());
+        return report;
+    }
+    if (!module_map_key_types_are_valid(module, report.diagnostics)) {
+        return report;
+    }
+    if (!map_layouts_are_well_formed(module, report.diagnostics)) {
         return report;
     }
     if (!named_types_are_well_formed(module)) {

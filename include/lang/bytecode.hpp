@@ -43,6 +43,11 @@ enum class OpCode {
     AllocClosure,
     CallClosure,
     LoadCapture,
+    AllocMap,
+    MapSet,
+    MapGet,
+    MapHas,
+    MapLen,
 };
 
 struct Instruction {
@@ -58,6 +63,7 @@ enum class ValueKind {
     Nil,
     Str,
     Function,
+    Map,
 };
 
 struct SignatureValue {
@@ -65,18 +71,22 @@ struct SignatureValue {
     std::shared_ptr<SignatureValue> left;
     std::shared_ptr<SignatureValue> right;
     std::shared_ptr<SignatureValue> element;
+    std::shared_ptr<SignatureValue> key;
+    std::shared_ptr<SignatureValue> value;
     std::vector<SignatureValue> function_parameters;
     std::shared_ptr<SignatureValue> function_return;
     std::optional<std::size_t> named_type;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == ValueKind::Object && !named_type.has_value() &&
-               left != nullptr && right != nullptr && element == nullptr;
+               left != nullptr && right != nullptr && element == nullptr &&
+               key == nullptr && value == nullptr;
     }
 
     [[nodiscard]] bool has_array_element() const {
         return kind == ValueKind::Array && element != nullptr &&
-               left == nullptr && right == nullptr && !named_type.has_value();
+               left == nullptr && right == nullptr && key == nullptr &&
+               value == nullptr && !named_type.has_value();
     }
 
     [[nodiscard]] bool is_named_type_reference() const {
@@ -86,6 +96,14 @@ struct SignatureValue {
     [[nodiscard]] bool has_function_signature() const {
         return kind == ValueKind::Function && function_return != nullptr &&
                left == nullptr && right == nullptr && element == nullptr &&
+               key == nullptr && value == nullptr &&
+               !named_type.has_value();
+    }
+
+    [[nodiscard]] bool has_map_entries() const {
+        return kind == ValueKind::Map && key != nullptr && value != nullptr &&
+               left == nullptr && right == nullptr && element == nullptr &&
+               function_return == nullptr && function_parameters.empty() &&
                !named_type.has_value();
     }
 };
@@ -128,9 +146,18 @@ inline SignatureValue function_signature(std::vector<SignatureValue> parameters,
     return value;
 }
 
+inline SignatureValue map_signature(SignatureValue key, SignatureValue value) {
+    SignatureValue signature;
+    signature.kind = ValueKind::Map;
+    signature.key = std::make_shared<SignatureValue>(std::move(key));
+    signature.value = std::make_shared<SignatureValue>(std::move(value));
+    return signature;
+}
+
 inline bool signature_value_is_reference(const SignatureValue& value) {
     return value.kind == ValueKind::Object || value.kind == ValueKind::Array ||
-           value.kind == ValueKind::Str || value.kind == ValueKind::Function;
+           value.kind == ValueKind::Str || value.kind == ValueKind::Function ||
+           value.kind == ValueKind::Map;
 }
 
 struct NamedTypeSignature {
@@ -150,6 +177,13 @@ struct ClosureLayout {
     SignatureValue function_type{signature_value(ValueKind::Nil)};
     std::vector<SignatureValue> capture_types;
     std::vector<bool> capture_map;
+};
+
+struct MapLayout {
+    SignatureValue key_type{signature_value(ValueKind::Nil)};
+    SignatureValue value_type{signature_value(ValueKind::Nil)};
+    bool key_is_ref{false};
+    bool value_is_ref{false};
 };
 
 struct StackMap {
@@ -172,6 +206,7 @@ struct Module {
     std::vector<NamedTypeSignature> named_types;
     std::vector<std::string> string_constants;
     std::vector<ClosureLayout> closure_layouts;
+    std::vector<MapLayout> map_layouts;
 };
 
 struct VerificationResult {
@@ -242,6 +277,11 @@ enum class VerifierReason {
     BadClosureCallArgKind,     // CallClosure argument violates the structural fn type.
     LoadCaptureOutOfRange,     // LoadCapture index is outside the current layout.
     LoadCaptureOutsideClosureBody, // LoadCapture occurs in a non-closure function.
+    BadMapLayoutIndex,        // AllocMap operand/layout descriptor is invalid.
+    InvalidMapKeyType,        // Map key type is not i64, bool, or str.
+    MapOperationOnNonMap,     // MapGet/Set/Has/Len receiver is not a map.
+    MapKeyTypeMismatch,       // Map key operand violates the map key type.
+    MapValueTypeMismatch,     // MapSet value violates the map value type.
 };
 
 struct VerifierDiagnostic {
