@@ -1,6 +1,7 @@
 #include "lang/gc/heap.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +24,7 @@ constexpr ObjectId kSlotMask = 0xFFFF'FFFFull;
 constexpr unsigned kGenerationShift = 32;
 constexpr std::uint32_t kFirstGeneration = 1;
 constexpr std::uint32_t kMaxGeneration = 0x7FFF'FFFFu;
+constexpr std::size_t kStorageSlotBytes = sizeof(std::int64_t);
 
 ObjectId make_object_id(std::uint32_t slot, std::uint32_t generation) {
     return (static_cast<ObjectId>(generation) << kGenerationShift) | slot;
@@ -58,6 +60,10 @@ std::size_t storage_slot_count(const Object& object) {
         return object.length == 0 ? 1 : object.length;
     case ObjectKind::RefArray:
         return object.length == 0 ? 1 : object.length;
+    case ObjectKind::Str:
+        return 1 + (static_cast<std::size_t>(object.length) +
+                    kStorageSlotBytes - 1) /
+                       kStorageSlotBytes;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -66,19 +72,29 @@ void validate_descriptor_shape(const Object& object) {
     switch (object.kind) {
     case ObjectKind::Pair:
         if (object.length != 2 || !object.scalar_elements.empty() ||
-            !object.ref_elements.empty()) {
+            !object.ref_elements.empty() || !object.string_bytes.empty()) {
             throw std::logic_error("pair object descriptor does not match pair payload");
         }
         return;
     case ObjectKind::ScalarArray:
         if (object.scalar_elements.size() != object.length ||
-            !object.ref_elements.empty()) {
+            !object.ref_elements.empty() || !object.string_bytes.empty()) {
             throw std::logic_error("scalar array descriptor length does not match payload");
         }
         return;
     case ObjectKind::RefArray:
-        if (!object.scalar_elements.empty() || object.ref_elements.size() != object.length) {
+        if (!object.scalar_elements.empty() ||
+            object.ref_elements.size() != object.length ||
+            !object.string_bytes.empty()) {
             throw std::logic_error("ref array descriptor length does not match payload");
+        }
+        return;
+    case ObjectKind::Str:
+        if (!object.scalar_elements.empty() || !object.ref_elements.empty() ||
+            object.string_bytes.size() != object.length ||
+            object.left.tag() != Value::Tag::Nil ||
+            object.right.tag() != Value::Tag::Nil) {
+            throw std::logic_error("string descriptor length does not match opaque byte payload");
         }
         return;
     }
@@ -106,6 +122,8 @@ void visit_reference_fields(Object& object, Fn&& fn) {
             fn(element);
         }
         return;
+    case ObjectKind::Str:
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -124,6 +142,8 @@ void visit_reference_fields(const Object& object, Fn&& fn) {
         for (const auto& element : object.ref_elements) {
             fn(element);
         }
+        return;
+    case ObjectKind::Str:
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -147,6 +167,8 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
         for (std::size_t i = object.ref_elements.size(); i > 0; --i) {
             fn(object.ref_elements[i - 1]);
         }
+        return;
+    case ObjectKind::Str:
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -187,6 +209,19 @@ Object Object::ref_array(std::size_t length, Value init) {
     object.left = Value::nil();
     object.right = Value::nil();
     object.ref_elements.assign(length, init);
+    return object;
+}
+
+Object Object::string(std::span<const std::uint8_t> bytes) {
+    if (bytes.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("string length exceeds object header limit");
+    }
+    Object object;
+    object.kind = ObjectKind::Str;
+    object.length = static_cast<std::uint32_t>(bytes.size());
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.string_bytes.assign(bytes.begin(), bytes.end());
     return object;
 }
 
@@ -370,6 +405,56 @@ ObjectId Heap::allocate_ref_array(std::size_t length, Value init) {
     return id;
 }
 
+ObjectId Heap::allocate_string(std::span<const std::uint8_t> bytes) {
+    if (stress_config_.collect_before_every_allocation) {
+        collect_with_extra_roots({});
+    }
+
+    auto id = allocate_object(Object::string(bytes));
+
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+
+    return id;
+}
+
+ObjectId Heap::allocate_string_concat(Value left, Value right) {
+    require_object_reference_value(left, "string concat left operand");
+    require_object_reference_value(right, "string concat right operand");
+    (void)checked_string(left.as_object());
+    (void)checked_string(right.as_object());
+
+    if (stress_config_.collect_before_every_allocation) {
+        std::array<Value*, 2> operand_roots{&left, &right};
+        collect_with_extra_roots(operand_roots);
+    }
+
+    const auto left_bytes = string_bytes(left.as_object());
+    const auto right_bytes = string_bytes(right.as_object());
+    if (right_bytes.size() >
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) -
+            left_bytes.size()) {
+        throw std::length_error("string concatenation exceeds object header limit");
+    }
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(left_bytes.size() + right_bytes.size());
+    bytes.insert(bytes.end(), left_bytes.begin(), left_bytes.end());
+    bytes.insert(bytes.end(), right_bytes.begin(), right_bytes.end());
+
+    auto id = allocate_object(Object::string(bytes));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+    return id;
+}
+
 Handle Heap::make_handle(Value value) {
     if (value.is_object()) {
         (void)checked_slot(value.as_object());
@@ -525,6 +610,15 @@ Object& Heap::checked_ref_array(ObjectId id) {
     return object;
 }
 
+const Object& Heap::checked_string(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Str) {
+        throw std::logic_error("object is not a string");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
 void Heap::register_handle_root(Value* slot) {
     assert(slot != nullptr && "cannot register a null GC handle root slot");
     handle_roots_.push_back(slot);
@@ -610,6 +704,29 @@ Value Heap::ref_array_get(ObjectId id, std::size_t index) const {
 
 void Heap::ref_array_set(ObjectId id, std::size_t index, Value value) {
     store_ref_array_element(id, index, value);
+}
+
+std::size_t Heap::string_length(ObjectId id) const {
+    return checked_string(id).length;
+}
+
+std::span<const std::uint8_t> Heap::string_bytes(ObjectId id) const {
+    return checked_string(id).string_bytes;
+}
+
+bool Heap::string_equal(ObjectId left, ObjectId right) const {
+    const auto left_bytes = string_bytes(left);
+    const auto right_bytes = string_bytes(right);
+    return left_bytes.size() == right_bytes.size() &&
+           std::equal(left_bytes.begin(), left_bytes.end(), right_bytes.begin());
+}
+
+std::uint8_t Heap::string_index(ObjectId id, std::size_t index) const {
+    const auto bytes = string_bytes(id);
+    if (index >= bytes.size()) {
+        throw std::out_of_range("string index out of bounds");
+    }
+    return bytes[index];
 }
 
 void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
@@ -1046,6 +1163,10 @@ bool Heap::TEST_ONLY_is_scalar_array(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_ref_array(ObjectId id) const {
     return object(id).kind == ObjectKind::RefArray;
+}
+
+bool Heap::TEST_ONLY_is_string(ObjectId id) const {
+    return object(id).kind == ObjectKind::Str;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {

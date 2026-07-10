@@ -25,14 +25,15 @@ Frontend implementation files are split by pipeline stage while keeping
 
 The source language is intentionally small:
 
-- Types are `i64`, `bool`, opaque `pair`, finite parametric `pair<T, U>`, array
+- Types are `i64`, `bool`, `str`, opaque `pair`, finite parametric `pair<T, U>`, array
   types `[T]`, and named pair declarations such as `type List = pair<i64, List>;`.
 - Top-level `let name: type = expression;` declarations introduce initialized locals.
 - Assignment supports locals, `pair` fields (`left` and `right`), and array elements
   (`a[i] = v`).
-- Expressions include i64/bool literals, variables, `+`, `<`, `pair(left, right)`, field
-  access, `[v, ...]` array literals, `array<T>(len, init)` sized array construction,
-  array indexing `a[i]`, array length `a.len`, and parentheses.
+- Expressions include i64/bool/string literals, variables, numeric/string `+`, `<`, string
+  `==`/`!=`, `pair(left, right)`, field access, `[v, ...]` array literals,
+  `array<T>(len, init)` sized array construction, array/string indexing, `.len`, and
+  parentheses.
 - `if condition { ... } else { ... }` and `while condition { ... }` are statement forms.
 - Function declarations use `fn name(a: i64, b: pair<i64, pair>) -> pair<i64, bool> { ... }`.
   Function bodies have the same shape as the top level: statements followed by a final
@@ -43,8 +44,9 @@ The source language is intentionally small:
   `if is_nil(local) { ... } else { ... }` statement.
 - A program ends with a final expression, which becomes the VM result.
 
-Minimal cuts: there are no strings, expression-valued blocks, first-class functions, or
-block-local `let` declarations. Bare `pair` remains an opaque pair leaf type for
+Minimal cuts: there are no substrings, string interning/mutation, expression-valued blocks,
+first-class functions, or block-local `let` declarations. Bare `pair` remains an opaque
+pair leaf type for
 compatibility: it proves only "object" at function boundaries, so field reads through bare
 pair parameters/returns are rejected as unknown. Inside a function, the type checker still
 tracks pair field types flow-sensitively by allocation site, so old local pair-field reads
@@ -72,10 +74,18 @@ indexing a reference array returns the declared element type as known non-nil. T
 element recovery is what allows `pairs[i].left`, `[List]` element field reads, and
 `grid[i][j]` for `[[i64]]` even though `RefArrayGet` is a coarse bytecode operation.
 
+Source strings are immutable byte sequences. Double-quoted literals decode `\n`, `\t`,
+`\\`, and `\"` into a per-module constant pool. `str + str` allocates a new string,
+`==` and `!=` compare bytes structurally, `.len` returns the byte count, and `s[i]`
+returns the unsigned byte widened to `i64`. String indexing traps deterministically when
+out of bounds; indexed assignment is rejected because no string payload-store operation
+exists.
+
 ## Runtime scaffold
 
 - `lang::Module` stores a designated entry function, all callable `lang::Function`
-  bodies, and a finite named-type table. Each function carries a `FunctionSignature` of
+  bodies, a finite named-type table, and decoded string constant bytes. Each function
+  carries a `FunctionSignature` of
   coarse parameter/return kinds, optional detailed `SignatureValue` pair-field types,
   array element types, or named-type back-references, bytecode, local count, and optional
   stack maps.
@@ -122,11 +132,13 @@ element recovery is what allows `pairs[i].left`, `[List]` element field reads, a
   reserves a descriptor-sized logical storage run and stores a raw contiguous
   `std::int64_t` payload that is not a `Value` sequence. `RefArray` reserves the same
   variable-width storage shape but stores a contiguous tagged `Value` payload whose every
-  element is a non-null, descriptor-declared object-reference slot.
+  element is a non-null, descriptor-declared object-reference slot. `Str` stores immutable
+  raw bytes and reserves one header slot plus the byte payload rounded up to the
+  `std::int64_t` storage-slot granularity.
 - All heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two tagged
   fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
-  Raw scalar array elements are never marked, forwarded, validated as references, or
-  entered into the remembered-set logic.
+  It also scans zero `Str` payload slots. Raw scalar elements and string bytes are never
+  marked, forwarded, validated as references, or entered into remembered-set logic.
 - Pair field types, array element types, and named recursive types are verification-time
   metadata only. They do not change `Value`, object layout, stack-map format, root
   tracing, write barriers, forwarding, movement, or heap validation.
@@ -135,6 +147,8 @@ element recovery is what allows `pairs[i].left`, `[List]` element field reads, a
   reference-publishing mutation hook points exposed to bytecode, and each runs the
   generational old-to-young write barrier before the new reference is published.
   `ArraySet` writes raw scalar payload and therefore does not run the write barrier.
+  Strings expose only construction and const byte access; there is no string write barrier
+  because no post-construction payload mutation exists.
 - Deterministic GC stress is configured with explicit counters: before every allocation,
   after every allocation, after every barrier-triggering old-to-young store, every N
   major-collection bytecode instructions, and every N minor-collection bytecode
@@ -231,6 +245,10 @@ Compiler accommodations for verifier strictness:
   asserts this representation split before returning the verifier-produced
   `VerifiedModule`, and detailed `SignatureValue` array elements let the verifier recover
   the declared element shape after `RefArrayGet`.
+- Strings: the compiler appends decoded literals to one deterministic per-module pool and
+  emits `PushStr`; checked concat/equality/length/index constructs emit `StrConcat`,
+  `StrEq`, `StrLen`, and `StrIndex`. `ValueKind::Str` remains distinct from pairs and
+  arrays, while verifier stack maps mark it with the same precise object-reference bit.
 - Recursive named pairs: the compiler emits the module named-type table before compiling
   signatures, lowers named references to table indices, emits `Nil` for `nil`, and emits
   `IsNil` for nil checks. The type checker and verifier both refine only a checked local,
@@ -309,7 +327,7 @@ makes missed updates fail as stale IDs.
 
 The heap has two logical object generations on top of the same slot vector:
 
-- New pair and scalar-array allocations are young.
+- New pair, array, and string allocations are young.
 - Any young object that survives one collection is promoted to old. This one-survival
   policy keeps the phase deterministic and makes promotion independent of wall-clock age or
   allocation rate.
@@ -334,6 +352,7 @@ The heap has two logical object generations on top of the same slot vector:
   publishing the value. The public heap API does not expose mutable pair fields or
   RefArray elements directly, protecting the barrier-completeness invariant. Scalar arrays
   do not contain reference slots, so `ArraySet` cannot publish an object reference.
+  Strings are immutable and therefore have no mutation hook or remembered-set entry.
 
 Rejected alternative: keep old objects fixed during minor collection and compact only young
 slots. That would reduce forwarding work, but it would leave minor collection unable to
@@ -350,7 +369,7 @@ remembered-set entries.
   `LoadLocal` requires a known initialized kind on every incoming path.
 - Root precision: `verify_with_stack_maps` emits per-function per-pc stack reference maps
   from the verifier's abstract states. A true bit means the slot may contain an object
-  reference, including pair objects, scalar arrays, and RefArrays; nullable named-pair
+  reference, including pair objects, scalar arrays, RefArrays, and strings; nullable named-pair
   slots may contain `nil` in the same reference-capable slot. Hand-written maps, when
   present, must match the verifier state, and VM-controlled collection points assert that
   the active frame's runtime stack tags agree with the generated map for the current
@@ -384,7 +403,8 @@ remembered-set entries.
   layout. Scalar arrays and RefArrays are bytecode-only reference-capable values, but
   stack maps keep the same single reference/non-reference bit per stack slot, and the
   VM/heap continue to trace, barrier, forward, and validate by runtime `Value` tags plus
-  heap object descriptors.
+  heap object descriptors. `Str` adds a distinct verification kind without changing the
+  runtime `Value` tag or stack-map format.
 - Source agreement: `compile_program` does not return bytecode for rejected source, and
   every returned `VerifiedModule` has passed module verification with generated stack
   maps. The returned proof is the single blessed execution product and carries that same
@@ -395,7 +415,8 @@ remembered-set entries.
 
 - Stack height is invariant at a merge; different heights reject immediately to protect
   stack-depth safety.
-- Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `Nil`, and `Poison`; recursive
+- Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `RefArray`, `Str`, `Nil`, and
+  `Poison`; recursive
   named values use `Object` with an explicit nullable bit rather than a new runtime kind.
 - Equal non-object/non-array kinds join to themselves; array kinds join only to array;
   object kinds join to object with the union of possible allocation sites, an opaque-object

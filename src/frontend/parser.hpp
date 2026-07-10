@@ -15,6 +15,7 @@ struct TypeSpec {
     enum class Kind {
         Int64,
         Bool,
+        Str,
         Pair,
         Array,
         Named,
@@ -37,6 +38,7 @@ struct TypeSpec {
 
 TypeSpec int64_type();
 TypeSpec bool_type();
+TypeSpec str_type();
 TypeSpec pair_type();
 TypeSpec named_type(std::string name, SourcePosition position);
 TypeSpec nil_type();
@@ -56,6 +58,7 @@ struct Expr {
     enum class Kind {
         IntLiteral,
         BoolLiteral,
+        StringLiteral,
         NilLiteral,
         Variable,
         PairLiteral,
@@ -74,6 +77,7 @@ struct Expr {
     SourcePosition operator_position;
     std::int64_t int_value{0};
     bool bool_value{false};
+    std::string string_value;
     std::string name;
     char binary_op{0};
     std::size_t pair_site{0};

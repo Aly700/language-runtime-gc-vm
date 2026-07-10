@@ -35,6 +35,11 @@ enum class OpCode {
     AllocRefArray,
     RefArrayGet,
     RefArraySet,
+    PushStr,
+    StrLen,
+    StrEq,
+    StrConcat,
+    StrIndex,
 };
 
 struct Instruction {
@@ -48,6 +53,7 @@ enum class ValueKind {
     Object,
     Array,
     Nil,
+    Str,
 };
 
 struct SignatureValue {
@@ -129,6 +135,7 @@ struct Module {
     std::vector<Function> functions;
     std::size_t entry_function{0};
     std::vector<NamedTypeSignature> named_types;
+    std::vector<std::string> string_constants;
 };
 
 struct VerificationResult {
@@ -189,6 +196,8 @@ enum class VerifierReason {
     BadCallArgKind,            // Call argument kind or detailed pair shape is invalid.
     BadReturnKind,             // Return value kind or detailed pair shape is invalid.
     InvalidOpcode,             // Instruction opcode is not a known OpCode value.
+    BadStringConstantIndex,    // PushStr operand is outside the module string pool.
+    BadStringOperation,        // String operation consumes the wrong stack shape or kind.
 };
 
 struct VerifierDiagnostic {

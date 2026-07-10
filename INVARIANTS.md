@@ -22,7 +22,7 @@
 - Every heap object has a descriptor derived from its header kind and length. The
   collector may inspect only descriptor-declared reference slots: `Pair` scans its two
   tagged `Value` fields, `RefArray` scans every tagged `Value` object-reference payload
-  slot, and `ScalarArray` scans zero payload slots.
+  slot, and `ScalarArray` and `Str` scan zero payload slots.
 - Reference-bearing variable-length payloads must be expressed through the same
   descriptor visitor as fixed-size objects. Marking, forwarding, remembered-set
   validation, and post-collection validation may not add one-off object-kind scans
@@ -31,6 +31,11 @@
   element's bit pattern equals a valid or stale `ObjectId`, marking, forwarding,
   remembered-set validation, and post-collection validation must not interpret it as a
   reference or rewrite it.
+- `Str` payload elements are immutable raw bytes, not tagged `Value`s. Even if any byte
+  sequence has the exact bit pattern of a live, dead, stale, or forwarded `ObjectId`,
+  marking, forwarding, remembered-set validation, and post-collection validation must not
+  interpret it as a reference or rewrite it. Strings expose no payload-store API and have
+  no write-barrier path after construction.
 - Object IDs name object base slots only. Payload/reserved storage slots are never valid
   object headers, and variable-size compaction must advance by the descriptor storage
   width without allowing overlapping live objects.
@@ -39,9 +44,17 @@
 - Every live embedder handle is a precise mutable root slot; handle destruction removes that slot before the next collection, and the heap must outlive all handles.
 - Write barriers must run on every old-to-young reference store once generations exist,
   including `Pair` field stores and `RefArray` element stores. Raw `ScalarArray` stores
-  are not reference-publishing mutations and must not enter the remembered set.
+  are not reference-publishing mutations and must not enter the remembered set; immutable
+  strings cannot publish references at all.
 
 ## Frontend
+
+- `str` values compile to the distinct verifier `Str` kind and runtime `ObjectKind::Str`.
+  Literals decode into the per-module constant pool; concat, equality, length, and byte
+  indexing must preserve the compile-boundary agreement invariant and string stack slots
+  must be marked as precise object roots.
+- String indexing is read-only and returns an unsigned byte widened to `i64`. The frontend
+  must reject indexed string assignment before bytecode generation.
 
 - A source array type's element type determines its runtime representation at the compile
   boundary: `[i64]` and `[bool]` must emit only scalar `AllocArray`/`ArrayGet`/`ArraySet`

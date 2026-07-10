@@ -87,6 +87,16 @@ const char* op_name(lang::OpCode op) {
         return "RefArrayGet";
     case lang::OpCode::RefArraySet:
         return "RefArraySet";
+    case lang::OpCode::PushStr:
+        return "PushStr";
+    case lang::OpCode::StrLen:
+        return "StrLen";
+    case lang::OpCode::StrEq:
+        return "StrEq";
+    case lang::OpCode::StrConcat:
+        return "StrConcat";
+    case lang::OpCode::StrIndex:
+        return "StrIndex";
     }
     return "<unknown>";
 }
@@ -103,6 +113,8 @@ const char* value_kind_name(lang::ValueKind kind) {
         return "array";
     case lang::ValueKind::Nil:
         return "nil";
+    case lang::ValueKind::Str:
+        return "str";
     }
     return "<unknown>";
 }
@@ -193,6 +205,7 @@ enum class Kind {
     Object,
     Array,
     RefArray,
+    Str,
 };
 
 Kind kind_from_value_kind(lang::ValueKind kind) {
@@ -205,6 +218,8 @@ Kind kind_from_value_kind(lang::ValueKind kind) {
         return Kind::Object;
     case lang::ValueKind::Array:
         return Kind::Array;
+    case lang::ValueKind::Str:
+        return Kind::Str;
     case lang::ValueKind::Nil:
         break;
     }
@@ -426,7 +441,7 @@ private:
     void pop_reference() {
         const auto actual = pop_any();
         assert(actual == Kind::Object || actual == Kind::Array ||
-               actual == Kind::RefArray);
+               actual == Kind::RefArray || actual == Kind::Str);
     }
 
     void pop_expect(Kind expected) {

@@ -53,12 +53,14 @@ enum class ObjectKind {
     Pair,
     ScalarArray,
     RefArray,
+    Str,
 };
 
 struct Object {
     static Object pair(Value left, Value right);
     static Object scalar_array(std::size_t length, std::int64_t init);
     static Object ref_array(std::size_t length, Value init);
+    static Object string(std::span<const std::uint8_t> bytes);
 
     bool marked{false};
     ObjectGeneration generation{ObjectGeneration::Young};
@@ -68,6 +70,7 @@ struct Object {
     Value right{Value::nil()};
     std::vector<std::int64_t> scalar_elements;
     std::vector<Value> ref_elements;
+    std::vector<std::uint8_t> string_bytes;
 };
 
 class Handle {
@@ -107,6 +110,8 @@ public:
 
     ObjectId allocate_pair(Value left, Value right);
     ObjectId allocate_scalar_array(std::size_t length, std::int64_t init);
+    ObjectId allocate_string(std::span<const std::uint8_t> bytes);
+    ObjectId allocate_string_concat(Value left, Value right);
     [[nodiscard]] Handle make_handle(Value value);
     [[nodiscard]] Handle make_handle(ObjectId id);
     void set_root_provider(RootProvider* provider) { root_provider_ = provider; }
@@ -128,6 +133,10 @@ public:
     [[nodiscard]] std::size_t ref_array_length(ObjectId id) const;
     [[nodiscard]] Value ref_array_get(ObjectId id, std::size_t index) const;
     void ref_array_set(ObjectId id, std::size_t index, Value value);
+    [[nodiscard]] std::size_t string_length(ObjectId id) const;
+    [[nodiscard]] std::span<const std::uint8_t> string_bytes(ObjectId id) const;
+    [[nodiscard]] bool string_equal(ObjectId left, ObjectId right) const;
+    [[nodiscard]] std::uint8_t string_index(ObjectId id, std::size_t index) const;
     [[nodiscard]] std::size_t live_count() const;
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
@@ -137,6 +146,7 @@ public:
     [[nodiscard]] bool TEST_ONLY_is_old_object(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_scalar_array(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_ref_array(ObjectId id) const;
+    [[nodiscard]] bool TEST_ONLY_is_string(ObjectId id) const;
     [[nodiscard]] std::size_t TEST_ONLY_remembered_set_size() const {
         return remembered_set_.size();
     }
@@ -178,6 +188,7 @@ private:
     [[nodiscard]] Object& checked_scalar_array(ObjectId id);
     [[nodiscard]] const Object& checked_ref_array(ObjectId id) const;
     [[nodiscard]] Object& checked_ref_array(ObjectId id);
+    [[nodiscard]] const Object& checked_string(ObjectId id) const;
     void register_handle_root(Value* slot);
     void deregister_handle_root(Value* slot) noexcept;
     void move_handle_root(Value* from, Value* to) noexcept;
