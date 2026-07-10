@@ -146,18 +146,37 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
     std::vector<lang::ObjectId> order;
     (void)value_token(heap, lang::Value::object(root), indexes, order);
 
-    std::vector<std::pair<std::string, std::string>> fields;
+    std::vector<std::string> objects;
     for (std::size_t i = 0; i < order.size(); ++i) {
         const auto& object = heap.object(order[i]);
-        fields.push_back({value_token(heap, object.left, indexes, order),
-                          value_token(heap, object.right, indexes, order)});
+        std::ostringstream rendered;
+        switch (object.kind) {
+        case lang::gc::ObjectKind::Pair:
+            rendered << "pair("
+                     << value_token(heap, heap.left(order[i]), indexes, order)
+                     << ", "
+                     << value_token(heap, heap.right(order[i]), indexes, order)
+                     << ")";
+            break;
+        case lang::gc::ObjectKind::ScalarArray:
+            rendered << "array[" << heap.array_length(order[i]) << "](";
+            for (std::size_t element = 0; element < heap.array_length(order[i]);
+                 ++element) {
+                if (element != 0) {
+                    rendered << ", ";
+                }
+                rendered << heap.array_get(order[i], element);
+            }
+            rendered << ")";
+            break;
+        }
+        objects.push_back(rendered.str());
     }
 
     std::ostringstream out;
     out << "object(@0)";
-    for (std::size_t i = 0; i < fields.size(); ++i) {
-        out << "\n  @" << i << " = pair(" << fields[i].first << ", "
-            << fields[i].second << ")";
+    for (std::size_t i = 0; i < objects.size(); ++i) {
+        out << "\n  @" << i << " = " << objects[i];
     }
     return out.str();
 }

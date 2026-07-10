@@ -42,7 +42,106 @@ std::uint32_t next_generation(std::uint32_t generation) {
     return generation + 1;
 }
 
+std::uint32_t generation_for_new_base(std::uint32_t generation) {
+    if (generation == 0) {
+        return kFirstGeneration;
+    }
+    return next_generation(generation);
+}
+
+std::size_t storage_slot_count(const Object& object) {
+    switch (object.kind) {
+    case ObjectKind::Pair:
+        return 1;
+    case ObjectKind::ScalarArray:
+        return object.length == 0 ? 1 : object.length;
+    }
+    throw std::logic_error("unknown object kind");
+}
+
+void validate_descriptor_shape(const Object& object) {
+    switch (object.kind) {
+    case ObjectKind::Pair:
+        if (object.length != 2 || !object.scalar_elements.empty()) {
+            throw std::logic_error("pair object descriptor does not match pair payload");
+        }
+        return;
+    case ObjectKind::ScalarArray:
+        if (object.scalar_elements.size() != object.length) {
+            throw std::logic_error("scalar array descriptor length does not match payload");
+        }
+        return;
+    }
+    throw std::logic_error("unknown object kind");
+}
+
+template <typename Fn>
+void visit_reference_fields(Object& object, Fn&& fn) {
+    validate_descriptor_shape(object);
+    switch (object.kind) {
+    case ObjectKind::Pair:
+        fn(object.left);
+        fn(object.right);
+        return;
+    case ObjectKind::ScalarArray:
+        return;
+    }
+    throw std::logic_error("unknown object kind");
+}
+
+template <typename Fn>
+void visit_reference_fields(const Object& object, Fn&& fn) {
+    validate_descriptor_shape(object);
+    switch (object.kind) {
+    case ObjectKind::Pair:
+        fn(object.left);
+        fn(object.right);
+        return;
+    case ObjectKind::ScalarArray:
+        return;
+    }
+    throw std::logic_error("unknown object kind");
+}
+
+template <typename Fn>
+void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
+    validate_descriptor_shape(object);
+    switch (object.kind) {
+    case ObjectKind::Pair:
+        // The mark worklist is LIFO, so right then left preserves the pre-existing
+        // left-before-right trace order while keeping the scan descriptor-owned.
+        fn(object.right);
+        fn(object.left);
+        return;
+    case ObjectKind::ScalarArray:
+        return;
+    }
+    throw std::logic_error("unknown object kind");
+}
+
 } // namespace
+
+Object Object::pair(Value left_value, Value right_value) {
+    Object object;
+    object.kind = ObjectKind::Pair;
+    object.length = 2;
+    object.left = left_value;
+    object.right = right_value;
+    return object;
+}
+
+Object Object::scalar_array(std::size_t length, std::int64_t init) {
+    if (length > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("scalar array length exceeds object header limit");
+    }
+    Object object;
+    object.kind = ObjectKind::ScalarArray;
+    object.length = static_cast<std::uint32_t>(length);
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.scalar_elements.assign(length, init);
+    return object;
+}
 
 void Handle::ensure_usable() const {
     if (heap_ == nullptr) {
@@ -176,7 +275,24 @@ ObjectId Heap::allocate_pair(Value left, Value right) {
         collect_with_extra_roots(operand_roots);
     }
 
-    auto id = allocate_slot(left, right);
+    auto id = allocate_object(Object::pair(left, right));
+
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+
+    return id;
+}
+
+ObjectId Heap::allocate_scalar_array(std::size_t length, std::int64_t init) {
+    if (stress_config_.collect_before_every_allocation) {
+        collect_with_extra_roots({});
+    }
+
+    auto id = allocate_object(Object::scalar_array(length, init));
 
     if (stress_config_.collect_after_every_allocation) {
         Value allocated = Value::object(id);
@@ -200,29 +316,75 @@ Handle Heap::make_handle(ObjectId id) {
     return Handle(*this, Value::object(id));
 }
 
-ObjectId Heap::allocate_slot(Value left, Value right) {
-    for (std::size_t i = 0; i < objects_.size(); ++i) {
-        if (!objects_[i].has_value()) {
-            generations_[i] = next_generation(generations_[i]);
-            objects_[i] = Object{false, ObjectGeneration::Young, left, right};
-            ++metrics_.allocations;
-            if (objects_.size() > metrics_.heap_peak_slots) {
-                metrics_.heap_peak_slots = objects_.size();
-            }
-            return make_object_id(static_cast<std::uint32_t>(i), generations_[i]);
+ObjectId Heap::allocate_object(Object object) {
+    validate_descriptor_shape(object);
+    const auto required_slots = storage_slot_count(object);
+    auto base = find_free_storage_run(required_slots);
+    if (!base.has_value()) {
+        const auto old_size = objects_.size();
+        if (required_slots >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) -
+                old_size + 1) {
+            throw std::length_error("heap object slot limit exceeded");
         }
+        objects_.resize(old_size + required_slots);
+        generations_.resize(old_size + required_slots, 0);
+        base = old_size;
     }
 
-    if (objects_.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::length_error("heap object slot limit exceeded");
+    assert(base.has_value());
+    assert(*base < objects_.size());
+    const auto base_slot = *base;
+    for (std::size_t offset = 0; offset < required_slots; ++offset) {
+        assert(is_storage_slot_free(base_slot + offset) &&
+               "allocator selected a storage run overlapping a live object");
     }
-    objects_.push_back(Object{false, ObjectGeneration::Young, left, right});
-    generations_.push_back(kFirstGeneration);
+
+    generations_[base_slot] = generation_for_new_base(generations_[base_slot]);
+    object.marked = false;
+    object.generation = ObjectGeneration::Young;
+    objects_[base_slot] = std::move(object);
     ++metrics_.allocations;
     if (objects_.size() > metrics_.heap_peak_slots) {
         metrics_.heap_peak_slots = objects_.size();
     }
-    return make_object_id(static_cast<std::uint32_t>(objects_.size() - 1), kFirstGeneration);
+    return make_object_id(static_cast<std::uint32_t>(base_slot), generations_[base_slot]);
+}
+
+std::optional<std::size_t> Heap::find_free_storage_run(std::size_t required_slots) const {
+    assert(required_slots > 0 && "heap objects must reserve at least one storage slot");
+    for (std::size_t base = 0; base + required_slots <= objects_.size(); ++base) {
+        bool free = true;
+        for (std::size_t offset = 0; offset < required_slots; ++offset) {
+            if (!is_storage_slot_free(base + offset)) {
+                free = false;
+                break;
+            }
+        }
+        if (free) {
+            return base;
+        }
+    }
+    return std::nullopt;
+}
+
+bool Heap::is_storage_slot_free(std::size_t slot) const {
+    if (slot >= objects_.size()) {
+        return false;
+    }
+    if (objects_[slot].has_value()) {
+        return false;
+    }
+    for (std::size_t base = 0; base < objects_.size(); ++base) {
+        if (!objects_[base].has_value()) {
+            continue;
+        }
+        const auto width = storage_slot_count(*objects_[base]);
+        if (base < slot && slot < base + width) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::size_t Heap::checked_slot(ObjectId id) const {
@@ -241,6 +403,42 @@ const Object& Heap::object(ObjectId id) const {
 
 Object& Heap::mutable_object(ObjectId id) {
     return *objects_[checked_slot(id)];
+}
+
+const Object& Heap::checked_pair(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Pair) {
+        throw std::logic_error("object is not a pair");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object& Heap::checked_pair(ObjectId id) {
+    auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Pair) {
+        throw std::logic_error("object is not a pair");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
+const Object& Heap::checked_scalar_array(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::ScalarArray) {
+        throw std::logic_error("object is not a scalar array");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object& Heap::checked_scalar_array(ObjectId id) {
+    auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::ScalarArray) {
+        throw std::logic_error("object is not a scalar array");
+    }
+    validate_descriptor_shape(object);
+    return object;
 }
 
 void Heap::register_handle_root(Value* slot) {
@@ -279,11 +477,11 @@ void Heap::trace_handle_roots(RootVisitor& visitor) const {
 }
 
 Value Heap::left(ObjectId id) const {
-    return object(id).left;
+    return checked_pair(id).left;
 }
 
 Value Heap::right(ObjectId id) const {
-    return object(id).right;
+    return checked_pair(id).right;
 }
 
 void Heap::set_left(ObjectId id, Value value) {
@@ -294,13 +492,33 @@ void Heap::set_right(ObjectId id, Value value) {
     store_pair_field(id, PairField::Right, value);
 }
 
+std::size_t Heap::array_length(ObjectId id) const {
+    return checked_scalar_array(id).length;
+}
+
+std::int64_t Heap::array_get(ObjectId id, std::size_t index) const {
+    const auto& object = checked_scalar_array(id);
+    if (index >= object.scalar_elements.size()) {
+        throw std::out_of_range("scalar array index out of bounds");
+    }
+    return object.scalar_elements[index];
+}
+
+void Heap::array_set(ObjectId id, std::size_t index, std::int64_t value) {
+    auto& object = checked_scalar_array(id);
+    if (index >= object.scalar_elements.size()) {
+        throw std::out_of_range("scalar array index out of bounds");
+    }
+    object.scalar_elements[index] = value;
+}
+
 void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     // Barrier hook: every pair field mutation must flow through this method. The public
     // heap API intentionally exposes only const object inspection plus set_left/set_right,
     // so bytecode cannot publish a field without running this old-to-young barrier.
+    auto& obj = checked_pair(id);
     const bool barrier_triggered = record_write_barrier_if_needed(id, value);
 
-    auto& obj = mutable_object(id);
     if (field == PairField::Left) {
         obj.left = value;
     } else {
@@ -389,10 +607,9 @@ void Heap::enqueue_young_references_from_remembered_set(std::vector<ObjectId>& w
         if (!is_old_slot(slot)) {
             throw std::logic_error("remembered-set entry does not name an old object");
         }
-        const auto& obj = *objects_[slot];
-        // Push right first so the LIFO worklist processes left before right.
-        enqueue_mark_value(obj.right, worklist, CollectionKind::Minor);
-        enqueue_mark_value(obj.left, worklist, CollectionKind::Minor);
+        visit_reference_fields_for_lifo_marking(*objects_[slot], [&](Value value) {
+            enqueue_mark_value(value, worklist, CollectionKind::Minor);
+        });
     }
 }
 
@@ -412,9 +629,9 @@ void Heap::drain_mark_worklist(std::vector<ObjectId>& worklist, CollectionKind k
         }
         obj.marked = true;
 
-        // Push right first so the LIFO worklist processes left before right.
-        enqueue_mark_value(obj.right, worklist, kind);
-        enqueue_mark_value(obj.left, worklist, kind);
+        visit_reference_fields_for_lifo_marking(obj, [&](Value value) {
+            enqueue_mark_value(value, worklist, kind);
+        });
     }
 }
 
@@ -439,6 +656,7 @@ void Heap::collect_with_extra_roots(std::span<Value*> extra_roots) {
 }
 
 void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots) {
+    validate_heap_storage_layout();
     validate_remembered_set();
     if (kind == CollectionKind::Major) {
         ++metrics_.major_collections;
@@ -509,8 +727,14 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
             moved.generation = ObjectGeneration::Old;
         }
 
+        const auto required_slots = storage_slot_count(moved);
+        if (next_live_slot + required_slots > result.objects.size()) {
+            throw std::logic_error("compaction cursor exceeded heap storage capacity");
+        }
+
         if (old_slot != next_live_slot) {
-            result.generations[next_live_slot] = next_generation(result.generations[next_live_slot]);
+            result.generations[next_live_slot] =
+                generation_for_new_base(result.generations[next_live_slot]);
             ++result.objects_moved;
         }
 
@@ -519,7 +743,7 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
                            result.generations[next_live_slot]);
         result.forwarding[old_slot] = new_id;
         result.objects[next_live_slot] = moved;
-        ++next_live_slot;
+        next_live_slot += required_slots;
     }
 
     return result;
@@ -535,8 +759,9 @@ void Heap::rewrite_references(const ForwardingTable& forwarding,
         if (!slot.has_value()) {
             continue;
         }
-        rewrite_value(slot->left, forwarding);
-        rewrite_value(slot->right, forwarding);
+        visit_reference_fields(*slot, [&](Value& field) {
+            rewrite_value(field, forwarding);
+        });
     }
 }
 
@@ -584,15 +809,14 @@ void Heap::prune_remembered_set() {
             continue;
         }
 
-        const auto& obj = *objects_[slot];
         bool has_young_reference = false;
-        for (const auto value : {obj.left, obj.right}) {
+        visit_reference_fields(*objects_[slot], [&](Value value) {
             if (!value.is_object()) {
-                continue;
+                return;
             }
             const auto target_slot = checked_slot(value.as_object());
             has_young_reference = has_young_reference || is_young_slot(target_slot);
-        }
+        });
         if (has_young_reference) {
             pruned.push_back(make_object_id(static_cast<std::uint32_t>(slot), generations_[slot]));
         }
@@ -600,8 +824,37 @@ void Heap::prune_remembered_set() {
     remembered_set_ = std::move(pruned);
 }
 
+void Heap::validate_heap_storage_layout() const {
+    std::vector<bool> covered(objects_.size(), false);
+    for (std::size_t base = 0; base < objects_.size(); ++base) {
+        if (!objects_[base].has_value()) {
+            continue;
+        }
+        if (covered[base]) {
+            throw std::logic_error("heap object header overlaps another object's storage run");
+        }
+        validate_descriptor_shape(*objects_[base]);
+        const auto width = storage_slot_count(*objects_[base]);
+        if (width == 0 || base + width > objects_.size()) {
+            throw std::logic_error("heap object descriptor extends past heap storage");
+        }
+        for (std::size_t offset = 0; offset < width; ++offset) {
+            const auto slot = base + offset;
+            if (covered[slot]) {
+                throw std::logic_error("heap object storage runs overlap");
+            }
+            if (offset != 0 && objects_[slot].has_value()) {
+                throw std::logic_error("heap object payload slot contains an object header");
+            }
+            covered[slot] = true;
+        }
+    }
+}
+
 void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const {
     ++TEST_ONLY_validation_count_;
+
+    validate_heap_storage_layout();
 
     ValidatingVisitor visitor(*this);
     trace_collection_roots(visitor, roots, extra_roots);
@@ -611,8 +864,10 @@ void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extr
             continue;
         }
         assert(!slot->marked && "collector invariant violated: mark bit survived collection");
-        validate_value(slot->left);
-        validate_value(slot->right);
+        validate_descriptor_shape(*slot);
+        visit_reference_fields(*slot, [&](Value value) {
+            validate_value(value);
+        });
     }
 
     validate_remembered_set();
@@ -632,17 +887,16 @@ void Heap::validate_remembered_set() const {
         }
 
         const auto owner = make_object_id(static_cast<std::uint32_t>(slot), generations_[slot]);
-        const auto& obj = *objects_[slot];
-        for (const auto value : {obj.left, obj.right}) {
+        visit_reference_fields(*objects_[slot], [&](Value value) {
             if (!value.is_object()) {
-                continue;
+                return;
             }
             const auto target_slot = checked_slot(value.as_object());
             if (is_young_slot(target_slot) && !remembered_set_contains(owner)) {
                 throw std::logic_error(
                     "old-to-young reference missing remembered-set entry");
             }
-        }
+        });
     }
 }
 
@@ -669,6 +923,10 @@ bool Heap::TEST_ONLY_is_young_object(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_old_object(ObjectId id) const {
     return is_old_slot(checked_slot(id));
+}
+
+bool Heap::TEST_ONLY_is_scalar_array(ObjectId id) const {
+    return object(id).kind == ObjectKind::ScalarArray;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {

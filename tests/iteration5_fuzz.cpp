@@ -27,12 +27,14 @@ using fuzz::schedules;
 
 constexpr std::uint64_t kSnapshotSeed = 17;
 constexpr std::uint64_t kCallSnapshotSeed = 17;
+constexpr std::uint64_t kArraySnapshotSeed = 17;
 constexpr std::uint64_t kFirstCorpusSeed = 1;
 constexpr std::uint64_t kCorpusSize = 64;
 
 enum class Grammar {
     Single,
     Calls,
+    Arrays,
 };
 
 const char* op_name(lang::OpCode op) {
@@ -53,6 +55,14 @@ const char* op_name(lang::OpCode op) {
         return "SetLeft";
     case lang::OpCode::SetRight:
         return "SetRight";
+    case lang::OpCode::AllocArray:
+        return "AllocArray";
+    case lang::OpCode::ArrayGet:
+        return "ArrayGet";
+    case lang::OpCode::ArraySet:
+        return "ArraySet";
+    case lang::OpCode::ArrayLen:
+        return "ArrayLen";
     case lang::OpCode::LoadLocal:
         return "LoadLocal";
     case lang::OpCode::StoreLocal:
@@ -83,6 +93,8 @@ const char* value_kind_name(lang::ValueKind kind) {
         return "bool";
     case lang::ValueKind::Object:
         return "object";
+    case lang::ValueKind::Array:
+        return "array";
     case lang::ValueKind::Nil:
         return "nil";
     }
@@ -173,6 +185,7 @@ enum class Kind {
     Int64,
     Bool,
     Object,
+    Array,
 };
 
 Kind kind_from_value_kind(lang::ValueKind kind) {
@@ -183,6 +196,8 @@ Kind kind_from_value_kind(lang::ValueKind kind) {
         return Kind::Bool;
     case lang::ValueKind::Object:
         return Kind::Object;
+    case lang::ValueKind::Array:
+        return Kind::Array;
     case lang::ValueKind::Nil:
         break;
     }
@@ -246,6 +261,13 @@ public:
         stack_.push_back(Kind::Object);
     }
 
+    void alloc_array() {
+        pop_expect(Kind::Int64);
+        pop_expect(Kind::Int64);
+        emit(lang::OpCode::AllocArray, 0);
+        stack_.push_back(Kind::Array);
+    }
+
     void load_local(std::uint32_t local) {
         assert(local < locals_.size());
         assert(locals_[local].has_value());
@@ -264,6 +286,12 @@ public:
         pop_expect(Kind::Object);
         emit(lang::OpCode::GetLeft, 0);
         stack_.push_back(Kind::Object);
+    }
+
+    void get_left_array() {
+        pop_expect(Kind::Object);
+        emit(lang::OpCode::GetLeft, 0);
+        stack_.push_back(Kind::Array);
     }
 
     void get_right_object() {
@@ -288,6 +316,26 @@ public:
         pop_any();
         pop_expect(Kind::Object);
         emit(lang::OpCode::SetRight, 0);
+    }
+
+    void array_get_i64() {
+        pop_expect(Kind::Int64);
+        pop_expect(Kind::Array);
+        emit(lang::OpCode::ArrayGet, 0);
+        stack_.push_back(Kind::Int64);
+    }
+
+    void array_set() {
+        pop_expect(Kind::Int64);
+        pop_expect(Kind::Int64);
+        pop_expect(Kind::Array);
+        emit(lang::OpCode::ArraySet, 0);
+    }
+
+    void array_len() {
+        pop_expect(Kind::Array);
+        emit(lang::OpCode::ArrayLen, 0);
+        stack_.push_back(Kind::Int64);
     }
 
     void collect() { emit(lang::OpCode::Collect, 0); }
@@ -495,6 +543,88 @@ lang::Function generate_program(std::uint64_t seed) {
     }
     b.return_top();
 
+    return b.finish();
+}
+
+lang::Function generate_array_program(std::uint64_t seed) {
+    SplitMix64 rng(seed ^ 0xA22A'7120'5EED'0001ull);
+
+    constexpr std::uint32_t kAnchor = 0;
+    constexpr std::uint32_t kArray = 1;
+    constexpr std::uint32_t kScratch = 2;
+    constexpr std::uint32_t kDead = 3;
+    constexpr std::uint32_t kObservedLength = 4;
+    constexpr std::uint32_t kLocalCount = 5;
+
+    const auto length = static_cast<std::int64_t>(1 + rng.bounded(6));
+    const auto old_init = rng.small_i64();
+    const auto new_init = rng.small_i64();
+    const bool collect_after_barrier = rng.bounded(2) == 0;
+
+    lang::FunctionSignature signature;
+    signature.return_type = lang::ValueKind::Object;
+    Builder b(kLocalCount, signature);
+
+    b.constant_i64(length);
+    b.constant_i64(old_init);
+    b.alloc_array();
+    b.store_local(kArray);
+
+    b.load_local(kArray);
+    b.constant_i64(rng.small_i64());
+    b.alloc_pair();
+    b.store_local(kAnchor);
+    b.collect();
+
+    b.constant_i64(rng.small_i64());
+    b.constant_i64(rng.small_i64());
+    b.alloc_pair();
+    b.store_local(kDead);
+    b.constant_i64(0);
+    b.store_local(kDead);
+
+    b.constant_i64(length);
+    b.constant_i64(new_init);
+    b.alloc_array();
+    b.store_local(kArray);
+
+    b.load_local(kAnchor);
+    b.load_local(kArray);
+    b.set_left();
+
+    b.constant_i64(0);
+    b.store_local(kArray);
+    if (collect_after_barrier) {
+        b.collect();
+    }
+
+    b.load_local(kAnchor);
+    b.get_left_array();
+    b.store_local(kArray);
+
+    b.load_local(kArray);
+    b.array_len();
+    b.store_local(kObservedLength);
+
+    for (std::int64_t index = 0; index < length; ++index) {
+        const auto value = rng.small_i64() + index;
+        b.load_local(kArray);
+        b.constant_i64(index);
+        b.constant_i64(value);
+        b.array_set();
+
+        b.load_local(kArray);
+        b.constant_i64(index);
+        b.array_get_i64();
+        b.store_local(kScratch);
+
+        if (rng.bounded(3) == 0) {
+            b.collect();
+        }
+    }
+
+    b.load_local(kAnchor);
+    b.return_top();
     return b.finish();
 }
 
@@ -886,6 +1016,8 @@ const char* grammar_name(Grammar grammar) {
         return "single";
     case Grammar::Calls:
         return "calls";
+    case Grammar::Arrays:
+        return "arrays";
     }
     return "<unknown>";
 }
@@ -897,29 +1029,34 @@ Grammar parse_grammar(const std::string& value) {
     if (value == "calls") {
         return Grammar::Calls;
     }
-    throw std::runtime_error("unknown grammar '" + value + "': expected single or calls");
+    if (value == "arrays") {
+        return Grammar::Arrays;
+    }
+    throw std::runtime_error(
+        "unknown grammar '" + value + "': expected single, calls, or arrays");
 }
 
 std::string repro_command(Grammar grammar, std::uint64_t seed,
                           const char* schedule_name) {
     std::ostringstream out;
     out << "./build/lang_iteration5_fuzz ";
-    if (grammar == Grammar::Calls) {
-        out << "--grammar calls ";
+    if (grammar != Grammar::Single) {
+        out << "--grammar " << grammar_name(grammar) << " ";
     }
     out << "--seed " << seed << " --schedule " << schedule_name;
     return out.str();
 }
 
-[[noreturn]] void report_failure(std::uint64_t seed, const Schedule& schedule,
+[[noreturn]] void report_failure(Grammar grammar, std::uint64_t seed,
+                                 const Schedule& schedule,
                                  const lang::Function& function,
                                  const Outcome& baseline,
                                  const Outcome& observed) {
     std::ostringstream out;
     out << "differential GC timing fuzz failure\n";
-    out << "grammar=" << grammar_name(Grammar::Single) << " seed=" << seed
+    out << "grammar=" << grammar_name(grammar) << " seed=" << seed
         << " schedule=" << schedule.name << "\n";
-    out << "repro: " << repro_command(Grammar::Single, seed, schedule.name) << "\n";
+    out << "repro: " << repro_command(grammar, seed, schedule.name) << "\n";
     out << "program:\n" << describe(function);
     if (!baseline.ok) {
         out << "baseline trap: " << baseline.error << "\n";
@@ -968,7 +1105,22 @@ void run_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
                               : execute_once(verified, schedule);
 
     if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
-        report_failure(seed, schedule, function, baseline, observed);
+        report_failure(Grammar::Single, seed, schedule, function, baseline, observed);
+    }
+}
+
+void run_array_seed_schedule(std::uint64_t seed, const Schedule& schedule) {
+    const auto function = generate_array_program(seed);
+    const auto verified = verified_module_for_function(function, seed);
+    const auto all_schedules = schedules();
+    const auto& baseline_schedule = find_schedule(all_schedules, "no_stress");
+    const auto baseline = execute_once(verified, baseline_schedule);
+    const auto observed = schedule.name == std::string("no_stress")
+                              ? baseline
+                              : execute_once(verified, schedule);
+
+    if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+        report_failure(Grammar::Arrays, seed, schedule, function, baseline, observed);
     }
 }
 
@@ -996,7 +1148,22 @@ void run_seed_all_schedules(std::uint64_t seed, const std::vector<Schedule>& all
                                   ? baseline
                                   : execute_once(verified, schedule);
         if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
-            report_failure(seed, schedule, function, baseline, observed);
+            report_failure(Grammar::Single, seed, schedule, function, baseline, observed);
+        }
+    }
+}
+
+void run_array_seed_all_schedules(std::uint64_t seed,
+                                  const std::vector<Schedule>& all_schedules) {
+    const auto function = generate_array_program(seed);
+    const auto verified = verified_module_for_function(function, seed);
+    const auto baseline = execute_once(verified, all_schedules.front());
+    for (const auto& schedule : all_schedules) {
+        const auto observed = schedule.name == std::string(all_schedules.front().name)
+                                  ? baseline
+                                  : execute_once(verified, schedule);
+        if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
+            report_failure(Grammar::Arrays, seed, schedule, function, baseline, observed);
         }
     }
 }
@@ -1012,6 +1179,24 @@ void run_call_seed_all_schedules(std::uint64_t seed,
                                   : execute_once(verified, schedule);
         if (!baseline.ok || !observed.ok || baseline.observable != observed.observable) {
             report_failure(seed, schedule, module, baseline, observed);
+        }
+    }
+}
+
+void dump_corpus(Grammar grammar) {
+    for (std::uint64_t seed = kFirstCorpusSeed;
+         seed < kFirstCorpusSeed + kCorpusSize; ++seed) {
+        std::cout << "grammar=" << grammar_name(grammar) << " seed=" << seed << "\n";
+        switch (grammar) {
+        case Grammar::Single:
+            std::cout << describe(generate_program(seed));
+            break;
+        case Grammar::Calls:
+            std::cout << describe(generate_call_module(seed));
+            break;
+        case Grammar::Arrays:
+            std::cout << describe(generate_array_program(seed));
+            break;
         }
     }
 }
@@ -1232,6 +1417,89 @@ function=4 signature=(i64,bool,object)->i64 locals=4
                 "actual:\n" + describe(module));
 }
 
+void arrays_pinned_seed_snapshot() {
+    const auto function = generate_array_program(kArraySnapshotSeed);
+    const std::string expected = R"SNAPSHOT(locals=5
+  #0 ConstantI64 5
+  #1 ConstantI64 29
+  #2 AllocArray 0
+  #3 StoreLocal 1
+  #4 LoadLocal 1
+  #5 ConstantI64 26
+  #6 AllocPair 0
+  #7 StoreLocal 0
+  #8 Collect 0
+  #9 ConstantI64 -35
+  #10 ConstantI64 22
+  #11 AllocPair 0
+  #12 StoreLocal 3
+  #13 ConstantI64 0
+  #14 StoreLocal 3
+  #15 ConstantI64 5
+  #16 ConstantI64 -3
+  #17 AllocArray 0
+  #18 StoreLocal 1
+  #19 LoadLocal 0
+  #20 LoadLocal 1
+  #21 SetLeft 0
+  #22 ConstantI64 0
+  #23 StoreLocal 1
+  #24 LoadLocal 0
+  #25 GetLeft 0
+  #26 StoreLocal 1
+  #27 LoadLocal 1
+  #28 ArrayLen 0
+  #29 StoreLocal 4
+  #30 LoadLocal 1
+  #31 ConstantI64 0
+  #32 ConstantI64 -4
+  #33 ArraySet 0
+  #34 LoadLocal 1
+  #35 ConstantI64 0
+  #36 ArrayGet 0
+  #37 StoreLocal 2
+  #38 LoadLocal 1
+  #39 ConstantI64 1
+  #40 ConstantI64 -25
+  #41 ArraySet 0
+  #42 LoadLocal 1
+  #43 ConstantI64 1
+  #44 ArrayGet 0
+  #45 StoreLocal 2
+  #46 LoadLocal 1
+  #47 ConstantI64 2
+  #48 ConstantI64 17
+  #49 ArraySet 0
+  #50 LoadLocal 1
+  #51 ConstantI64 2
+  #52 ArrayGet 0
+  #53 StoreLocal 2
+  #54 Collect 0
+  #55 LoadLocal 1
+  #56 ConstantI64 3
+  #57 ConstantI64 -35
+  #58 ArraySet 0
+  #59 LoadLocal 1
+  #60 ConstantI64 3
+  #61 ArrayGet 0
+  #62 StoreLocal 2
+  #63 LoadLocal 1
+  #64 ConstantI64 4
+  #65 ConstantI64 -11
+  #66 ArraySet 0
+  #67 LoadLocal 1
+  #68 ConstantI64 4
+  #69 ArrayGet 0
+  #70 StoreLocal 2
+  #71 LoadLocal 0
+  #72 Return 0
+)SNAPSHOT";
+    require(describe(function) == expected,
+            "array generator snapshot changed for seed " +
+                std::to_string(kArraySnapshotSeed) + "\nexpected:\n" + expected +
+                "actual:\n" + describe(function));
+}
+
 int run(int argc, char** argv) {
     const auto all_schedules = schedules();
 
@@ -1253,6 +1521,8 @@ int run(int argc, char** argv) {
         const auto& schedule = find_schedule(all_schedules, argv[6]);
         if (grammar == Grammar::Calls) {
             run_call_seed_schedule(seed, schedule);
+        } else if (grammar == Grammar::Arrays) {
+            run_array_seed_schedule(seed, schedule);
         } else {
             run_seed_schedule(seed, schedule);
         }
@@ -1261,12 +1531,19 @@ int run(int argc, char** argv) {
         return 0;
     }
 
+    if (argc == 3 && std::string(argv[1]) == "--dump-corpus") {
+        dump_corpus(parse_grammar(argv[2]));
+        return 0;
+    }
+
     if (argc != 1) {
         std::cerr << "usage: " << argv[0]
                   << " [--seed <uint64> --schedule <schedule-name>]\n"
                   << "       " << argv[0]
-                  << " --grammar <single|calls> --seed <uint64>"
+                  << " --grammar <single|calls|arrays> --seed <uint64>"
                   << " --schedule <schedule-name>\n";
+        std::cerr << "       " << argv[0]
+                  << " --dump-corpus <single|calls|arrays>\n";
         std::cerr << "schedules:";
         for (const auto& schedule : all_schedules) {
             std::cerr << " " << schedule.name;
@@ -1277,6 +1554,7 @@ int run(int argc, char** argv) {
 
     pinned_seed_snapshot();
     calls_pinned_seed_snapshot();
+    arrays_pinned_seed_snapshot();
 
     for (std::uint64_t seed = kFirstCorpusSeed;
          seed < kFirstCorpusSeed + kCorpusSize; ++seed) {
@@ -1285,6 +1563,10 @@ int run(int argc, char** argv) {
     for (std::uint64_t seed = kFirstCorpusSeed;
          seed < kFirstCorpusSeed + kCorpusSize; ++seed) {
         run_call_seed_all_schedules(seed, all_schedules);
+    }
+    for (std::uint64_t seed = kFirstCorpusSeed;
+         seed < kFirstCorpusSeed + kCorpusSize; ++seed) {
+        run_array_seed_all_schedules(seed, all_schedules);
     }
 
     std::cerr << "[PASS] pinned_seed_snapshot seed=" << kSnapshotSeed << "\n";

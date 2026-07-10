@@ -43,6 +43,14 @@ const char* op_name(lang::OpCode op) {
         return "SetLeft";
     case lang::OpCode::SetRight:
         return "SetRight";
+    case lang::OpCode::AllocArray:
+        return "AllocArray";
+    case lang::OpCode::ArrayGet:
+        return "ArrayGet";
+    case lang::OpCode::ArraySet:
+        return "ArraySet";
+    case lang::OpCode::ArrayLen:
+        return "ArrayLen";
     case lang::OpCode::LoadLocal:
         return "LoadLocal";
     case lang::OpCode::StoreLocal:
