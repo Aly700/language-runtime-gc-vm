@@ -74,7 +74,14 @@ std::size_t storage_slot_count(const Object& object) {
     throw std::logic_error("unknown object kind");
 }
 
-void validate_descriptor_shape(const Object& object) {
+void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = nullptr) {
+    if (metrics != nullptr) {
+        if (object.kind == ObjectKind::Closure) {
+            metrics->closure_capture_slots_scanned += object.closure_captures.size();
+        } else if (object.kind == ObjectKind::Map) {
+            metrics->map_descriptor_entries_scanned += object.map_entries.size();
+        }
+    }
     switch (object.kind) {
     case ObjectKind::Pair:
         if (object.length != 2 || !object.scalar_elements.empty() ||
@@ -206,8 +213,9 @@ void require_object_reference_value(Value value, const char* context) {
 }
 
 template <typename Fn>
-void visit_reference_fields(Object& object, Fn&& fn) {
-    validate_descriptor_shape(object);
+void visit_reference_fields(Object& object, Fn&& fn,
+                            HeapMetrics* metrics = nullptr) {
+    validate_descriptor_shape(object, metrics);
     switch (object.kind) {
     case ObjectKind::Pair:
         fn(object.left);
@@ -223,6 +231,9 @@ void visit_reference_fields(Object& object, Fn&& fn) {
     case ObjectKind::Str:
         return;
     case ObjectKind::Closure:
+        if (metrics != nullptr) {
+            metrics->closure_capture_slots_scanned += object.closure_captures.size();
+        }
         for (std::size_t i = 0; i < object.closure_captures.size(); ++i) {
             if (object.closure_capture_map[i]) {
                 fn(object.closure_captures[i]);
@@ -230,6 +241,9 @@ void visit_reference_fields(Object& object, Fn&& fn) {
         }
         return;
     case ObjectKind::Map:
+        if (metrics != nullptr) {
+            metrics->map_descriptor_entries_scanned += object.map_entries.size();
+        }
         for (auto& entry : object.map_entries) {
             if (object.map_key_is_ref) {
                 fn(entry.key);
@@ -246,8 +260,9 @@ void visit_reference_fields(Object& object, Fn&& fn) {
 }
 
 template <typename Fn>
-void visit_reference_fields(const Object& object, Fn&& fn) {
-    validate_descriptor_shape(object);
+void visit_reference_fields(const Object& object, Fn&& fn,
+                            HeapMetrics* metrics = nullptr) {
+    validate_descriptor_shape(object, metrics);
     switch (object.kind) {
     case ObjectKind::Pair:
         fn(object.left);
@@ -263,6 +278,9 @@ void visit_reference_fields(const Object& object, Fn&& fn) {
     case ObjectKind::Str:
         return;
     case ObjectKind::Closure:
+        if (metrics != nullptr) {
+            metrics->closure_capture_slots_scanned += object.closure_captures.size();
+        }
         for (std::size_t i = 0; i < object.closure_captures.size(); ++i) {
             if (object.closure_capture_map[i]) {
                 fn(object.closure_captures[i]);
@@ -270,6 +288,9 @@ void visit_reference_fields(const Object& object, Fn&& fn) {
         }
         return;
     case ObjectKind::Map:
+        if (metrics != nullptr) {
+            metrics->map_descriptor_entries_scanned += object.map_entries.size();
+        }
         for (const auto& entry : object.map_entries) {
             if (object.map_key_is_ref) {
                 fn(entry.key);
@@ -286,8 +307,9 @@ void visit_reference_fields(const Object& object, Fn&& fn) {
 }
 
 template <typename Fn>
-void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
-    validate_descriptor_shape(object);
+void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn,
+                                             HeapMetrics* metrics = nullptr) {
+    validate_descriptor_shape(object, metrics);
     switch (object.kind) {
     case ObjectKind::Pair:
         // The mark worklist is LIFO, so right then left preserves the pre-existing
@@ -307,6 +329,9 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
     case ObjectKind::Str:
         return;
     case ObjectKind::Closure:
+        if (metrics != nullptr) {
+            metrics->closure_capture_slots_scanned += object.closure_captures.size();
+        }
         for (std::size_t i = object.closure_captures.size(); i > 0; --i) {
             if (object.closure_capture_map[i - 1]) {
                 fn(object.closure_captures[i - 1]);
@@ -314,6 +339,9 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
         }
         return;
     case ObjectKind::Map:
+        if (metrics != nullptr) {
+            metrics->map_descriptor_entries_scanned += object.map_entries.size();
+        }
         for (std::size_t i = object.map_entries.size(); i > 0; --i) {
             const auto& entry = object.map_entries[i - 1];
             if (object.map_value_is_ref) {
@@ -741,7 +769,7 @@ Handle Heap::make_handle(ObjectId id) {
 }
 
 ObjectId Heap::allocate_object(Object object) {
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     const auto required_slots = storage_slot_count(object);
     auto base = find_free_storage_run(required_slots);
     if (!base.has_value()) {
@@ -787,17 +815,31 @@ ObjectId Heap::allocate_object(Object object) {
 
 std::optional<std::size_t> Heap::find_free_storage_run(std::size_t required_slots) const {
     assert(required_slots > 0 && "heap objects must reserve at least one storage slot");
-    for (std::size_t base = 0; base + required_slots <= objects_.size(); ++base) {
-        bool free = true;
-        for (std::size_t offset = 0; offset < required_slots; ++offset) {
-            if (!is_storage_slot_free(base + offset)) {
-                free = false;
-                break;
-            }
+
+    // Walk the same occupied intervals once. Descriptor widths let the search skip
+    // payload slots without repeatedly asking is_storage_slot_free to rescan every
+    // object header. The post-selection overlap assertions in allocate_object still
+    // call is_storage_slot_free independently.
+    std::size_t free_run_start = 0;
+    std::size_t free_run_length = 0;
+    for (std::size_t base = 0; base < objects_.size();) {
+        ++metrics_.allocation_candidate_slots_examined;
+        ++metrics_.storage_occupancy_headers_examined;
+        if (objects_[base].has_value()) {
+            free_run_length = 0;
+            base += storage_slot_count(*objects_[base]);
+            continue;
         }
-        if (free) {
-            return base;
+
+        ++metrics_.allocation_storage_slots_checked;
+        if (free_run_length == 0) {
+            free_run_start = base;
         }
+        ++free_run_length;
+        if (free_run_length == required_slots) {
+            return free_run_start;
+        }
+        ++base;
     }
     return std::nullopt;
 }
@@ -810,6 +852,7 @@ bool Heap::is_storage_slot_free(std::size_t slot) const {
         return false;
     }
     for (std::size_t base = 0; base < objects_.size(); ++base) {
+        ++metrics_.storage_occupancy_headers_examined;
         if (!objects_[base].has_value()) {
             continue;
         }
@@ -844,7 +887,7 @@ const Object& Heap::checked_pair(ObjectId id) const {
     if (object.kind != ObjectKind::Pair) {
         throw std::logic_error("object is not a pair");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -853,7 +896,7 @@ Object& Heap::checked_pair(ObjectId id) {
     if (object.kind != ObjectKind::Pair) {
         throw std::logic_error("object is not a pair");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -862,7 +905,7 @@ const Object& Heap::checked_scalar_array(ObjectId id) const {
     if (object.kind != ObjectKind::ScalarArray) {
         throw std::logic_error("object is not a scalar array");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -871,7 +914,7 @@ Object& Heap::checked_scalar_array(ObjectId id) {
     if (object.kind != ObjectKind::ScalarArray) {
         throw std::logic_error("object is not a scalar array");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -880,7 +923,7 @@ const Object& Heap::checked_ref_array(ObjectId id) const {
     if (object.kind != ObjectKind::RefArray) {
         throw std::logic_error("object is not a ref array");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -889,7 +932,7 @@ Object& Heap::checked_ref_array(ObjectId id) {
     if (object.kind != ObjectKind::RefArray) {
         throw std::logic_error("object is not a ref array");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -898,7 +941,7 @@ const Object& Heap::checked_string(ObjectId id) const {
     if (object.kind != ObjectKind::Str) {
         throw std::logic_error("object is not a string");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -907,7 +950,7 @@ const Object& Heap::checked_closure(ObjectId id) const {
     if (object.kind != ObjectKind::Closure) {
         throw std::logic_error("object is not a closure");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -916,7 +959,7 @@ const Object& Heap::checked_map(ObjectId id) const {
     if (object.kind != ObjectKind::Map) {
         throw std::logic_error("object is not a map");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -925,7 +968,7 @@ Object& Heap::checked_map(ObjectId id) {
     if (object.kind != ObjectKind::Map) {
         throw std::logic_error("object is not a map");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -934,7 +977,7 @@ const Object& Heap::checked_weak_ref(ObjectId id) const {
     if (object.kind != ObjectKind::WeakRef) {
         throw std::logic_error("object is not a weak reference");
     }
-    validate_descriptor_shape(object);
+    validate_descriptor_shape(object, &metrics_);
     return object;
 }
 
@@ -1110,6 +1153,7 @@ std::optional<std::size_t> Heap::find_map_entry(ObjectId id, Value key) const {
     const auto& map = checked_map(id);
     validate_map_key(map, key);
     for (std::size_t i = 0; i < map.map_entries.size(); ++i) {
+        ++metrics_.map_lookup_entries_examined;
         const auto stored = map.map_entries[i].key;
         bool equal = false;
         if (map.map_key_is_ref) {
@@ -1234,8 +1278,8 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     const auto rewritten_remembered = rewrite_remembered_set(forwarding);
     std::array<Value*, 3> growth_roots{&owner, &key, &value};
     rewrite_references(forwarding, relocated_objects, nullptr, growth_roots);
-    auto rewritten_weak_refs = process_weak_targets(forwarding,
-                                                    relocated_objects);
+    auto rewritten_weak_refs =
+        process_weak_targets(forwarding, relocated_objects, std::nullopt);
 
     objects_ = std::move(relocated_objects);
     generations_ = std::move(relocated_generations);
@@ -1276,7 +1320,7 @@ void Heap::store_map_entry(ObjectId id, Value key, Value value) {
         map.map_entries.push_back(MapEntry{key, value});
         map.length = static_cast<std::uint32_t>(map.map_entries.size());
     }
-    validate_descriptor_shape(map);
+    validate_descriptor_shape(map, &metrics_);
 
     if (barrier_triggered &&
         stress_config_.collect_minor_after_every_write_barrier) {
@@ -1406,7 +1450,7 @@ void Heap::record_promoted_object_edges(
             }
             const auto target_slot = checked_slot(value.as_object());
             has_young_reference = has_young_reference || is_young_slot(target_slot);
-        });
+        }, &metrics_);
         if (has_young_reference) {
             record_remembered_object(owner);
             assert(remembered_set_contains(owner) &&
@@ -1459,7 +1503,7 @@ void Heap::enqueue_young_references_from_remembered_set(std::vector<ObjectId>& w
         }
         visit_reference_fields_for_lifo_marking(*objects_[slot], [&](Value value) {
             enqueue_mark_value(value, worklist, CollectionKind::Minor);
-        });
+        }, &metrics_);
     }
 }
 
@@ -1481,7 +1525,7 @@ void Heap::drain_mark_worklist(std::vector<ObjectId>& worklist, CollectionKind k
 
         visit_reference_fields_for_lifo_marking(obj, [&](Value value) {
             enqueue_mark_value(value, worklist, kind);
-        });
+        }, &metrics_);
     }
 }
 
@@ -1527,8 +1571,8 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     metrics_.objects_moved += compacted.objects_moved;
     rewrite_references(compacted.forwarding, compacted.objects, roots, extra_roots);
     auto rewritten_remembered_set = rewrite_remembered_set(compacted.forwarding);
-    auto rewritten_weak_refs = process_weak_targets(compacted.forwarding,
-                                                    compacted.objects);
+    auto rewritten_weak_refs =
+        process_weak_targets(compacted.forwarding, compacted.objects, kind);
 
     objects_ = std::move(compacted.objects);
     generations_ = std::move(compacted.generations);
@@ -1587,6 +1631,31 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
         const auto required_slots = storage_slot_count(moved);
         assert(required_slots == width_at_collection_start &&
                "object storage width changed within one collection");
+        ++metrics_.compaction_objects_copied;
+        const auto copied_bytes = required_slots * kStorageSlotBytes;
+        switch (moved.kind) {
+        case ObjectKind::Pair:
+            metrics_.compaction_pair_bytes += copied_bytes;
+            break;
+        case ObjectKind::ScalarArray:
+            metrics_.compaction_scalar_array_bytes += copied_bytes;
+            break;
+        case ObjectKind::RefArray:
+            metrics_.compaction_ref_array_bytes += copied_bytes;
+            break;
+        case ObjectKind::Str:
+            metrics_.compaction_string_bytes += copied_bytes;
+            break;
+        case ObjectKind::Closure:
+            metrics_.compaction_closure_bytes += copied_bytes;
+            break;
+        case ObjectKind::Map:
+            metrics_.compaction_map_bytes += copied_bytes;
+            break;
+        case ObjectKind::WeakRef:
+            metrics_.compaction_weak_ref_bytes += copied_bytes;
+            break;
+        }
         if (next_live_slot + required_slots > result.objects.size()) {
             throw std::logic_error("compaction cursor exceeded heap storage capacity");
         }
@@ -1620,7 +1689,7 @@ void Heap::rewrite_references(const ForwardingTable& forwarding,
         }
         visit_reference_fields(*slot, [&](Value& field) {
             rewrite_value(field, forwarding);
-        });
+        }, &metrics_);
     }
 }
 
@@ -1638,7 +1707,8 @@ void Heap::rewrite_value(Value& value, const ForwardingTable& forwarding) const 
 
 std::vector<ObjectId> Heap::process_weak_targets(
     const ForwardingTable& forwarding,
-    std::vector<std::optional<Object>>& moved_objects) const {
+    std::vector<std::optional<Object>>& moved_objects,
+    std::optional<CollectionKind> collection_kind) const {
     std::vector<ObjectId> rewritten;
     rewritten.reserve(weak_refs_.size());
 
@@ -1659,13 +1729,26 @@ std::vector<ObjectId> Heap::process_weak_targets(
         }
 
         auto& target = moved_objects[new_owner_slot]->weak_target_;
+        ++metrics_.weak_targets_processed;
         if (target.is_object()) {
             const auto old_target_slot = checked_slot(target.as_object());
             if (old_target_slot < forwarding.size() &&
                 forwarding[old_target_slot].has_value()) {
                 target = Value::object(*forwarding[old_target_slot]);
+                ++metrics_.weak_targets_forwarded;
+                if (collection_kind == CollectionKind::Major) {
+                    ++metrics_.major_weak_targets_forwarded;
+                } else if (collection_kind == CollectionKind::Minor) {
+                    ++metrics_.minor_weak_targets_forwarded;
+                }
             } else {
                 target = Value::nil();
+                ++metrics_.weak_targets_cleared;
+                if (collection_kind == CollectionKind::Major) {
+                    ++metrics_.major_weak_targets_cleared;
+                } else if (collection_kind == CollectionKind::Minor) {
+                    ++metrics_.minor_weak_targets_cleared;
+                }
             }
         } else if (target.tag() != Value::Tag::Nil) {
             throw std::logic_error(
@@ -1722,7 +1805,7 @@ void Heap::prune_remembered_set() {
             }
             const auto target_slot = checked_slot(value.as_object());
             has_young_reference = has_young_reference || is_young_slot(target_slot);
-        });
+        }, &metrics_);
         if (has_young_reference) {
             pruned.push_back(make_object_id(static_cast<std::uint32_t>(slot), generations_[slot]));
         }
@@ -1733,18 +1816,21 @@ void Heap::prune_remembered_set() {
 void Heap::validate_heap_storage_layout() const {
     std::vector<bool> covered(objects_.size(), false);
     for (std::size_t base = 0; base < objects_.size(); ++base) {
+        ++metrics_.heap_layout_slots_checked;
         if (!objects_[base].has_value()) {
             continue;
         }
+        ++metrics_.heap_layout_objects_checked;
         if (covered[base]) {
             throw std::logic_error("heap object header overlaps another object's storage run");
         }
-        validate_descriptor_shape(*objects_[base]);
+        validate_descriptor_shape(*objects_[base], &metrics_);
         const auto width = storage_slot_count(*objects_[base]);
         if (width == 0 || base + width > objects_.size()) {
             throw std::logic_error("heap object descriptor extends past heap storage");
         }
         for (std::size_t offset = 0; offset < width; ++offset) {
+            ++metrics_.heap_layout_slots_checked;
             const auto slot = base + offset;
             if (covered[slot]) {
                 throw std::logic_error("heap object storage runs overlap");
@@ -1770,10 +1856,10 @@ void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extr
             continue;
         }
         assert(!slot->marked && "collector invariant violated: mark bit survived collection");
-        validate_descriptor_shape(*slot);
+        validate_descriptor_shape(*slot, &metrics_);
         visit_reference_fields(*slot, [&](Value value) {
             validate_value(value);
-        });
+        }, &metrics_);
     }
 
     validate_remembered_set();
@@ -1782,6 +1868,7 @@ void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extr
 
 void Heap::validate_remembered_set() const {
     for (const auto remembered : remembered_set_) {
+        ++metrics_.remembered_set_entries_checked;
         const auto slot = checked_slot(remembered);
         if (!is_old_slot(slot)) {
             throw std::logic_error("remembered-set entry does not name an old object");
@@ -1789,12 +1876,14 @@ void Heap::validate_remembered_set() const {
     }
 
     for (std::size_t slot = 0; slot < objects_.size(); ++slot) {
+        ++metrics_.remembered_set_heap_slots_examined;
         if (!objects_[slot].has_value() || !is_old_slot(slot)) {
             continue;
         }
 
         const auto owner = make_object_id(static_cast<std::uint32_t>(slot), generations_[slot]);
         visit_reference_fields(*objects_[slot], [&](Value value) {
+            ++metrics_.remembered_set_reference_fields_checked;
             if (!value.is_object()) {
                 return;
             }
@@ -1803,7 +1892,7 @@ void Heap::validate_remembered_set() const {
                 throw std::logic_error(
                     "old-to-young reference missing remembered-set entry");
             }
-        });
+        }, &metrics_);
     }
 }
 

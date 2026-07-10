@@ -257,3 +257,153 @@ storage, but preserves the existing logical slot accounting for `Pair` objects.
 `ScalarArray` reserves descriptor-sized storage and raw `i64` payload, but the
 current benchmark workloads are pair-only and do not allocate arrays. No
 deterministic counter rebaseline is required.
+
+## Iteration 27 Phase A: Full Object-Kind Baseline (2026-07-10)
+
+Iteration 27 extends the measurement boundary without changing runtime behavior.
+The five iteration-16 workloads remain in their original order with their original
+seeds and fourteen original counter values. New counters are appended after those
+values, and five fixed-seed workloads cover the machinery introduced in iterations
+20–26.
+
+### Capture context and reproduction
+
+- Source revision before instrumentation: `5ad131b`
+- Host: `Darwin Affans-MacBook-Pro.local 25.5.0 ... RELEASE_ARM64_T8112 arm64`
+- Compiler: Apple clang `17.0.0 (clang-1700.4.4.1)`
+- CMake build type: `Debug`; `CMAKE_CXX_FLAGS` empty; assertions active
+- Build: `cmake --build build -j 6`
+- Deterministic counters: `build/lang_bench --counters-only`
+- Timings: `build/lang_bench --repetitions 7`
+- Correctness gate: `ctest --test-dir build --output-on-failure`
+
+The corpus identity commands are:
+
+```bash
+build/lang_iteration5_fuzz --dump-corpus single
+build/lang_iteration5_fuzz --dump-corpus calls
+build/lang_iteration5_fuzz --dump-corpus arrays
+build/lang_iteration10_source_fuzz --dump-corpus legacy
+build/lang_iteration10_source_fuzz --dump-corpus recursive
+build/lang_iteration10_source_fuzz --dump-corpus array
+build/lang_iteration10_source_fuzz --dump-corpus strings
+build/lang_iteration10_source_fuzz --dump-corpus closures
+build/lang_iteration25_maps --dump-corpus maps
+build/lang_iteration26_weak_source_fuzz --dump-corpus weak
+```
+
+Each output was redirected to a separate file and compared with `cmp` against the
+clean-revision captures in `/tmp/lang-iteration27-baseline/`. All ten files were
+byte-identical. The post-instrumentation counter output was filtered to the original
+five workload names and original fourteen counter names; that filtered file was also
+byte-identical to `/tmp/lang-iteration27-baseline/bench-counters.txt`. CTest remained
+23/23 green.
+
+### New workloads
+
+| bench | seed | shape |
+| --- | ---: | --- |
+| `string_heavy` | 1470217967 | Source-level constant-pool literals, balanced concat chains, structural equality/inequality, length/index operations, and pair garbage under periodic major/minor pressure. |
+| `closure_heavy` | 3238391040 | Source-level capture-heavy lambdas, higher-order `apply`/`compose`, repeated `CallClosure`, and a 48-deep retained composition chain. |
+| `map_heavy` | 1785773807 | Source-level insertion of 96 structural string keys, growth relocation, four full update/lookup rounds using fresh byte-equal keys, and reference values. |
+| `weak_heavy` | 2124725999 | Verified hand-built module with exact explicit-major and instruction-scheduled-minor forwarding and clearing boundaries. |
+| `mixed_graph` | 2703056909 | Source-level pairs, scalar/ref arrays, strings, closures, maps, and weak refs retained and mutated together under both collectors. |
+
+### Deterministic counter summary
+
+| bench | instr | alloc | major | minor | moved | barrier | remset peak | heap peak slots | bytecode | stack maps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `string_heavy` | 12504 | 1206 | 72 | 304 | 666 | 0 | 0 | 91 | 84 | 84 |
+| `closure_heavy` | 24088 | 97 | 114 | 454 | 0 | 0 | 0 | 437 | 86 | 86 |
+| `map_heavy` | 7117 | 2883 | 14 | 62 | 1874 | 457 | 1 | 1103 | 7117 | 7117 |
+| `weak_heavy` | 4226 | 104 | 16 | 33 | 62 | 0 | 0 | 67 | 4226 | 4226 |
+| `mixed_graph` | 9814 | 970 | 31 | 124 | 250 | 278 | 2 | 82 | 116 | 116 |
+
+The passive cost-center counters count work only and never participate in control flow:
+
+| bench | map lookup entries | map descriptor entries | closure capture slots | weak processed / forwarded / cleared | storage occupancy headers | layout slots | remset heap slots |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `string_heavy` | 0 | 0 | 0 | 0 / 0 / 0 | 1,798,188 | 99,778 | 64,952 |
+| `closure_heavy` | 0 | 0 | 1,849,904 | 0 / 0 / 0 | 2,388,789 | 671,228 | 335,614 |
+| `map_heavy` | 41,809 | 481,745 | 0 | 0 / 0 / 0 | 306,009,624 | 1,004,097 | 630,602 |
+| `weak_heavy` | 0 | 0 | 0 | 577 / 280 / 24 | 3,502 | 4,748 | 2,402 |
+| `mixed_graph` | 320 | 3,729 | 17,272 | 155 / 155 / 0 | 1,170,798 | 64,142 | 38,082 |
+
+`weak_heavy` further pins path coverage: major forwarded/cleared = `8/8`, minor
+forwarded/cleared = `272/16`. Compaction byte counters are split into fixed fields for
+`Pair`, `ScalarArray`, `RefArray`, `Str`, `Closure`, `Map`, and `WeakRef`; `mixed_graph`
+records nonzero bytes for all seven kinds.
+
+### Phase-A wall time and cost ranking
+
+Median of seven repetitions on the machine above:
+
+| bench | median ms |
+| --- | ---: |
+| `string_heavy` | 21.343 |
+| `closure_heavy` | 120.740 |
+| `map_heavy` | 1580.233 |
+| `weak_heavy` | 1.462 |
+| `mixed_graph` | 14.393 |
+
+`map_heavy` is the single dominant outlier. Its 306,009,624 storage-occupancy
+header examinations are about 165 times the next-largest new-workload count and arise
+from `find_free_storage_run` asking `is_storage_slot_free` to rescan the whole heap for
+each candidate slot. That allocator search is not an invariant validator and its result
+is only the deterministic lowest free run.
+
+Rejected optimization targets:
+
+- Heap-layout and remembered-set validation remain fully active and in the same order.
+  They are material but not dominant, and reducing call frequency would violate the
+  iteration constraint.
+- Closure descriptor scans are the main `closure_heavy` cost, but changing descriptor
+  validation or capture visitation risks weakening the precise capture-map check.
+- Map lookup and map descriptor scans are far smaller than allocator occupancy rescans;
+  optimizing them would not address the measured 1.58-second outlier.
+- Weak registry processing is only 577 targets and `weak_heavy` is the fastest new
+  workload, so a registry change is not justified.
+
+## Iteration 27 Phase B: First-Fit Interval Sweep
+
+Phase B changes only `Heap::find_free_storage_run`. The old search considered each
+candidate slot and called `is_storage_slot_free`, which rescanned every object header to
+determine whether that one slot lay inside a variable-width storage interval. The new
+search walks object headers once in ascending slot order, advances by each descriptor's
+storage width, and counts free slots between occupied intervals. It returns the first free
+run of the requested length, exactly matching the prior first-fit result on every valid
+heap layout.
+
+The independent post-selection loop in `allocate_object` still calls
+`is_storage_slot_free` for every selected slot and retains the same overlap assertion.
+Map-growth adjacency checks still use the unchanged helper. All heap-layout,
+remembered-set, weak-target, and descriptor validators execute at the same points and in
+the same order as Phase A.
+
+Deterministic work reduction on `map_heavy`:
+
+| allocator work counter | before | after | change |
+| --- | ---: | ---: | ---: |
+| candidate slots examined | 1,767,785 | 636,870 | -64.0% |
+| requested-run slots checked | 1,771,813 | 6,900 | -99.6% |
+| storage-occupancy headers examined | 306,009,624 | 8,002,102 | -97.4% |
+
+All deterministic counters other than these three measurements of the optimized
+allocator search are byte-identical to Phase A. In particular, instructions,
+allocations, collections, movement, barriers, remembered-set peak, heap shape, module
+shape, map probes, descriptor scans, weak outcomes, compaction bytes, and validation-work
+counters did not change.
+
+Seven-run medians using the same command and machine:
+
+| bench | before median ms | after median ms | change |
+| --- | ---: | ---: | ---: |
+| `string_heavy` | 21.343 | 13.844 | -35.1% |
+| `closure_heavy` | 120.740 | 111.861 | -7.4% |
+| `map_heavy` | 1580.233 | 84.943 | -94.6% |
+| `weak_heavy` | 1.462 | 1.440 | -1.5% |
+| `mixed_graph` | 14.393 | 8.625 | -40.1% |
+
+`map_heavy` is the decision workload. The other changes are reported because the full
+protocol measures every workload, but they are corroborating effects or host-run variance
+rather than additional optimization targets.
