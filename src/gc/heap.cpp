@@ -68,6 +68,8 @@ std::size_t storage_slot_count(const Object& object) {
         return 1 + static_cast<std::size_t>(object.length);
     case ObjectKind::Map:
         return 1 + 2 * static_cast<std::size_t>(object.length);
+    case ObjectKind::WeakRef:
+        return 1;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -79,7 +81,8 @@ void validate_descriptor_shape(const Object& object) {
             !object.ref_elements.empty() || !object.string_bytes.empty() ||
             !object.closure_captures.empty() ||
             !object.closure_capture_map.empty() ||
-            !object.map_entries.empty()) {
+            !object.map_entries.empty() ||
+            object.weak_target().tag() != Value::Tag::Nil) {
             throw std::logic_error("pair object descriptor does not match pair payload");
         }
         return;
@@ -88,7 +91,8 @@ void validate_descriptor_shape(const Object& object) {
             !object.ref_elements.empty() || !object.string_bytes.empty() ||
             !object.closure_captures.empty() ||
             !object.closure_capture_map.empty() ||
-            !object.map_entries.empty()) {
+            !object.map_entries.empty() ||
+            object.weak_target().tag() != Value::Tag::Nil) {
             throw std::logic_error("scalar array descriptor length does not match payload");
         }
         return;
@@ -97,7 +101,8 @@ void validate_descriptor_shape(const Object& object) {
             object.ref_elements.size() != object.length ||
             !object.string_bytes.empty() || !object.closure_captures.empty() ||
             !object.closure_capture_map.empty() ||
-            !object.map_entries.empty()) {
+            !object.map_entries.empty() ||
+            object.weak_target().tag() != Value::Tag::Nil) {
             throw std::logic_error("ref array descriptor length does not match payload");
         }
         return;
@@ -108,7 +113,8 @@ void validate_descriptor_shape(const Object& object) {
             object.right.tag() != Value::Tag::Nil ||
             !object.closure_captures.empty() ||
             !object.closure_capture_map.empty() ||
-            !object.map_entries.empty()) {
+            !object.map_entries.empty() ||
+            object.weak_target().tag() != Value::Tag::Nil) {
             throw std::logic_error("string descriptor length does not match opaque byte payload");
         }
         return;
@@ -119,7 +125,8 @@ void validate_descriptor_shape(const Object& object) {
             object.closure_capture_map.size() != object.length ||
             object.left.tag() != Value::Tag::Nil ||
             object.right.tag() != Value::Tag::Nil ||
-            !object.map_entries.empty()) {
+            !object.map_entries.empty() ||
+            object.weak_target().tag() != Value::Tag::Nil) {
             throw std::logic_error(
                 "closure descriptor length does not match capture-map payload");
         }
@@ -142,7 +149,8 @@ void validate_descriptor_shape(const Object& object) {
             !object.closure_capture_map.empty() ||
             object.map_entries.size() != object.length ||
             object.left.tag() != Value::Tag::Nil ||
-            object.right.tag() != Value::Tag::Nil) {
+            object.right.tag() != Value::Tag::Nil ||
+            object.weak_target().tag() != Value::Tag::Nil) {
             throw std::logic_error(
                 "map descriptor entry count does not match ordered payload");
         }
@@ -171,6 +179,20 @@ void validate_descriptor_shape(const Object& object) {
                 throw std::logic_error(
                     "map descriptor marks a reference value slot as scalar");
             }
+        }
+        return;
+    case ObjectKind::WeakRef:
+        if (object.length != 1 || !object.scalar_elements.empty() ||
+            !object.ref_elements.empty() || !object.string_bytes.empty() ||
+            !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty() ||
+            !object.map_entries.empty() ||
+            object.left.tag() != Value::Tag::Nil ||
+            object.right.tag() != Value::Tag::Nil ||
+            (object.weak_target().tag() != Value::Tag::Object &&
+             object.weak_target().tag() != Value::Tag::Nil)) {
+            throw std::logic_error(
+                "weak reference descriptor does not match collector-owned target slot");
         }
         return;
     }
@@ -217,6 +239,8 @@ void visit_reference_fields(Object& object, Fn&& fn) {
             }
         }
         return;
+    case ObjectKind::WeakRef:
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -254,6 +278,8 @@ void visit_reference_fields(const Object& object, Fn&& fn) {
                 fn(entry.value);
             }
         }
+        return;
+    case ObjectKind::WeakRef:
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -297,6 +323,8 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn) {
                 fn(entry.key);
             }
         }
+        return;
+    case ObjectKind::WeakRef:
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -389,6 +417,18 @@ Object Object::map(std::size_t layout_index, bool key_is_ref,
     object.map_layout_index = static_cast<std::uint32_t>(layout_index);
     object.map_key_is_ref = key_is_ref;
     object.map_value_is_ref = value_is_ref;
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object Object::weak_ref(Value target) {
+    require_object_reference_value(target, "weak reference target");
+    Object object;
+    object.kind = ObjectKind::WeakRef;
+    object.length = 1;
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.weak_target_ = target;
     validate_descriptor_shape(object);
     return object;
 }
@@ -670,6 +710,24 @@ ObjectId Heap::allocate_map(std::size_t layout_index, bool key_is_ref,
     return id;
 }
 
+ObjectId Heap::allocate_weak(Value target) {
+    require_object_reference_value(target, "weak reference target");
+    (void)checked_slot(target.as_object());
+    if (stress_config_.collect_before_every_allocation) {
+        std::array<Value*, 1> operand_roots{&target};
+        collect_with_extra_roots(operand_roots);
+    }
+
+    auto id = allocate_object(Object::weak_ref(target));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+    return id;
+}
+
 Handle Heap::make_handle(Value value) {
     if (value.is_object()) {
         (void)checked_slot(value.as_object());
@@ -710,11 +768,21 @@ ObjectId Heap::allocate_object(Object object) {
     object.marked = false;
     object.generation = ObjectGeneration::Young;
     objects_[base_slot] = std::move(object);
+    const auto id = make_object_id(static_cast<std::uint32_t>(base_slot),
+                                   generations_[base_slot]);
+    if (objects_[base_slot]->kind == ObjectKind::WeakRef) {
+        const auto position = std::lower_bound(
+            weak_refs_.begin(), weak_refs_.end(), base_slot,
+            [](ObjectId existing, std::size_t slot) {
+                return slot_from(existing) < slot;
+            });
+        weak_refs_.insert(position, id);
+    }
     ++metrics_.allocations;
     if (objects_.size() > metrics_.heap_peak_slots) {
         metrics_.heap_peak_slots = objects_.size();
     }
-    return make_object_id(static_cast<std::uint32_t>(base_slot), generations_[base_slot]);
+    return id;
 }
 
 std::optional<std::size_t> Heap::find_free_storage_run(std::size_t required_slots) const {
@@ -856,6 +924,15 @@ Object& Heap::checked_map(ObjectId id) {
     auto& object = *objects_[checked_slot(id)];
     if (object.kind != ObjectKind::Map) {
         throw std::logic_error("object is not a map");
+    }
+    validate_descriptor_shape(object);
+    return object;
+}
+
+const Object& Heap::checked_weak_ref(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::WeakRef) {
+        throw std::logic_error("object is not a weak reference");
     }
     validate_descriptor_shape(object);
     return object;
@@ -1079,6 +1156,10 @@ Value Heap::map_value_at(ObjectId id, std::size_t index) const {
     return map.map_entries[index].value;
 }
 
+Value Heap::weak_get(ObjectId id) const {
+    return checked_weak_ref(id).weak_target();
+}
+
 void Heap::map_set(ObjectId id, Value key, Value value) {
     store_map_entry(id, key, value);
 }
@@ -1115,6 +1196,7 @@ void Heap::ensure_map_growth_storage(Value& owner, Value& key, Value& value,
 
 void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
                                    std::size_t required_width) {
+    validate_weak_targets();
     const auto old_id = owner.as_object();
     const auto old_slot = checked_slot(old_id);
     const auto old_size = objects_.size();
@@ -1152,16 +1234,20 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     const auto rewritten_remembered = rewrite_remembered_set(forwarding);
     std::array<Value*, 3> growth_roots{&owner, &key, &value};
     rewrite_references(forwarding, relocated_objects, nullptr, growth_roots);
+    auto rewritten_weak_refs = process_weak_targets(forwarding,
+                                                    relocated_objects);
 
     objects_ = std::move(relocated_objects);
     generations_ = std::move(relocated_generations);
     remembered_set_ = rewritten_remembered;
+    weak_refs_ = std::move(rewritten_weak_refs);
     ++metrics_.objects_moved;
     if (objects_.size() > metrics_.heap_peak_slots) {
         metrics_.heap_peak_slots = objects_.size();
     }
     validate_heap_storage_layout();
     validate_remembered_set();
+    validate_weak_targets();
 }
 
 void Heap::store_map_entry(ObjectId id, Value key, Value value) {
@@ -1422,6 +1508,7 @@ void Heap::collect_with_extra_roots(std::span<Value*> extra_roots) {
 void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots) {
     validate_heap_storage_layout();
     validate_remembered_set();
+    validate_weak_targets();
     if (kind == CollectionKind::Major) {
         ++metrics_.major_collections;
     } else {
@@ -1440,10 +1527,13 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     metrics_.objects_moved += compacted.objects_moved;
     rewrite_references(compacted.forwarding, compacted.objects, roots, extra_roots);
     auto rewritten_remembered_set = rewrite_remembered_set(compacted.forwarding);
+    auto rewritten_weak_refs = process_weak_targets(compacted.forwarding,
+                                                    compacted.objects);
 
     objects_ = std::move(compacted.objects);
     generations_ = std::move(compacted.generations);
     remembered_set_ = std::move(rewritten_remembered_set);
+    weak_refs_ = std::move(rewritten_weak_refs);
     record_promoted_object_edges(compacted.promoted_slots);
     prune_remembered_set();
 
@@ -1546,6 +1636,53 @@ void Heap::rewrite_value(Value& value, const ForwardingTable& forwarding) const 
     value = Value::object(*forwarding[old_slot]);
 }
 
+std::vector<ObjectId> Heap::process_weak_targets(
+    const ForwardingTable& forwarding,
+    std::vector<std::optional<Object>>& moved_objects) const {
+    std::vector<ObjectId> rewritten;
+    rewritten.reserve(weak_refs_.size());
+
+    for (const auto old_owner : weak_refs_) {
+        const auto old_owner_slot = checked_slot(old_owner);
+        if (old_owner_slot >= forwarding.size() ||
+            !forwarding[old_owner_slot].has_value()) {
+            continue;
+        }
+
+        const auto new_owner = *forwarding[old_owner_slot];
+        const auto new_owner_slot = static_cast<std::size_t>(slot_from(new_owner));
+        if (new_owner_slot >= moved_objects.size() ||
+            !moved_objects[new_owner_slot].has_value() ||
+            moved_objects[new_owner_slot]->kind != ObjectKind::WeakRef) {
+            throw std::logic_error(
+                "weak registry owner missing from movement forwarding result");
+        }
+
+        auto& target = moved_objects[new_owner_slot]->weak_target_;
+        if (target.is_object()) {
+            const auto old_target_slot = checked_slot(target.as_object());
+            if (old_target_slot < forwarding.size() &&
+                forwarding[old_target_slot].has_value()) {
+                target = Value::object(*forwarding[old_target_slot]);
+            } else {
+                target = Value::nil();
+            }
+        } else if (target.tag() != Value::Tag::Nil) {
+            throw std::logic_error(
+                "weak target processing saw a non-reference target value");
+        }
+        rewritten.push_back(new_owner);
+    }
+
+    for (std::size_t i = 1; i < rewritten.size(); ++i) {
+        if (slot_from(rewritten[i - 1]) >= slot_from(rewritten[i])) {
+            throw std::logic_error(
+                "weak registry movement did not preserve strict heap-slot order");
+        }
+    }
+    return rewritten;
+}
+
 std::vector<ObjectId> Heap::rewrite_remembered_set(const ForwardingTable& forwarding) const {
     std::vector<ObjectId> rewritten;
     rewritten.reserve(remembered_set_.size());
@@ -1640,6 +1777,7 @@ void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extr
     }
 
     validate_remembered_set();
+    validate_weak_targets();
 }
 
 void Heap::validate_remembered_set() const {
@@ -1666,6 +1804,44 @@ void Heap::validate_remembered_set() const {
                     "old-to-young reference missing remembered-set entry");
             }
         });
+    }
+}
+
+void Heap::validate_weak_targets() const {
+    std::size_t registry_index = 0;
+    std::optional<std::uint32_t> previous_slot;
+    for (std::size_t slot = 0; slot < objects_.size(); ++slot) {
+        if (!objects_[slot].has_value() ||
+            objects_[slot]->kind != ObjectKind::WeakRef) {
+            continue;
+        }
+        if (registry_index >= weak_refs_.size()) {
+            throw std::logic_error(
+                "live WeakRef is missing from weak-target registry");
+        }
+        const auto registered = weak_refs_[registry_index++];
+        const auto registered_slot = slot_from(registered);
+        if (registered_slot != slot || checked_slot(registered) != slot) {
+            throw std::logic_error(
+                "weak-target registry names a stale or wrong WeakRef owner");
+        }
+        if (previous_slot.has_value() && *previous_slot >= registered_slot) {
+            throw std::logic_error(
+                "weak-target registry is not in strict heap-slot order");
+        }
+        previous_slot = registered_slot;
+
+        const auto target = objects_[slot]->weak_target();
+        if (target.is_object()) {
+            validate_value(target);
+        } else if (target.tag() != Value::Tag::Nil) {
+            throw std::logic_error(
+                "weak target is neither a live object id nor canonical nil");
+        }
+    }
+    if (registry_index != weak_refs_.size()) {
+        throw std::logic_error(
+            "weak-target registry contains a dead or non-WeakRef owner");
     }
 }
 
@@ -1712,6 +1888,10 @@ bool Heap::TEST_ONLY_is_closure(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_map(ObjectId id) const {
     return object(id).kind == ObjectKind::Map;
+}
+
+bool Heap::TEST_ONLY_is_weak_ref(ObjectId id) const {
+    return object(id).kind == ObjectKind::WeakRef;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {

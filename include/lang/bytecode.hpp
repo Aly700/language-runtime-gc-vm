@@ -48,6 +48,8 @@ enum class OpCode {
     MapGet,
     MapHas,
     MapLen,
+    AllocWeak,
+    WeakGet,
 };
 
 struct Instruction {
@@ -64,6 +66,7 @@ enum class ValueKind {
     Str,
     Function,
     Map,
+    Weak,
 };
 
 struct SignatureValue {
@@ -73,6 +76,7 @@ struct SignatureValue {
     std::shared_ptr<SignatureValue> element;
     std::shared_ptr<SignatureValue> key;
     std::shared_ptr<SignatureValue> value;
+    std::shared_ptr<SignatureValue> weak_target;
     std::vector<SignatureValue> function_parameters;
     std::shared_ptr<SignatureValue> function_return;
     std::optional<std::size_t> named_type;
@@ -80,13 +84,14 @@ struct SignatureValue {
     [[nodiscard]] bool has_pair_fields() const {
         return kind == ValueKind::Object && !named_type.has_value() &&
                left != nullptr && right != nullptr && element == nullptr &&
-               key == nullptr && value == nullptr;
+               key == nullptr && value == nullptr && weak_target == nullptr;
     }
 
     [[nodiscard]] bool has_array_element() const {
         return kind == ValueKind::Array && element != nullptr &&
                left == nullptr && right == nullptr && key == nullptr &&
-               value == nullptr && !named_type.has_value();
+               value == nullptr && weak_target == nullptr &&
+               !named_type.has_value();
     }
 
     [[nodiscard]] bool is_named_type_reference() const {
@@ -96,13 +101,21 @@ struct SignatureValue {
     [[nodiscard]] bool has_function_signature() const {
         return kind == ValueKind::Function && function_return != nullptr &&
                left == nullptr && right == nullptr && element == nullptr &&
-               key == nullptr && value == nullptr &&
+               key == nullptr && value == nullptr && weak_target == nullptr &&
                !named_type.has_value();
     }
 
     [[nodiscard]] bool has_map_entries() const {
         return kind == ValueKind::Map && key != nullptr && value != nullptr &&
                left == nullptr && right == nullptr && element == nullptr &&
+               function_return == nullptr && function_parameters.empty() &&
+               weak_target == nullptr && !named_type.has_value();
+    }
+
+    [[nodiscard]] bool has_weak_target() const {
+        return kind == ValueKind::Weak && weak_target != nullptr &&
+               left == nullptr && right == nullptr && element == nullptr &&
+               key == nullptr && value == nullptr &&
                function_return == nullptr && function_parameters.empty() &&
                !named_type.has_value();
     }
@@ -154,10 +167,18 @@ inline SignatureValue map_signature(SignatureValue key, SignatureValue value) {
     return signature;
 }
 
+inline SignatureValue weak_signature(SignatureValue target) {
+    SignatureValue signature;
+    signature.kind = ValueKind::Weak;
+    signature.weak_target =
+        std::make_shared<SignatureValue>(std::move(target));
+    return signature;
+}
+
 inline bool signature_value_is_reference(const SignatureValue& value) {
     return value.kind == ValueKind::Object || value.kind == ValueKind::Array ||
            value.kind == ValueKind::Str || value.kind == ValueKind::Function ||
-           value.kind == ValueKind::Map;
+           value.kind == ValueKind::Map || value.kind == ValueKind::Weak;
 }
 
 struct NamedTypeSignature {
@@ -282,6 +303,9 @@ enum class VerifierReason {
     MapOperationOnNonMap,     // MapGet/Set/Has/Len receiver is not a map.
     MapKeyTypeMismatch,       // Map key operand violates the map key type.
     MapValueTypeMismatch,     // MapSet value violates the map value type.
+    BadWeakTargetType,        // weak<T>/AllocWeak target is scalar, nil, or malformed.
+    WeakOperationOnNonWeak,   // WeakGet receiver is not a typed weak reference.
+    WeakTargetMayBeNil,       // WeakGet result was used without IsNil refinement.
 };
 
 struct VerifierDiagnostic {

@@ -61,6 +61,13 @@ TypeSpec map_type(TypeSpec key, TypeSpec value) {
     return type;
 }
 
+TypeSpec weak_type(TypeSpec target) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Weak;
+    type.weak_target = std::make_shared<TypeSpec>(std::move(target));
+    return type;
+}
+
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs.kind != rhs.kind) {
         return false;
@@ -96,6 +103,12 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
             return lhs.key == rhs.key && lhs.value == rhs.value;
         }
         return *lhs.key == *rhs.key && *lhs.value == *rhs.value;
+    }
+    if (lhs.kind == TypeSpec::Kind::Weak) {
+        if (lhs.weak_target == nullptr || rhs.weak_target == nullptr) {
+            return lhs.weak_target == rhs.weak_target;
+        }
+        return *lhs.weak_target == *rhs.weak_target;
     }
     if (!lhs.has_pair_fields() && !rhs.has_pair_fields()) {
         return true;
@@ -134,6 +147,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Function;
     case TypeSpec::Kind::Map:
         return Type::Map;
+    case TypeSpec::Kind::Weak:
+        return Type::Weak;
     case TypeSpec::Kind::Named:
         return Type::Pair;
     case TypeSpec::Kind::Nil:
@@ -182,6 +197,10 @@ std::string type_name(const TypeSpec& type) {
                    type_name(*type.value) + ">";
         }
         return "map<invalid, invalid>";
+    case TypeSpec::Kind::Weak:
+        return type.weak_target == nullptr
+                   ? "weak<invalid>"
+                   : "weak<" + type_name(*type.weak_target) + ">";
     case TypeSpec::Kind::Named:
         return type.name;
     case TypeSpec::Kind::Nil:
@@ -487,6 +506,15 @@ private:
             type.position = position;
             return type;
         }
+        if (match(TokenKind::Weak)) {
+            const auto position = previous().position;
+            expect(TokenKind::Less, "expected '<' after 'weak'");
+            auto target = parse_type();
+            expect(TokenKind::Greater, "expected '>' after weak target type");
+            auto type = weak_type(std::move(target));
+            type.position = position;
+            return type;
+        }
         if (match(TokenKind::Fn)) {
             const auto position = previous().position;
             expect(TokenKind::LParen, "expected '(' after 'fn' in function type");
@@ -706,9 +734,18 @@ private:
                     node->left = parse_expression();
                     expect(TokenKind::RParen, "expected ')' after map key");
                     expression = std::move(node);
+                } else if (check(TokenKind::Identifier) && peek().text == "get") {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::WeakGet;
+                    node->position = peek().position;
+                    node->receiver = std::move(expression);
+                    ++current_;
+                    expect(TokenKind::LParen, "expected '(' after 'get'");
+                    expect(TokenKind::RParen, "weak get takes no arguments");
+                    expression = std::move(node);
                 } else {
                     add_diagnostic(diagnostics_, peek().position,
-                                   "expected field name 'left', 'right', 'len', or 'has'");
+                                   "expected field name 'left', 'right', 'len', 'has', or 'get'");
                     break;
                 }
             } else if (match(TokenKind::LBracket)) {
@@ -822,6 +859,15 @@ private:
             expect(TokenKind::LParen, "expected '(' after 'is_nil'");
             node->receiver = parse_expression();
             expect(TokenKind::RParen, "expected ')' after is_nil operand");
+            return node;
+        }
+        if (match(TokenKind::Weak)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::WeakConstruct;
+            node->position = previous().position;
+            expect(TokenKind::LParen, "expected '(' after 'weak'");
+            node->receiver = parse_expression();
+            expect(TokenKind::RParen, "expected ')' after weak target");
             return node;
         }
         if (match(TokenKind::Identifier)) {

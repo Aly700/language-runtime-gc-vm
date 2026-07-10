@@ -27,6 +27,8 @@ enum class AbstractKind {
     Str,
     Function,
     Map,
+    Weak,
+    MaybeReference,
     Nil,
     Poison,
 };
@@ -43,6 +45,7 @@ struct AbstractValue {
     std::shared_ptr<const AbstractValue> signature_array_element;
     std::shared_ptr<const SignatureValue> signature_function;
     std::shared_ptr<const SignatureValue> signature_map;
+    std::shared_ptr<const AbstractValue> reference_target;
     std::optional<std::size_t> signature_named_type;
     std::optional<std::size_t> source_local;
     std::optional<std::size_t> nil_test_local;
@@ -142,6 +145,10 @@ const char* op_name(OpCode op) {
         return "MapHas";
     case OpCode::MapLen:
         return "MapLen";
+    case OpCode::AllocWeak:
+        return "AllocWeak";
+    case OpCode::WeakGet:
+        return "WeakGet";
     }
     return "<invalid>";
 }
@@ -164,6 +171,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Function";
     case ValueKind::Map:
         return "Map";
+    case ValueKind::Weak:
+        return "Weak";
     }
     return "<invalid>";
 }
@@ -186,6 +195,10 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "Function";
     case AbstractKind::Map:
         return "Map";
+    case AbstractKind::Weak:
+        return "Weak";
+    case AbstractKind::MaybeReference:
+        return "MaybeReference";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -251,6 +264,7 @@ bool signature_values_equal(const SignatureValue& lhs,
         !signature_value_ptr_equal(lhs.element, rhs.element) ||
         !signature_value_ptr_equal(lhs.key, rhs.key) ||
         !signature_value_ptr_equal(lhs.value, rhs.value) ||
+        !signature_value_ptr_equal(lhs.weak_target, rhs.weak_target) ||
         !signature_value_ptr_equal(lhs.function_return, rhs.function_return)) {
         return false;
     }
@@ -314,6 +328,22 @@ std::shared_ptr<const AbstractValue> abstract_value_ptr(AbstractValue value) {
     return std::make_shared<const AbstractValue>(std::move(value));
 }
 
+AbstractValue weak_value(AbstractValue target) {
+    AbstractValue value;
+    value.kind = AbstractKind::Weak;
+    value.reference_target = abstract_value_ptr(without_provenance(
+        std::move(target)));
+    return value;
+}
+
+AbstractValue maybe_reference_value(AbstractValue target) {
+    AbstractValue value;
+    value.kind = AbstractKind::MaybeReference;
+    value.reference_target = abstract_value_ptr(without_provenance(
+        std::move(target)));
+    return value;
+}
+
 AbstractKind abstract_kind(ValueKind kind) {
     switch (kind) {
     case ValueKind::Int64:
@@ -332,6 +362,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Function;
     case ValueKind::Map:
         return AbstractKind::Map;
+    case ValueKind::Weak:
+        return AbstractKind::Weak;
     }
     return AbstractKind::Poison;
 }
@@ -349,6 +381,9 @@ bool signature_array_uses_ref_payload(const SignatureValue& signature) {
 }
 
 AbstractValue value_from_signature(const SignatureValue& signature) {
+    if (signature.has_weak_target()) {
+        return weak_value(value_from_signature(*signature.weak_target));
+    }
     if (signature.has_function_signature()) {
         AbstractValue value;
         value.kind = AbstractKind::Function;
@@ -389,7 +424,8 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
 bool is_reference_kind(AbstractKind kind) {
     return kind == AbstractKind::Object || kind == AbstractKind::Array ||
            kind == AbstractKind::RefArray || kind == AbstractKind::Str ||
-           kind == AbstractKind::Function || kind == AbstractKind::Map;
+           kind == AbstractKind::Function || kind == AbstractKind::Map ||
+           kind == AbstractKind::Weak || kind == AbstractKind::MaybeReference;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -426,7 +462,7 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                *signature.named_type < module.named_types.size() &&
                signature.left == nullptr && signature.right == nullptr &&
                signature.element == nullptr && signature.key == nullptr &&
-               signature.value == nullptr &&
+               signature.value == nullptr && signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty();
     }
@@ -437,6 +473,7 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                                             module) &&
                signature.element == nullptr &&
                signature.key == nullptr && signature.value == nullptr &&
+               signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty();
     }
@@ -446,6 +483,7 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                                             signature.element->kind, module) &&
                signature.left == nullptr && signature.right == nullptr &&
                signature.key == nullptr && signature.value == nullptr &&
+               signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty();
     }
@@ -468,15 +506,25 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature_shape_matches_kind(*signature.value,
                                             signature.value->kind, module);
     }
+    if (signature.has_weak_target()) {
+        return signature_value_is_reference(*signature.weak_target) &&
+               signature_shape_matches_kind(*signature.weak_target,
+                                            signature.weak_target->kind,
+                                            module);
+    }
     if (signature.kind == ValueKind::Function) {
         return false;
     }
     if (signature.kind == ValueKind::Map) {
         return false;
     }
+    if (signature.kind == ValueKind::Weak) {
+        return false;
+    }
     return signature.left == nullptr && signature.right == nullptr &&
            signature.element == nullptr && signature.function_return == nullptr &&
            signature.key == nullptr && signature.value == nullptr &&
+           signature.weak_target == nullptr &&
            signature.function_parameters.empty() && !signature.named_type.has_value();
 }
 
@@ -498,6 +546,9 @@ bool signature_has_invalid_map_key(const SignatureValue& signature) {
     if (signature.has_array_element()) {
         return signature_has_invalid_map_key(*signature.element);
     }
+    if (signature.has_weak_target()) {
+        return signature_has_invalid_map_key(*signature.weak_target);
+    }
     if (signature.has_function_signature()) {
         if (signature_has_invalid_map_key(*signature.function_return)) {
             return true;
@@ -509,6 +560,95 @@ bool signature_has_invalid_map_key(const SignatureValue& signature) {
         }
     }
     return false;
+}
+
+bool signature_has_invalid_weak_target(const SignatureValue& signature) {
+    if (signature.has_weak_target()) {
+        return !signature_value_is_reference(*signature.weak_target) ||
+               signature_has_invalid_weak_target(*signature.weak_target);
+    }
+    if (signature.kind == ValueKind::Weak) {
+        return true;
+    }
+    if (signature.has_pair_fields()) {
+        return signature_has_invalid_weak_target(*signature.left) ||
+               signature_has_invalid_weak_target(*signature.right);
+    }
+    if (signature.has_array_element()) {
+        return signature_has_invalid_weak_target(*signature.element);
+    }
+    if (signature.has_map_entries()) {
+        return signature_has_invalid_weak_target(*signature.key) ||
+               signature_has_invalid_weak_target(*signature.value);
+    }
+    if (signature.has_function_signature()) {
+        if (signature_has_invalid_weak_target(*signature.function_return)) {
+            return true;
+        }
+        for (const auto& parameter : signature.function_parameters) {
+            if (signature_has_invalid_weak_target(parameter)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool module_weak_target_types_are_valid(
+    const Module& module, std::vector<VerifierDiagnostic>& diagnostics) {
+    const auto reject_invalid = [&](std::size_t function_index,
+                                    const SignatureValue& signature,
+                                    std::string message) {
+        if (!signature_has_invalid_weak_target(signature)) {
+            return false;
+        }
+        reject(diagnostics, function_index, std::nullopt,
+               VerifierReason::BadWeakTargetType, std::move(message));
+        return true;
+    };
+
+    for (const auto& type : module.named_types) {
+        if (reject_invalid(0, type.body,
+                           "module named type contains a non-object weak target")) {
+            return false;
+        }
+    }
+    for (std::size_t function_index = 0;
+         function_index < module.functions.size(); ++function_index) {
+        const auto& signature = module.functions[function_index].signature;
+        for (std::size_t i = 0; i < signature.parameters.size(); ++i) {
+            if (reject_invalid(function_index,
+                               parameter_signature(signature, i),
+                               "function parameter contains a non-object weak target")) {
+                return false;
+            }
+        }
+        if (reject_invalid(function_index, return_signature(signature),
+                           "function return contains a non-object weak target")) {
+            return false;
+        }
+    }
+    for (const auto& layout : module.closure_layouts) {
+        if (reject_invalid(layout.function_index, layout.function_type,
+                           "closure function type contains a non-object weak target")) {
+            return false;
+        }
+        for (const auto& capture : layout.capture_types) {
+            if (reject_invalid(layout.function_index, capture,
+                               "closure capture contains a non-object weak target")) {
+                return false;
+            }
+        }
+    }
+    for (const auto& layout : module.map_layouts) {
+        if (reject_invalid(0, layout.key_type,
+                           "map key contains a non-object weak target") ||
+            reject_invalid(0, layout.value_type,
+                           "map value contains a non-object weak target")) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool module_map_key_types_are_valid(
@@ -707,6 +847,8 @@ bool operator==(const AbstractValue& lhs, const AbstractValue& rhs) {
             (lhs.signature_map != nullptr && rhs.signature_map != nullptr &&
              signature_values_equal(*lhs.signature_map,
                                     *rhs.signature_map))) &&
+           abstract_value_ptr_equal(lhs.reference_target,
+                                    rhs.reference_target) &&
            lhs.signature_named_type == rhs.signature_named_type &&
            lhs.source_local == rhs.source_local &&
            lhs.nil_test_local == rhs.nil_test_local;
@@ -745,6 +887,26 @@ bool is_poison(const AbstractValue& value) {
 }
 
 AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
+    const auto join_maybe_with_target = [](const AbstractValue& maybe,
+                                           const AbstractValue& target)
+        -> std::optional<AbstractValue> {
+        if (maybe.kind != AbstractKind::MaybeReference ||
+            maybe.reference_target == nullptr ||
+            maybe.reference_target->kind != target.kind) {
+            return std::nullopt;
+        }
+        auto joined_target = join_values(*maybe.reference_target, target);
+        if (is_poison(joined_target)) {
+            return poison_value();
+        }
+        return maybe_reference_value(std::move(joined_target));
+    };
+    if (auto joined = join_maybe_with_target(lhs, rhs); joined.has_value()) {
+        return *joined;
+    }
+    if (auto joined = join_maybe_with_target(rhs, lhs); joined.has_value()) {
+        return *joined;
+    }
     if (lhs.kind != rhs.kind || is_poison(lhs) || is_poison(rhs)) {
         return poison_value();
     }
@@ -802,6 +964,18 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
                                     *rhs.signature_map)) {
             return poison_value();
         }
+    } else if (joined.kind == AbstractKind::Weak ||
+               joined.kind == AbstractKind::MaybeReference) {
+        if (lhs.reference_target == nullptr ||
+            rhs.reference_target == nullptr) {
+            return poison_value();
+        }
+        auto target = join_values(*lhs.reference_target,
+                                  *rhs.reference_target);
+        if (is_poison(target)) {
+            return poison_value();
+        }
+        joined.reference_target = abstract_value_ptr(std::move(target));
     }
     if (lhs.source_local == rhs.source_local) {
         joined.source_local = lhs.source_local;
@@ -977,7 +1151,10 @@ bool pop_expect_or_report(AbstractState& state,
         std::ostringstream message;
         message << context << " expected " << abstract_kind_name(expected)
                 << " but found " << abstract_kind_name(actual.kind);
-        return reject(diagnostics, function_index, pc, mismatch_reason,
+        const auto reason = actual.kind == AbstractKind::MaybeReference
+                                ? VerifierReason::WeakTargetMayBeNil
+                                : mismatch_reason;
+        return reject(diagnostics, function_index, pc, reason,
                       instruction_message(function, pc, message.str()));
     }
     if (out != nullptr) {
@@ -1001,6 +1178,7 @@ bool pop_reference_or_report(AbstractState& state,
         return false;
     }
     if (!is_reference_kind(actual.kind) ||
+        actual.kind == AbstractKind::MaybeReference ||
         (actual.kind == AbstractKind::Object && actual.includes_nil)) {
         std::ostringstream message;
         message << context << " expected a non-nil reference but found "
@@ -1176,12 +1354,28 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
         !value.signature_named_type.has_value()) {
         return true;
     }
+    if (value.kind == AbstractKind::MaybeReference &&
+        value.reference_target != nullptr &&
+        expected.kind == AbstractKind::Object &&
+        expected.signature_named_type.has_value()) {
+        return value_conforms_to_expected(module, state,
+                                          *value.reference_target, expected,
+                                          assumptions);
+    }
     if (value.kind == AbstractKind::RefArray && expected.kind == AbstractKind::Object) {
         return !expected.includes_nil && !expected.signature_named_type.has_value() &&
                expected.signature_fields == nullptr;
     }
     if (value.kind != expected.kind) {
         return false;
+    }
+    if (expected.kind == AbstractKind::Weak) {
+        return value.reference_target != nullptr &&
+               expected.reference_target != nullptr &&
+               value_conforms_to_expected(module, state,
+                                          *value.reference_target,
+                                          *expected.reference_target,
+                                          assumptions);
     }
     if (expected.kind == AbstractKind::RefArray) {
         if (expected.signature_array_element == nullptr) {
@@ -1435,13 +1629,55 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         state.stack.push_back(nil_object_value());
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    case OpCode::AllocWeak: {
+        AbstractValue target;
+        if (!pop_reference_or_report(state, diagnostics, function,
+                                     function_index, pc,
+                                     VerifierReason::StackUnderflow,
+                                     VerifierReason::BadWeakTargetType,
+                                     "weak target", &target)) {
+            return false;
+        }
+        state.stack.push_back(weak_value(std::move(target)));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
+    case OpCode::WeakGet: {
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index,
+                               pc, VerifierReason::StackUnderflow,
+                               "weak receiver", &receiver)) {
+            return false;
+        }
+        if (receiver.kind != AbstractKind::Weak ||
+            receiver.reference_target == nullptr) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::WeakOperationOnNonWeak,
+                          instruction_message(
+                              function, pc,
+                              "receiver is not a typed weak reference"));
+        }
+        state.stack.push_back(
+            maybe_reference_value(*receiver.reference_target));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    }
     case OpCode::IsNil: {
         AbstractValue value;
-        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
-                                  AbstractKind::Object, VerifierReason::StackUnderflow,
-                                  VerifierReason::TypeMismatch, "is_nil operand",
-                                  &value)) {
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow,
+                               "is_nil operand", &value)) {
             return false;
+        }
+        if (!is_reference_kind(value.kind)) {
+            std::ostringstream message;
+            message << "is_nil operand expected a reference but found "
+                    << abstract_kind_name(value.kind);
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::TypeMismatch,
+                          instruction_message(function, pc, message.str()));
         }
         auto result = bool_value();
         result.nil_test_local = value.source_local;
@@ -1866,11 +2102,21 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         if (condition.nil_test_local.has_value()) {
             const auto local = *condition.nil_test_local;
             if (local < true_state.locals.size() && true_state.locals[local].has_value()) {
-                true_state.locals[local] = nil_object_value();
+                if (true_state.locals[local]->kind !=
+                    AbstractKind::MaybeReference) {
+                    true_state.locals[local] = nil_object_value();
+                }
             }
             if (local < false_state.locals.size() &&
                 false_state.locals[local].has_value()) {
-                false_state.locals[local]->includes_nil = false;
+                if (false_state.locals[local]->kind ==
+                        AbstractKind::MaybeReference &&
+                    false_state.locals[local]->reference_target != nullptr) {
+                    false_state.locals[local] = without_provenance(
+                        *false_state.locals[local]->reference_target);
+                } else {
+                    false_state.locals[local]->includes_nil = false;
+                }
             }
         }
         successors.emplace_back(static_cast<std::size_t>(ins.operand),
@@ -2266,6 +2512,12 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "MapKeyTypeMismatch";
     case VerifierReason::MapValueTypeMismatch:
         return "MapValueTypeMismatch";
+    case VerifierReason::BadWeakTargetType:
+        return "BadWeakTargetType";
+    case VerifierReason::WeakOperationOnNonWeak:
+        return "WeakOperationOnNonWeak";
+    case VerifierReason::WeakTargetMayBeNil:
+        return "WeakTargetMayBeNil";
     }
     return "<unknown>";
 }
@@ -2313,6 +2565,9 @@ ModuleVerifierReport verify_with_diagnostics(const Module& module) {
                 << " is outside function count " << module.functions.size();
         reject(report.diagnostics, module.entry_function, std::nullopt,
                VerifierReason::ModuleShapeMismatch, message.str());
+        return report;
+    }
+    if (!module_weak_target_types_are_valid(module, report.diagnostics)) {
         return report;
     }
     if (!module_map_key_types_are_valid(module, report.diagnostics)) {

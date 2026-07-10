@@ -20,6 +20,7 @@ struct TypeSpec {
         Array,
         Function,
         Map,
+        Weak,
         Named,
         Nil,
         Invalid,
@@ -31,6 +32,7 @@ struct TypeSpec {
     std::shared_ptr<TypeSpec> element;
     std::shared_ptr<TypeSpec> key;
     std::shared_ptr<TypeSpec> value;
+    std::shared_ptr<TypeSpec> weak_target;
     std::vector<TypeSpec> function_parameters;
     std::shared_ptr<TypeSpec> function_return;
     std::string name;
@@ -48,6 +50,10 @@ struct TypeSpec {
     [[nodiscard]] bool has_map_entries() const {
         return kind == Kind::Map && key != nullptr && value != nullptr;
     }
+
+    [[nodiscard]] bool has_weak_target() const {
+        return kind == Kind::Weak && weak_target != nullptr;
+    }
 };
 
 TypeSpec int64_type();
@@ -61,6 +67,7 @@ TypeSpec pair_type(TypeSpec left, TypeSpec right);
 TypeSpec array_type(TypeSpec element);
 TypeSpec function_type(std::vector<TypeSpec> parameters, TypeSpec result);
 TypeSpec map_type(TypeSpec key, TypeSpec value);
+TypeSpec weak_type(TypeSpec target);
 
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs);
 bool operator!=(const TypeSpec& lhs, const TypeSpec& rhs);
@@ -91,6 +98,8 @@ struct Expr {
         IsNil,
         MapEmpty,
         MapHas,
+        WeakConstruct,
+        WeakGet,
     };
 
     Kind kind{Kind::IntLiteral};
