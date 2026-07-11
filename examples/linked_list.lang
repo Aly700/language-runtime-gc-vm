@@ -1,0 +1,65 @@
+type List = pair<i64, List>;
+type ListHolder = pair<List, pair<i64, bool>>;
+
+fn empty_list() -> List {
+  nil
+}
+
+fn cons(value: i64, tail: List) -> List {
+  pair(value, tail)
+}
+
+fn sum(xs: List) -> i64 {
+  let total: i64 = 0;
+  if is_nil(xs) {
+    total = 0;
+  } else {
+    total = xs.left + sum(xs.right);
+  }
+  total
+}
+
+fn reverse_into(xs: List, holder: ListHolder) -> i64 {
+  let count: i64 = 0;
+  if is_nil(holder) {
+    count = -1;
+  } else {
+    if is_nil(xs) {
+      count = 0;
+    } else {
+    holder.left = cons(xs.left, holder.left);
+      count = 1 + reverse_into(xs.right, holder);
+    }
+  }
+  count
+}
+
+fn print_list(xs: List) -> i64 {
+  let count: i64 = 0;
+  if is_nil(xs) {
+    count = 0;
+  } else {
+    print(to_str(xs.left));
+    count = 1 + print_list(xs.right);
+  }
+  count
+}
+
+let values: List = nil;
+for value in 1..6 {
+  values = pair(value, values);
+}
+print("list");
+let original_count: i64 = print_list(values);
+print("sum=" + to_str(sum(values)));
+let empty: List = empty_list();
+let placeholder: List = cons(0, empty_list());
+let metadata: pair<i64, bool> = pair(0, true);
+let holder: ListHolder = pair(placeholder, metadata);
+holder.left = empty;
+let reverse_count: i64 = reverse_into(values, holder);
+let reversed: List = holder.left;
+print("reversed");
+let reversed_count: i64 = print_list(reversed);
+print("count=" + to_str(reversed_count));
+original_count + reverse_count + reversed_count

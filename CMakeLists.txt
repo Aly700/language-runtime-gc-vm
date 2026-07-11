@@ -97,6 +97,11 @@ target_link_libraries(lang_iteration30_break_continue PRIVATE lang_runtime)
 add_executable(lang_iteration31_strings2 tests/iteration31_strings2.cpp)
 target_link_libraries(lang_iteration31_strings2 PRIVATE lang_runtime)
 
+add_executable(lang_examples tests/lang_examples.cpp)
+target_link_libraries(lang_examples PRIVATE lang_runtime)
+target_compile_definitions(
+    lang_examples PRIVATE LANG_EXAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
+
 add_executable(lang_bench src/bench.cpp)
 target_link_libraries(lang_bench PRIVATE lang_runtime)
 
@@ -127,4 +132,5 @@ add_test(NAME lang_iteration28_for_in COMMAND lang_iteration28_for_in)
 add_test(NAME lang_iteration29_output COMMAND lang_iteration29_output)
 add_test(NAME lang_iteration30_break_continue COMMAND lang_iteration30_break_continue)
 add_test(NAME lang_iteration31_strings2 COMMAND lang_iteration31_strings2)
+add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

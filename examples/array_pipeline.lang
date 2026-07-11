@@ -1,0 +1,71 @@
+fn map_values(values: [i64], transform: fn(i64) -> i64) -> [i64] {
+  let output: [i64] = array<i64>(values.len, 0);
+  let index: i64 = 0;
+  for value in values {
+    output[index] = transform(value);
+    index = index + 1;
+  }
+  output
+}
+
+fn filter_values(values: [i64], predicate: fn(i64) -> bool) -> [i64] {
+  let count: i64 = 0;
+  for value in values {
+    if predicate(value) {
+      count = count + 1;
+    } else {
+      count = count + 0;
+    }
+  }
+  let output: [i64] = array<i64>(count, 0);
+  let index: i64 = 0;
+  for value in values {
+    if predicate(value) {
+      output[index] = value;
+      index = index + 1;
+    } else {
+      index = index + 0;
+    }
+  }
+  output
+}
+
+fn fold_values(values: [i64], initial: i64,
+               combine: fn(i64, i64) -> i64) -> i64 {
+  let result: i64 = initial;
+  for value in values {
+    result = combine(result, value);
+  }
+  result
+}
+
+fn make_shift(offset: i64) -> fn(i64) -> i64 {
+  fn(value: i64) -> i64 {
+    value + offset
+  }
+}
+
+fn less_than(limit: i64) -> fn(i64) -> bool {
+  fn(value: i64) -> bool {
+    value < limit
+  }
+}
+
+fn add(lhs: i64, rhs: i64) -> i64 {
+  lhs + rhs
+}
+
+let input: [i64] = [1, 5, 9, 12];
+let shifted: [i64] = map_values(input, make_shift(2));
+let selected: [i64] = filter_values(shifted, less_than(12));
+print("shifted");
+for value in shifted {
+  print(to_str(value));
+}
+print("selected");
+for value in selected {
+  print(to_str(value));
+}
+let total: i64 = fold_values(selected, 0, add);
+print("sum=" + to_str(total));
+total
