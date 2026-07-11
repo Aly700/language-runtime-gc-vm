@@ -1,0 +1,17 @@
+let source: str = "bytecode-runtime";
+let prefix: str = source.sub(0, 8);
+let suffix: str = source.sub(9, source.len);
+let joined: str = prefix + "/" + suffix;
+let ordered: bool = prefix < suffix;
+let parsed: i64 = to_i64("-42");
+let rendered: str = to_str(parsed);
+let round_trip: bool = to_str(to_i64(rendered)) == "-42";
+print("prefix=" + prefix);
+print("suffix=" + suffix);
+print("joined=" + joined);
+print("ordered=" + to_str(ordered));
+print("first_byte=" + to_str(prefix[0]));
+print("length=" + to_str(prefix.len));
+print("parsed=" + to_str(parsed));
+print("round_trip=" + to_str(round_trip));
+parsed

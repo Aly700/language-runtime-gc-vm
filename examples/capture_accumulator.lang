@@ -1,0 +1,19 @@
+fn make_accumulator(start: i64) -> fn(i64) -> i64 {
+  fn(delta: i64) -> i64 {
+    start + delta
+  }
+}
+
+fn apply_twice(accumulate: fn(i64) -> i64, first: i64, second: i64) -> i64 {
+  accumulate(first) + accumulate(second)
+}
+
+let seed: i64 = 10;
+let original: fn(i64) -> i64 = make_accumulator(seed);
+seed = 100;
+let current: fn(i64) -> i64 = make_accumulator(seed);
+let accumulators: [fn(i64) -> i64] = [original, current];
+print("snapshot=" + to_str(accumulators[0](5)));
+print("original_twice=" + to_str(apply_twice(accumulators[0], 1, 2)));
+print("current=" + to_str(accumulators[1](5)));
+accumulators[0](0) + accumulators[1](0)

@@ -75,6 +75,52 @@ const char* op_name(lang::OpCode op) {
         return "RefArrayGet";
     case lang::OpCode::RefArraySet:
         return "RefArraySet";
+    case lang::OpCode::PushStr:
+        return "PushStr";
+    case lang::OpCode::StrLen:
+        return "StrLen";
+    case lang::OpCode::StrEq:
+        return "StrEq";
+    case lang::OpCode::StrConcat:
+        return "StrConcat";
+    case lang::OpCode::StrIndex:
+        return "StrIndex";
+    case lang::OpCode::AllocClosure:
+        return "AllocClosure";
+    case lang::OpCode::CallClosure:
+        return "CallClosure";
+    case lang::OpCode::LoadCapture:
+        return "LoadCapture";
+    case lang::OpCode::AllocMap:
+        return "AllocMap";
+    case lang::OpCode::MapSet:
+        return "MapSet";
+    case lang::OpCode::MapGet:
+        return "MapGet";
+    case lang::OpCode::MapHas:
+        return "MapHas";
+    case lang::OpCode::MapLen:
+        return "MapLen";
+    case lang::OpCode::AllocWeak:
+        return "AllocWeak";
+    case lang::OpCode::WeakGet:
+        return "WeakGet";
+    case lang::OpCode::MapKeyAt:
+        return "MapKeyAt";
+    case lang::OpCode::MapValueAt:
+        return "MapValueAt";
+    case lang::OpCode::Print:
+        return "Print";
+    case lang::OpCode::I64ToStr:
+        return "I64ToStr";
+    case lang::OpCode::StrToI64:
+        return "StrToI64";
+    case lang::OpCode::BoolToStr:
+        return "BoolToStr";
+    case lang::OpCode::StrSub:
+        return "StrSub";
+    case lang::OpCode::StrLt:
+        return "StrLt";
     }
     return "<unknown>";
 }

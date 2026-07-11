@@ -1,0 +1,15 @@
+let words: [str] = ["blue", "red", "blue", "green", "red", "blue"];
+let counts: map<str, i64> = map<str, i64>();
+for word in words {
+  if counts.has(word) {
+    counts[word] = counts[word] + 1;
+  } else {
+    counts[word] = 1;
+  }
+}
+print("frequencies");
+for word, count in counts {
+  print(word + "=" + to_str(count));
+}
+print("unique=" + to_str(counts.len));
+counts.len
