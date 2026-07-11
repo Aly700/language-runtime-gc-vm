@@ -138,6 +138,10 @@
   Literals decode into the per-module constant pool; concat, equality, length, and byte
   indexing must preserve the compile-boundary agreement invariant and string stack slots
   must be marked as precise object roots.
+- `StrSub` copies a half-open byte range into a fresh `Str`; its source remains a precise
+  mutable root until the allocating operation completes. `StrLt` is unsigned byte-wise
+  lexicographic ordering, and every source string ordering operator lowers only through
+  `StrLt` plus deterministic boolean inversion.
 - String indexing is read-only and returns an unsigned byte widened to `i64`. The frontend
   must reject indexed string assignment before bytecode generation.
 - `print(e)` accepts exactly `str` and appends its bytes plus one newline to the bounded VM

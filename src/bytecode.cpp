@@ -166,6 +166,10 @@ const char* op_name(OpCode op) {
         return "StrToI64";
     case OpCode::BoolToStr:
         return "BoolToStr";
+    case OpCode::StrSub:
+        return "StrSub";
+    case OpCode::StrLt:
+        return "StrLt";
     }
     return "<invalid>";
 }
@@ -1661,6 +1665,45 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         return push_fallthrough_or_report(pc, function, function_index,
                                           std::move(state), successors,
                                           diagnostics);
+    case OpCode::StrSub:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::StrSubRequiresI64Bounds,
+                                  "substring high bound") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Int64,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::StrSubRequiresI64Bounds,
+                                  "substring low bound") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::StrSubRequiresStr,
+                                  "substring receiver")) {
+            return false;
+        }
+        state.stack.push_back(str_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
+    case OpCode::StrLt:
+        if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::StrLtRequiresStr,
+                                  "right string operand") ||
+            !pop_expect_or_report(state, diagnostics, function, function_index, pc,
+                                  AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::StrLtRequiresStr,
+                                  "left string operand")) {
+            return false;
+        }
+        state.stack.push_back(bool_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
     case OpCode::StrIndex:
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64,
@@ -2661,6 +2704,12 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "StrToI64RequiresStr";
     case VerifierReason::BoolToStrRequiresBool:
         return "BoolToStrRequiresBool";
+    case VerifierReason::StrSubRequiresStr:
+        return "StrSubRequiresStr";
+    case VerifierReason::StrSubRequiresI64Bounds:
+        return "StrSubRequiresI64Bounds";
+    case VerifierReason::StrLtRequiresStr:
+        return "StrLtRequiresStr";
     }
     return "<unknown>";
 }

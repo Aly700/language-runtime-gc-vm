@@ -43,6 +43,8 @@ enum class TokenKind {
     Plus,
     Less,
     Greater,
+    LessEqual,
+    GreaterEqual,
     Equal,
     EqualEqual,
     BangEqual,

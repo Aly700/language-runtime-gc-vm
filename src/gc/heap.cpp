@@ -691,6 +691,31 @@ ObjectId Heap::allocate_string_concat(Value left, Value right) {
     return id;
 }
 
+ObjectId Heap::allocate_string_substring(Value source, std::size_t lo,
+                                         std::size_t hi) {
+    require_object_reference_value(source, "string substring source operand");
+    const auto initial_length = checked_string(source.as_object()).string_bytes.size();
+    assert(lo <= hi && hi <= initial_length &&
+           "StrSub VM boundary checks must precede allocation");
+
+    if (stress_config_.collect_before_every_allocation) {
+        std::array<Value*, 1> operand_roots{&source};
+        collect_with_extra_roots(operand_roots);
+    }
+
+    const auto source_bytes = string_bytes(source.as_object());
+    assert(hi <= source_bytes.size() &&
+           "rooted StrSub source length changed across collection");
+    auto id = allocate_object(Object::string(source_bytes.subspan(lo, hi - lo)));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+    return id;
+}
+
 ObjectId Heap::allocate_closure(std::size_t layout_index,
                                 std::size_t function_index,
                                 std::vector<Value> captures,

@@ -166,6 +166,8 @@ public:
     ObjectId allocate_scalar_array(std::size_t length, std::int64_t init);
     ObjectId allocate_string(std::span<const std::uint8_t> bytes);
     ObjectId allocate_string_concat(Value left, Value right);
+    ObjectId allocate_string_substring(Value source, std::size_t lo,
+                                       std::size_t hi);
     ObjectId allocate_closure(std::size_t layout_index,
                               std::size_t function_index,
                               std::vector<Value> captures,

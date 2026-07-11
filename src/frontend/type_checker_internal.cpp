@@ -1332,6 +1332,8 @@ private:
             return check_array_index(expression, state);
         case Expr::Kind::ArrayLen:
             return check_array_len(expression, state);
+        case Expr::Kind::StrSub:
+            return check_str_sub(expression, state);
         case Expr::Kind::Binary:
             return check_binary(expression, state);
         case Expr::Kind::Field:
@@ -1780,13 +1782,36 @@ private:
             }
             return annotate(expression, scalar_value(int64_type()));
         }
-        if (expression.binary_op == '<') {
-            if ((!is_invalid(left.type) && left.type != int64_type()) ||
-                (!is_invalid(right.type) && right.type != int64_type())) {
-                diagnose(expression.operator_position, "operator '<' requires i64 operands");
+        if (expression.binary_op == '<' || expression.binary_op == 'L' ||
+            expression.binary_op == '>' || expression.binary_op == 'G') {
+            const std::string operation =
+                expression.binary_op == '<' ? "<" :
+                expression.binary_op == 'L' ? "<=" :
+                expression.binary_op == '>' ? ">" : ">=";
+            const bool both_i64 =
+                left.type == int64_type() && right.type == int64_type();
+            const bool both_str = left.type == str_type() && right.type == str_type();
+            if (both_str && (left.includes_nil || right.includes_nil)) {
+                diagnose(expression.operator_position,
+                         "string ordering requires non-nil str operands");
                 return annotate(expression, invalid_value());
             }
-            return annotate(expression, scalar_value(bool_type()));
+            if (both_str || (expression.binary_op == '<' && both_i64)) {
+                return annotate(expression, scalar_value(bool_type()));
+            }
+            if (expression.binary_op == '<') {
+                if (left.type == str_type() || right.type == str_type()) {
+                    diagnose(expression.operator_position,
+                             "operator '<' requires matching i64 or str operands");
+                } else {
+                    diagnose(expression.operator_position,
+                             "operator '<' requires i64 operands");
+                }
+            } else {
+                diagnose(expression.operator_position,
+                         "operator '" + operation + "' requires str operands");
+            }
+            return annotate(expression, invalid_value());
         }
         if (expression.binary_op == '=' || expression.binary_op == '!') {
             if (left.type == str_type() && right.type == str_type() &&
@@ -1806,6 +1831,36 @@ private:
         }
         diagnose(expression.operator_position, "unknown binary operator");
         return annotate(expression, invalid_value());
+    }
+
+    TypedValue check_str_sub(Expr& expression, FlowState& state) {
+        const auto receiver = check_expr(*expression.receiver, state);
+        if (expression.arguments.size() != 2) {
+            diagnose(expression.position, "sub expects exactly 2 arguments");
+            return annotate(expression, invalid_value());
+        }
+        const auto lo = check_expr(*expression.arguments[0], state);
+        const auto hi = check_expr(*expression.arguments[1], state);
+        bool valid = true;
+        if (!is_invalid(receiver.type) && receiver.type != str_type()) {
+            diagnose(expression.position, "sub requires str receiver");
+            valid = false;
+        } else if (receiver.type == str_type() && receiver.includes_nil) {
+            diagnose(expression.position, "sub requires non-nil str receiver");
+            valid = false;
+        }
+        if (!is_invalid(lo.type) && lo.type != int64_type()) {
+            diagnose(expression.arguments[0]->position,
+                     "sub argument expects i64");
+            valid = false;
+        }
+        if (!is_invalid(hi.type) && hi.type != int64_type()) {
+            diagnose(expression.arguments[1]->position,
+                     "sub argument expects i64");
+            valid = false;
+        }
+        return annotate(expression,
+                        valid ? scalar_value(str_type()) : invalid_value());
     }
 
     TypedValue check_is_nil(Expr& expression, FlowState& state) {

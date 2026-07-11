@@ -56,6 +56,8 @@ enum class OpCode {
     I64ToStr,
     StrToI64,
     BoolToStr,
+    StrSub,
+    StrLt,
 };
 
 struct Instruction {
@@ -320,6 +322,9 @@ enum class VerifierReason {
     I64ToStrRequiresI64,      // I64ToStr operand is not an i64.
     StrToI64RequiresStr,      // StrToI64 operand is not a string.
     BoolToStrRequiresBool,    // BoolToStr operand is not a bool.
+    StrSubRequiresStr,        // StrSub receiver is not a string.
+    StrSubRequiresI64Bounds,  // StrSub lo or hi operand is not an i64.
+    StrLtRequiresStr,         // StrLt operand is not a string.
 };
 
 struct VerifierDiagnostic {

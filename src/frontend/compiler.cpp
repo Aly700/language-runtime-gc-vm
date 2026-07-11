@@ -304,6 +304,12 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::ArrayLen:
         add_expr_array_counts(*expression.receiver, counts);
         return;
+    case Expr::Kind::StrSub:
+        add_expr_array_counts(*expression.receiver, counts);
+        for (const auto& argument : expression.arguments) {
+            add_expr_array_counts(*argument, counts);
+        }
+        return;
     case Expr::Kind::Field:
     case Expr::Kind::IsNil:
     case Expr::Kind::WeakConstruct:
@@ -761,16 +767,46 @@ private:
                 emit(OpCode::ArrayLen, 0);
             }
             break;
+        case Expr::Kind::StrSub:
+            assert(expression.arguments.size() == 2 &&
+                   "type-checked sub must have exactly two arguments");
+            compile_expr(*expression.receiver);
+            compile_expr(*expression.arguments[0]);
+            compile_expr(*expression.arguments[1]);
+            emit(OpCode::StrSub, 0);
+            break;
         case Expr::Kind::Binary:
-            compile_expr(*expression.left);
-            compile_expr(*expression.right);
+            if (expression.binary_op == '>' || expression.binary_op == 'L') {
+                const auto left = allocate_temp_local();
+                const auto right = allocate_temp_local();
+                compile_expr(*expression.left);
+                emit(OpCode::StoreLocal, left);
+                compile_expr(*expression.right);
+                emit(OpCode::StoreLocal, right);
+                emit(OpCode::LoadLocal, right);
+                emit(OpCode::LoadLocal, left);
+            } else {
+                compile_expr(*expression.left);
+                compile_expr(*expression.right);
+            }
             if (expression.binary_op == '+') {
                 emit(expression.left->inferred_type.kind == TypeSpec::Kind::Str
                          ? OpCode::StrConcat
                          : OpCode::AddI64,
                      0);
             } else if (expression.binary_op == '<') {
-                emit(OpCode::LessI64, 0);
+                emit(expression.left->inferred_type.kind == TypeSpec::Kind::Str
+                         ? OpCode::StrLt
+                         : OpCode::LessI64,
+                     0);
+            } else if (expression.binary_op == '>' ||
+                       expression.binary_op == 'L' ||
+                       expression.binary_op == 'G') {
+                emit(OpCode::StrLt, 0);
+                if (expression.binary_op == 'L' ||
+                    expression.binary_op == 'G') {
+                    invert_bool_on_stack();
+                }
             } else {
                 emit(OpCode::StrEq, 0);
                 if (expression.binary_op == '!') {
