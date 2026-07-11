@@ -1,5 +1,6 @@
 #include "lang/vm.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <charconv>
 #include <cstddef>
@@ -312,6 +313,47 @@ Value VM::execute_verified(const Module& module,
             (void)pop(frame);
             (void)pop(frame);
             push(frame, Value::object(result));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::StrSub: {
+            assert(frame.stack.size() >= 3 &&
+                   "verifier invariant violated: StrSub requires three operands");
+            const auto source = frame.stack[frame.stack.size() - 3];
+            const auto lo_value = frame.stack[frame.stack.size() - 2];
+            const auto hi_value = frame.stack[frame.stack.size() - 1];
+            assert(source.is_object() &&
+                   "verifier invariant violated: StrSub source must be object");
+            assert(lo_value.tag() == Value::Tag::Int64 &&
+                   hi_value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: StrSub bounds must be i64");
+            const auto lo = lo_value.as_i64();
+            const auto hi = hi_value.as_i64();
+            const auto length = heap_.string_length(source.as_object());
+            if (lo < 0 || hi < 0 || lo > hi ||
+                static_cast<std::uint64_t>(hi) > length) {
+                throw std::out_of_range("string substring bounds out of range");
+            }
+            const auto result = heap_.allocate_string_substring(
+                source, static_cast<std::size_t>(lo),
+                static_cast<std::size_t>(hi));
+            (void)pop(frame);
+            (void)pop(frame);
+            (void)pop(frame);
+            push(frame, Value::object(result));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::StrLt: {
+            const auto right = pop(frame);
+            const auto left = pop(frame);
+            assert(right.is_object() && left.is_object() &&
+                   "verifier invariant violated: StrLt operands must be objects");
+            const auto left_bytes = heap_.string_bytes(left.as_object());
+            const auto right_bytes = heap_.string_bytes(right.as_object());
+            push(frame, Value::boolean(std::lexicographical_compare(
+                            left_bytes.begin(), left_bytes.end(),
+                            right_bytes.begin(), right_bytes.end())));
             ++frame.pc;
             break;
         }

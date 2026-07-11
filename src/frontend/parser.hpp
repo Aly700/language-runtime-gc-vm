@@ -91,6 +91,7 @@ struct Expr {
         ArraySized,
         ArrayIndex,
         ArrayLen,
+        StrSub,
         Binary,
         Field,
         Call,

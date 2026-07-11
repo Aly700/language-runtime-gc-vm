@@ -742,12 +742,29 @@ private:
 
     std::unique_ptr<Expr> parse_comparison() {
         auto expression = parse_addition();
-        while (match(TokenKind::Less)) {
+        while (match(TokenKind::Less) || match(TokenKind::LessEqual) ||
+               match(TokenKind::Greater) || match(TokenKind::GreaterEqual)) {
+            const auto operation = previous();
             auto node = std::make_unique<Expr>();
             node->kind = Expr::Kind::Binary;
             node->position = expression->position;
-            node->operator_position = previous().position;
-            node->binary_op = '<';
+            node->operator_position = operation.position;
+            switch (operation.kind) {
+            case TokenKind::Less:
+                node->binary_op = '<';
+                break;
+            case TokenKind::LessEqual:
+                node->binary_op = 'L';
+                break;
+            case TokenKind::Greater:
+                node->binary_op = '>';
+                break;
+            case TokenKind::GreaterEqual:
+                node->binary_op = 'G';
+                break;
+            default:
+                throw std::logic_error("comparison parser matched non-comparison token");
+            }
             node->left = std::move(expression);
             node->right = parse_addition();
             expression = std::move(node);
@@ -808,9 +825,23 @@ private:
                     expect(TokenKind::LParen, "expected '(' after 'get'");
                     expect(TokenKind::RParen, "weak get takes no arguments");
                     expression = std::move(node);
+                } else if (check(TokenKind::Identifier) && peek().text == "sub") {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::StrSub;
+                    node->position = peek().position;
+                    node->receiver = std::move(expression);
+                    ++current_;
+                    expect(TokenKind::LParen, "expected '(' after 'sub'");
+                    if (!check(TokenKind::RParen)) {
+                        do {
+                            node->arguments.push_back(parse_expression());
+                        } while (match(TokenKind::Comma));
+                    }
+                    expect(TokenKind::RParen, "expected ')' after sub arguments");
+                    expression = std::move(node);
                 } else {
                     add_diagnostic(diagnostics_, peek().position,
-                                   "expected field name 'left', 'right', 'len', 'has', or 'get'");
+                                   "expected field name 'left', 'right', 'len', 'has', 'get', or 'sub'");
                     break;
                 }
             } else if (match(TokenKind::LBracket)) {

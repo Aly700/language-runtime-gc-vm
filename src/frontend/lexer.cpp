@@ -53,6 +53,20 @@ public:
                 tokens.push_back(simple(TokenKind::BangEqual, start, "!="));
                 continue;
             }
+            if (c == '<' && offset_ + 1 < source_.size() &&
+                source_[offset_ + 1] == '=') {
+                advance();
+                advance();
+                tokens.push_back(simple(TokenKind::LessEqual, start, "<="));
+                continue;
+            }
+            if (c == '>' && offset_ + 1 < source_.size() &&
+                source_[offset_ + 1] == '=') {
+                advance();
+                advance();
+                tokens.push_back(simple(TokenKind::GreaterEqual, start, ">="));
+                continue;
+            }
             if (c == '.' && offset_ + 1 < source_.size() &&
                 source_[offset_ + 1] == '.') {
                 advance();

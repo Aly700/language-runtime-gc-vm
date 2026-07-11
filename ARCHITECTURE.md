@@ -32,8 +32,9 @@ The source language is intentionally small:
 - Top-level `let name: type = expression;` declarations introduce initialized locals.
 - Assignment supports locals, `pair` fields (`left` and `right`), and array elements
   (`a[i] = v`).
-- Expressions include i64/bool/string literals, variables, numeric/string `+`, `<`, string
-  `==`/`!=`, `pair(left, right)`, field access, `[v, ...]` array literals,
+- Expressions include i64/bool/string literals, variables, numeric/string `+`, numeric
+  `<`, string `<`/`<=`/`>`/`>=`, string `==`/`!=`, `pair(left, right)`, field access,
+  `[v, ...]` array literals,
   `array<T>(len, init)` sized array construction, array/string indexing, `.len`, and
   parentheses. Maps add `map<K, V>()`, indexed get, indexed insert-or-update,
   `.has(key)`, and `.len`.
@@ -59,8 +60,8 @@ The source language is intentionally small:
   before any object operation. There is no separate `is_alive` surface.
 - A program ends with a final expression, which becomes the VM result.
 
-Minimal cuts: there are no substrings, string interning/mutation, expression-valued blocks,
-capture mutation, recursion through a self-capture, or block-local `let` declarations.
+Minimal cuts: there is no string interning/mutation, expression-valued blocks, capture
+mutation, recursion through a self-capture, or block-local `let` declarations.
 Bare `pair` remains an opaque pair leaf type for
 compatibility: it proves only "object" at function boundaries, so field reads through bare
 pair parameters/returns are rejected as unknown. Inside a function, the type checker still
@@ -92,9 +93,16 @@ element recovery is what allows `pairs[i].left`, `[List]` element field reads, a
 Source strings are immutable byte sequences. Double-quoted literals decode `\n`, `\t`,
 `\\`, and `\"` into a per-module constant pool. `str + str` allocates a new string,
 `==` and `!=` compare bytes structurally, `.len` returns the byte count, and `s[i]`
-returns the unsigned byte widened to `i64`. String indexing traps deterministically when
-out of bounds; indexed assignment is rejected because no string payload-store operation
-exists.
+returns the unsigned byte widened to `i64`. `s.sub(lo, hi)` copies the half-open byte range
+`[lo, hi)` into a fresh `Str`; negative `lo`, `hi` beyond the byte length, and `lo > hi`
+trap with `string substring bounds out of range`, while `lo == hi` returns a fresh empty
+string. String indexing traps deterministically when out of bounds; indexed assignment is
+rejected because no string payload-store operation exists.
+
+String ordering is unsigned byte-wise lexicographic order with shorter-prefix-is-less.
+The VM exposes only `StrLt`; the compiler lowers `a < b` directly, `a > b` as `b < a`,
+`a <= b` as `!(b < a)`, and `a >= b` as `!(a < b)`. This keeps the bytecode boundary
+minimal while retaining positioned frontend type errors for mixed operands.
 
 String/integer conversion is explicit. `to_str(i64)` emits the unique optional-minus
 decimal form, including `INT64_MIN` without host signed-negation overflow;
@@ -190,6 +198,12 @@ control remains deferred.
   instruction loop. The per-pc stack-map assertions, collection-boundary assertions,
   call-depth checks, heap validators, and agreement invariants remain active and
   unchanged.
+- `StrSub` retains its source and both scalar bounds on the frame until allocation
+  completes. The verifier-generated map marks exactly the source slot as a root, and the
+  heap allocation helper mirrors `StrConcat` by rooting its copied source `Value` across a
+  before-allocation collection. Every result is a new opaque byte object, including empty
+  and full-range slices. `StrLt` performs no allocation and compares `uint8_t` payloads so
+  bytes such as `0x00` and `0xff` are ordered independently of host signed `char`.
 - `lang::gc::Heap` implements deterministic major and minor mark-compact collection over
   generation-tagged object IDs. The low bits identify the storage slot and the high bits
   identify that slot's current generation, so a swept or moved ID cannot alias a later
@@ -261,6 +275,10 @@ control remains deferred.
   separate pinned `output` grammar so the eleven legacy generators and corpus dumps remain
   byte-identical while programs exercise conversions, containers, closures, concatenation,
   for-in map recovery, printing, and deterministic runtime traps.
+- Iteration 31 adds a separate pinned `strings2` grammar. Its 32 seeds exercise
+  substring/ordering/concat/length/index composition, map keys, closures, for-in break,
+  and output across the same ten schedules. The target supports deterministic schedule and
+  mutant replay without modifying any legacy generator stream.
 
 ## Performance measurement
 
