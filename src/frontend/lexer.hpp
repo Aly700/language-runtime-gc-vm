@@ -16,6 +16,7 @@ enum class TokenKind {
     String,
     Let,
     Type,
+    Record,
     Fn,
     If,
     Else,

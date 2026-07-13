@@ -97,6 +97,12 @@ target_link_libraries(lang_iteration30_break_continue PRIVATE lang_runtime)
 add_executable(lang_iteration31_strings2 tests/iteration31_strings2.cpp)
 target_link_libraries(lang_iteration31_strings2 PRIVATE lang_runtime)
 
+add_executable(lang_iteration33_records tests/iteration33_records.cpp)
+target_link_libraries(lang_iteration33_records PRIVATE lang_runtime)
+
+add_executable(lang_iteration33_records_fuzz tests/iteration33_records_fuzz.cpp)
+target_link_libraries(lang_iteration33_records_fuzz PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -132,5 +138,7 @@ add_test(NAME lang_iteration28_for_in COMMAND lang_iteration28_for_in)
 add_test(NAME lang_iteration29_output COMMAND lang_iteration29_output)
 add_test(NAME lang_iteration30_break_continue COMMAND lang_iteration30_break_continue)
 add_test(NAME lang_iteration31_strings2 COMMAND lang_iteration31_strings2)
+add_test(NAME lang_iteration33_records COMMAND lang_iteration33_records)
+add_test(NAME lang_iteration33_records_fuzz COMMAND lang_iteration33_records_fuzz)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

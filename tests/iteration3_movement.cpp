@@ -111,6 +111,12 @@ const char* op_name(lang::OpCode op) {
         return "StrSub";
     case lang::OpCode::StrLt:
         return "StrLt";
+    case lang::OpCode::AllocRecord:
+        return "AllocRecord";
+    case lang::OpCode::RecordGet:
+        return "RecordGet";
+    case lang::OpCode::RecordSet:
+        return "RecordSet";
     }
     return "<unknown>";
 }

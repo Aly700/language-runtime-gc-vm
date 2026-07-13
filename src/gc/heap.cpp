@@ -70,11 +70,18 @@ std::size_t storage_slot_count(const Object& object) {
         return 1 + 2 * static_cast<std::size_t>(object.length);
     case ObjectKind::WeakRef:
         return 1;
+    case ObjectKind::Record:
+        return 1 + static_cast<std::size_t>(object.length);
     }
     throw std::logic_error("unknown object kind");
 }
 
 void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = nullptr) {
+    if (object.kind != ObjectKind::Record &&
+        (!object.record_fields.empty() || !object.record_ref_map.empty())) {
+        throw std::logic_error(
+            "non-record descriptor contains collector-visible record payload");
+    }
     if (metrics != nullptr) {
         if (object.kind == ObjectKind::Closure) {
             metrics->closure_capture_slots_scanned += object.closure_captures.size();
@@ -202,6 +209,31 @@ void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = null
                 "weak reference descriptor does not match collector-owned target slot");
         }
         return;
+    case ObjectKind::Record:
+        if (!object.scalar_elements.empty() || !object.ref_elements.empty() ||
+            !object.string_bytes.empty() || !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty() || !object.map_entries.empty() ||
+            object.record_fields.size() != object.length ||
+            object.record_ref_map.size() != object.length ||
+            object.left.tag() != Value::Tag::Nil ||
+            object.right.tag() != Value::Tag::Nil ||
+            object.weak_target().tag() != Value::Tag::Nil) {
+            throw std::logic_error(
+                "record descriptor length does not match layout payload");
+        }
+        for (std::size_t i = 0; i < object.record_fields.size(); ++i) {
+            const auto tag = object.record_fields[i].tag();
+            if (object.record_ref_map[i]) {
+                if (tag != Value::Tag::Object && tag != Value::Tag::Nil) {
+                    throw std::logic_error(
+                        "record reference bitmap marks a scalar payload as a reference");
+                }
+            } else if (tag != Value::Tag::Int64 && tag != Value::Tag::Bool) {
+                throw std::logic_error(
+                    "record reference bitmap marks a reference payload as scalar");
+            }
+        }
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -255,6 +287,13 @@ void visit_reference_fields(Object& object, Fn&& fn,
         return;
     case ObjectKind::WeakRef:
         return;
+    case ObjectKind::Record:
+        for (std::size_t i = 0; i < object.record_fields.size(); ++i) {
+            if (object.record_ref_map[i]) {
+                fn(object.record_fields[i]);
+            }
+        }
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -301,6 +340,13 @@ void visit_reference_fields(const Object& object, Fn&& fn,
         }
         return;
     case ObjectKind::WeakRef:
+        return;
+    case ObjectKind::Record:
+        for (std::size_t i = 0; i < object.record_fields.size(); ++i) {
+            if (object.record_ref_map[i]) {
+                fn(object.record_fields[i]);
+            }
+        }
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -353,6 +399,13 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn,
         }
         return;
     case ObjectKind::WeakRef:
+        return;
+    case ObjectKind::Record:
+        for (std::size_t i = object.record_fields.size(); i > 0; --i) {
+            if (object.record_ref_map[i - 1]) {
+                fn(object.record_fields[i - 1]);
+            }
+        }
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -457,6 +510,26 @@ Object Object::weak_ref(Value target) {
     object.left = Value::nil();
     object.right = Value::nil();
     object.weak_target_ = target;
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object Object::record(std::size_t layout_index, std::vector<Value> fields,
+                      std::vector<bool> ref_map) {
+    if (fields.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("record field count exceeds object header limit");
+    }
+    if (layout_index > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("record layout index exceeds object header limit");
+    }
+    Object object;
+    object.kind = ObjectKind::Record;
+    object.length = static_cast<std::uint32_t>(fields.size());
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.record_layout_index = static_cast<std::uint32_t>(layout_index);
+    object.record_fields = std::move(fields);
+    object.record_ref_map = std::move(ref_map);
     validate_descriptor_shape(object);
     return object;
 }
@@ -781,6 +854,37 @@ ObjectId Heap::allocate_weak(Value target) {
     return id;
 }
 
+ObjectId Heap::allocate_record(std::size_t layout_index,
+                               std::vector<Value> fields,
+                               std::vector<bool> ref_map) {
+    if (fields.size() != ref_map.size()) {
+        throw std::logic_error(
+            "record reference-bitmap length does not match field payload");
+    }
+    (void)Object::record(layout_index, fields, ref_map);
+
+    if (stress_config_.collect_before_every_allocation) {
+        std::vector<Value*> operand_roots;
+        operand_roots.reserve(fields.size());
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+            if (ref_map[i]) {
+                operand_roots.push_back(&fields[i]);
+            }
+        }
+        collect_with_extra_roots(operand_roots);
+    }
+
+    auto id = allocate_object(Object::record(
+        layout_index, std::move(fields), std::move(ref_map)));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+    return id;
+}
+
 Handle Heap::make_handle(Value value) {
     if (value.is_object()) {
         (void)checked_slot(value.as_object());
@@ -1001,6 +1105,24 @@ const Object& Heap::checked_weak_ref(ObjectId id) const {
     const auto& object = *objects_[checked_slot(id)];
     if (object.kind != ObjectKind::WeakRef) {
         throw std::logic_error("object is not a weak reference");
+    }
+    validate_descriptor_shape(object, &metrics_);
+    return object;
+}
+
+const Object& Heap::checked_record(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Record) {
+        throw std::logic_error("object is not a record");
+    }
+    validate_descriptor_shape(object, &metrics_);
+    return object;
+}
+
+Object& Heap::checked_record(ObjectId id) {
+    auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Record) {
+        throw std::logic_error("object is not a record");
     }
     validate_descriptor_shape(object, &metrics_);
     return object;
@@ -1229,6 +1351,26 @@ Value Heap::weak_get(ObjectId id) const {
     return checked_weak_ref(id).weak_target();
 }
 
+std::size_t Heap::record_layout_index(ObjectId id) const {
+    return checked_record(id).record_layout_index;
+}
+
+std::size_t Heap::record_field_count(ObjectId id) const {
+    return checked_record(id).record_fields.size();
+}
+
+Value Heap::record_get(ObjectId id, std::size_t index) const {
+    const auto& record = checked_record(id);
+    if (index >= record.record_fields.size()) {
+        throw std::out_of_range("record field index out of bounds");
+    }
+    return record.record_fields[index];
+}
+
+void Heap::record_set(ObjectId id, std::size_t index, Value value) {
+    store_record_field(id, index, value);
+}
+
 void Heap::map_set(ObjectId id, Value key, Value value) {
     store_map_entry(id, key, value);
 }
@@ -1387,6 +1529,38 @@ void Heap::store_ref_array_element(ObjectId id, std::size_t index, Value value) 
 
     if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
         collect_minor();
+    }
+}
+
+void Heap::store_record_field(ObjectId id, std::size_t index, Value value) {
+    Value owner = Value::object(id);
+    auto& record = checked_record(id);
+    if (index >= record.record_fields.size()) {
+        throw std::out_of_range("record field index out of bounds");
+    }
+    const bool is_reference = record.record_ref_map[index];
+    if (is_reference) {
+        if (value.tag() != Value::Tag::Object && value.tag() != Value::Tag::Nil) {
+            throw std::logic_error(
+                "record reference field must carry Object or Nil tag");
+        }
+        if (value.is_object()) {
+            (void)checked_slot(value.as_object());
+        }
+    } else if (value.tag() != Value::Tag::Int64 &&
+               value.tag() != Value::Tag::Bool) {
+        throw std::logic_error("record scalar field must carry i64 or bool tag");
+    }
+
+    const bool barrier_triggered =
+        is_reference && record_write_barrier_if_needed(id, value);
+    record.record_fields[index] = value;
+    validate_descriptor_shape(record, &metrics_);
+
+    if (barrier_triggered &&
+        stress_config_.collect_minor_after_every_write_barrier) {
+        std::array<Value*, 2> mutation_roots{&owner, &value};
+        collect_impl(CollectionKind::Minor, nullptr, mutation_roots);
     }
 }
 
@@ -1679,6 +1853,10 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
             break;
         case ObjectKind::WeakRef:
             metrics_.compaction_weak_ref_bytes += copied_bytes;
+            break;
+        case ObjectKind::Record:
+            // Record accounting is intentionally not appended to the public benchmark
+            // counter stream; legacy workloads must remain byte-identical.
             break;
         }
         if (next_live_slot + required_slots > result.objects.size()) {
@@ -2006,6 +2184,10 @@ bool Heap::TEST_ONLY_is_map(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_weak_ref(ObjectId id) const {
     return object(id).kind == ObjectKind::WeakRef;
+}
+
+bool Heap::TEST_ONLY_is_record(ObjectId id) const {
+    return object(id).kind == ObjectKind::Record;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {

@@ -30,6 +30,16 @@ TypeSpec named_type(std::string name, SourcePosition position) {
     return type;
 }
 
+TypeSpec record_type(std::string name, std::size_t layout_index,
+                     SourcePosition position) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Record;
+    type.name = std::move(name);
+    type.position = position;
+    type.record_layout_index = layout_index;
+    return type;
+}
+
 TypeSpec pair_type(TypeSpec left, TypeSpec right) {
     TypeSpec type;
     type.kind = TypeSpec::Kind::Pair;
@@ -75,6 +85,13 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs.kind == TypeSpec::Kind::Named) {
         if (lhs.named_type_index.has_value() && rhs.named_type_index.has_value()) {
             return lhs.named_type_index == rhs.named_type_index;
+        }
+        return lhs.name == rhs.name;
+    }
+    if (lhs.kind == TypeSpec::Kind::Record) {
+        if (lhs.record_layout_index.has_value() &&
+            rhs.record_layout_index.has_value()) {
+            return lhs.record_layout_index == rhs.record_layout_index;
         }
         return lhs.name == rhs.name;
     }
@@ -151,6 +168,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Weak;
     case TypeSpec::Kind::Named:
         return Type::Pair;
+    case TypeSpec::Kind::Record:
+        return Type::Record;
     case TypeSpec::Kind::Nil:
         return Type::Invalid;
     case TypeSpec::Kind::Invalid:
@@ -203,6 +222,8 @@ std::string type_name(const TypeSpec& type) {
                    : "weak<" + type_name(*type.weak_target) + ">";
     case TypeSpec::Kind::Named:
         return type.name;
+    case TypeSpec::Kind::Record:
+        return type.name;
     case TypeSpec::Kind::Nil:
         return "nil";
     case TypeSpec::Kind::Invalid:
@@ -221,10 +242,12 @@ TypeSpec join_types(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs == rhs) {
         return lhs;
     }
-    if (lhs.kind == TypeSpec::Kind::Nil && is_pair(rhs)) {
+    if (lhs.kind == TypeSpec::Kind::Nil &&
+        (is_pair(rhs) || rhs.kind == TypeSpec::Kind::Record)) {
         return rhs;
     }
-    if (rhs.kind == TypeSpec::Kind::Nil && is_pair(lhs)) {
+    if (rhs.kind == TypeSpec::Kind::Nil &&
+        (is_pair(lhs) || lhs.kind == TypeSpec::Kind::Record)) {
         return lhs;
     }
     if (lhs.kind == TypeSpec::Kind::Array && rhs.kind == TypeSpec::Kind::Array &&
@@ -245,12 +268,19 @@ public:
 
     std::optional<Program> parse() {
         Program program;
-        while (check(TokenKind::Type) ||
+        while (check(TokenKind::Type) || check(TokenKind::Record) ||
                (check(TokenKind::Fn) && check_next(TokenKind::Identifier))) {
             if (match(TokenKind::Type)) {
                 auto declaration = parse_type_declaration(previous());
                 if (declaration.has_value()) {
                     program.types.push_back(std::move(*declaration));
+                } else {
+                    synchronize();
+                }
+            } else if (match(TokenKind::Record)) {
+                auto declaration = parse_record_declaration(previous());
+                if (declaration.has_value()) {
+                    program.records.push_back(std::move(*declaration));
                 } else {
                     synchronize();
                 }
@@ -330,6 +360,32 @@ private:
         return std::nullopt;
     }
 
+    std::optional<Token> expect_field_name(const std::string& message) {
+        if (match(TokenKind::Identifier) || match(TokenKind::Left) ||
+            match(TokenKind::Right)) {
+            return previous();
+        }
+        add_diagnostic(diagnostics_, peek().position, message);
+        return std::nullopt;
+    }
+
+    bool looks_like_record_literal(const Token& identifier) const {
+        if (!check(TokenKind::LBrace)) {
+            return false;
+        }
+        if (record_names_.contains(identifier.text)) {
+            return true;
+        }
+        if (current_ + 2 >= tokens_.size()) {
+            return false;
+        }
+        const auto field_kind = tokens_[current_ + 1].kind;
+        return (field_kind == TokenKind::Identifier ||
+                field_kind == TokenKind::Left ||
+                field_kind == TokenKind::Right) &&
+               tokens_[current_ + 2].kind == TokenKind::Colon;
+    }
+
     std::optional<TypeDecl> parse_type_declaration(const Token& type_token) {
         TypeDecl declaration;
         declaration.position = type_token.position;
@@ -343,6 +399,36 @@ private:
         declaration.body_position = peek().position;
         declaration.body = parse_type();
         expect(TokenKind::Semicolon, "expected ';' after type declaration");
+        return declaration;
+    }
+
+    std::optional<RecordDecl> parse_record_declaration(
+        const Token& record_token) {
+        RecordDecl declaration;
+        declaration.position = record_token.position;
+        const auto name =
+            expect(TokenKind::Identifier, "expected record name after 'record'");
+        if (name.has_value()) {
+            declaration.name = name->text;
+            declaration.position = name->position;
+            record_names_.insert(name->text);
+        }
+        expect(TokenKind::LBrace, "expected '{' before record fields");
+        if (!check(TokenKind::RBrace)) {
+            do {
+                RecordFieldDecl field;
+                const auto field_name =
+                    expect_field_name("expected record field name");
+                if (field_name.has_value()) {
+                    field.name = field_name->text;
+                    field.position = field_name->position;
+                }
+                expect(TokenKind::Colon, "expected ':' after record field name");
+                field.type = parse_type();
+                declaration.fields.push_back(std::move(field));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
+        }
+        expect(TokenKind::RBrace, "expected '}' after record fields");
         return declaration;
     }
 
@@ -413,7 +499,8 @@ private:
         std::size_t index = current_ + 1;
         while (index < tokens_.size()) {
             if (index + 1 < tokens_.size() && tokens_[index].kind == TokenKind::Dot &&
-                (tokens_[index + 1].kind == TokenKind::Left ||
+                (tokens_[index + 1].kind == TokenKind::Identifier ||
+                 tokens_[index + 1].kind == TokenKind::Left ||
                  tokens_[index + 1].kind == TokenKind::Right)) {
                 index += 2;
                 continue;
@@ -680,31 +767,15 @@ private:
             value.base_name = name->text;
             value.base_position = name->position;
         }
-        while (match(TokenKind::Dot)) {
-            if (match(TokenKind::Left) || match(TokenKind::Right)) {
-                LValueStep step;
-                step.kind = LValueStep::Kind::Field;
-                step.name = previous().text;
-                step.position = previous().position;
-                value.steps.push_back(std::move(step));
-            } else {
-                add_diagnostic(diagnostics_, peek().position,
-                               "expected field name 'left' or 'right'");
-                break;
-            }
-        }
         while (true) {
             if (match(TokenKind::Dot)) {
-                if (match(TokenKind::Left) || match(TokenKind::Right)) {
+                const auto field = expect_field_name("expected field name");
+                if (field.has_value()) {
                     LValueStep step;
                     step.kind = LValueStep::Kind::Field;
-                    step.name = previous().text;
-                    step.position = previous().position;
+                    step.name = field->text;
+                    step.position = field->position;
                     value.steps.push_back(std::move(step));
-                } else {
-                    add_diagnostic(diagnostics_, peek().position,
-                                   "expected field name 'left' or 'right'");
-                    break;
                 }
                 continue;
             }
@@ -799,14 +870,8 @@ private:
                     node->name = previous().text;
                     node->receiver = std::move(expression);
                     expression = std::move(node);
-                } else if (check(TokenKind::Identifier) && peek().text == "len") {
-                    auto node = std::make_unique<Expr>();
-                    node->kind = Expr::Kind::ArrayLen;
-                    node->position = peek().position;
-                    node->receiver = std::move(expression);
-                    ++current_;
-                    expression = std::move(node);
-                } else if (check(TokenKind::Identifier) && peek().text == "has") {
+                } else if (check(TokenKind::Identifier) && peek().text == "has" &&
+                           check_next(TokenKind::LParen)) {
                     auto node = std::make_unique<Expr>();
                     node->kind = Expr::Kind::MapHas;
                     node->position = peek().position;
@@ -816,7 +881,8 @@ private:
                     node->left = parse_expression();
                     expect(TokenKind::RParen, "expected ')' after map key");
                     expression = std::move(node);
-                } else if (check(TokenKind::Identifier) && peek().text == "get") {
+                } else if (check(TokenKind::Identifier) && peek().text == "get" &&
+                           check_next(TokenKind::LParen)) {
                     auto node = std::make_unique<Expr>();
                     node->kind = Expr::Kind::WeakGet;
                     node->position = peek().position;
@@ -825,7 +891,8 @@ private:
                     expect(TokenKind::LParen, "expected '(' after 'get'");
                     expect(TokenKind::RParen, "weak get takes no arguments");
                     expression = std::move(node);
-                } else if (check(TokenKind::Identifier) && peek().text == "sub") {
+                } else if (check(TokenKind::Identifier) && peek().text == "sub" &&
+                           check_next(TokenKind::LParen)) {
                     auto node = std::make_unique<Expr>();
                     node->kind = Expr::Kind::StrSub;
                     node->position = peek().position;
@@ -839,9 +906,16 @@ private:
                     }
                     expect(TokenKind::RParen, "expected ')' after sub arguments");
                     expression = std::move(node);
+                } else if (match(TokenKind::Identifier)) {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::Field;
+                    node->position = previous().position;
+                    node->name = previous().text;
+                    node->receiver = std::move(expression);
+                    expression = std::move(node);
                 } else {
                     add_diagnostic(diagnostics_, peek().position,
-                                   "expected field name 'left', 'right', 'len', 'has', 'get', or 'sub'");
+                                   "expected field name or method");
                     break;
                 }
             } else if (match(TokenKind::LBracket)) {
@@ -984,10 +1058,35 @@ private:
             return node;
         }
         if (match(TokenKind::Identifier)) {
+            const auto identifier = previous();
+            if (looks_like_record_literal(identifier) &&
+                match(TokenKind::LBrace)) {
+                auto node = std::make_unique<Expr>();
+                node->kind = Expr::Kind::RecordLiteral;
+                node->position = identifier.position;
+                node->name = identifier.text;
+                if (!check(TokenKind::RBrace)) {
+                    do {
+                        const auto field =
+                            expect_field_name("expected record initializer field name");
+                        if (field.has_value()) {
+                            node->field_names.push_back(field->text);
+                            node->field_positions.push_back(field->position);
+                        }
+                        expect(TokenKind::Colon,
+                               "expected ':' after record initializer field name");
+                        node->arguments.push_back(parse_expression());
+                    } while (match(TokenKind::Comma) &&
+                             !check(TokenKind::RBrace));
+                }
+                expect(TokenKind::RBrace,
+                       "expected '}' after record initializer fields");
+                return node;
+            }
             auto node = std::make_unique<Expr>();
             node->kind = Expr::Kind::Variable;
-            node->position = previous().position;
-            node->name = previous().text;
+            node->position = identifier.position;
+            node->name = identifier.text;
             return node;
         }
         if (match(TokenKind::Pair)) {
@@ -1064,7 +1163,8 @@ private:
             if (current_ > 0 && previous().kind == TokenKind::Semicolon) {
                 return;
             }
-            if (check(TokenKind::Type) || check(TokenKind::Fn) ||
+            if (check(TokenKind::Type) || check(TokenKind::Record) ||
+                check(TokenKind::Fn) ||
                 check(TokenKind::Let) || check(TokenKind::If) ||
                 check(TokenKind::While) || check(TokenKind::For) ||
                 check(TokenKind::Print) || check(TokenKind::RBrace)) {
@@ -1077,6 +1177,7 @@ private:
     std::vector<Token> tokens_;
     std::size_t current_{0};
     std::size_t next_pair_site_{0};
+    std::set<std::string> record_names_;
     std::vector<std::shared_ptr<LambdaExpr>> lambdas_;
     std::vector<Diagnostic> diagnostics_;
 };

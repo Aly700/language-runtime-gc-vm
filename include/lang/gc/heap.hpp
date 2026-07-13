@@ -83,6 +83,7 @@ enum class ObjectKind {
     Closure,
     Map,
     WeakRef,
+    Record,
 };
 
 struct MapEntry {
@@ -101,6 +102,8 @@ struct Object {
     static Object map(std::size_t layout_index, bool key_is_ref,
                       bool value_is_ref);
     static Object weak_ref(Value target);
+    static Object record(std::size_t layout_index, std::vector<Value> fields,
+                         std::vector<bool> ref_map);
 
     [[nodiscard]] Value weak_target() const { return weak_target_; }
 
@@ -121,6 +124,9 @@ struct Object {
     bool map_key_is_ref{false};
     bool map_value_is_ref{false};
     std::vector<MapEntry> map_entries;
+    std::uint32_t record_layout_index{0};
+    std::vector<Value> record_fields;
+    std::vector<bool> record_ref_map;
 
 private:
     friend class Heap;
@@ -175,6 +181,9 @@ public:
     ObjectId allocate_map(std::size_t layout_index, bool key_is_ref,
                           bool value_is_ref);
     ObjectId allocate_weak(Value target);
+    ObjectId allocate_record(std::size_t layout_index,
+                             std::vector<Value> fields,
+                             std::vector<bool> ref_map);
     [[nodiscard]] Handle make_handle(Value value);
     [[nodiscard]] Handle make_handle(ObjectId id);
     void set_root_provider(RootProvider* provider) { root_provider_ = provider; }
@@ -212,6 +221,10 @@ public:
     [[nodiscard]] Value map_key_at(ObjectId id, std::size_t index) const;
     [[nodiscard]] Value map_value_at(ObjectId id, std::size_t index) const;
     [[nodiscard]] Value weak_get(ObjectId id) const;
+    [[nodiscard]] std::size_t record_layout_index(ObjectId id) const;
+    [[nodiscard]] std::size_t record_field_count(ObjectId id) const;
+    [[nodiscard]] Value record_get(ObjectId id, std::size_t index) const;
+    void record_set(ObjectId id, std::size_t index, Value value);
     [[nodiscard]] std::size_t live_count() const;
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
@@ -225,6 +238,7 @@ public:
     [[nodiscard]] bool TEST_ONLY_is_closure(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_map(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_weak_ref(ObjectId id) const;
+    [[nodiscard]] bool TEST_ONLY_is_record(ObjectId id) const;
     [[nodiscard]] std::size_t TEST_ONLY_remembered_set_size() const {
         return remembered_set_.size();
     }
@@ -273,6 +287,8 @@ private:
     [[nodiscard]] const Object& checked_map(ObjectId id) const;
     [[nodiscard]] Object& checked_map(ObjectId id);
     [[nodiscard]] const Object& checked_weak_ref(ObjectId id) const;
+    [[nodiscard]] const Object& checked_record(ObjectId id) const;
+    [[nodiscard]] Object& checked_record(ObjectId id);
     void register_handle_root(Value* slot);
     void deregister_handle_root(Value* slot) noexcept;
     void move_handle_root(Value* from, Value* to) noexcept;
@@ -284,6 +300,7 @@ private:
     void store_pair_field(ObjectId id, PairField field, Value value);
     void store_ref_array_element(ObjectId id, std::size_t index, Value value);
     void store_map_entry(ObjectId id, Value key, Value value);
+    void store_record_field(ObjectId id, std::size_t index, Value value);
     void ensure_map_growth_storage(Value& owner, Value& key, Value& value,
                                    std::size_t required_width);
     void relocate_map_for_growth(Value& owner, Value& key, Value& value,

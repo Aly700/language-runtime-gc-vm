@@ -21,6 +21,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
     case TypeSpec::Kind::Pair:
     case TypeSpec::Kind::Named:
         return ValueKind::Object;
+    case TypeSpec::Kind::Record:
+        return ValueKind::Record;
     case TypeSpec::Kind::Array:
         return ValueKind::Array;
     case TypeSpec::Kind::Function:
@@ -38,6 +40,10 @@ ValueKind bytecode_kind(const TypeSpec& type) {
 }
 
 SignatureValue signature_value_from_type(const TypeSpec& type) {
+    if (type.kind == TypeSpec::Kind::Record &&
+        type.record_layout_index.has_value()) {
+        return record_signature(*type.record_layout_index);
+    }
     if (type.kind == TypeSpec::Kind::Named && type.named_type_index.has_value()) {
         return named_type_signature(*type.named_type_index);
     }
@@ -263,6 +269,11 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
         add_expr_array_counts(*expression.left, counts);
         add_expr_array_counts(*expression.right, counts);
         return;
+    case Expr::Kind::RecordLiteral:
+        for (const auto& argument : expression.arguments) {
+            add_expr_array_counts(*argument, counts);
+        }
+        return;
     case Expr::Kind::ArrayLiteral:
         for (const auto& argument : expression.arguments) {
             add_expr_array_counts(*argument, counts);
@@ -440,6 +451,12 @@ private:
         return function_.code.size() - 1;
     }
 
+    std::size_t emit(OpCode op, std::int64_t operand,
+                     std::int64_t operand2) {
+        function_.code.push_back(Instruction{op, operand, operand2});
+        return function_.code.size() - 1;
+    }
+
     void patch(std::size_t instruction, std::size_t target) {
         assert(instruction < function_.code.size());
         assert(target <= static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
@@ -535,6 +552,12 @@ private:
         // Verifier accommodation: SetLeft/SetRight consumes receiver then value and leaves
         // no stack result, so field-assignment statements compile as stack-neutral blocks.
         compile_expr(*statement.value);
+        if (final_step.receiver_type.kind == TypeSpec::Kind::Record) {
+            emit(OpCode::RecordSet,
+                 static_cast<std::int64_t>(final_step.record_layout_index),
+                 static_cast<std::int64_t>(final_step.record_field_index));
+            return;
+        }
         emit(final_step.name == "left" ? OpCode::SetLeft : OpCode::SetRight, 0);
     }
 
@@ -747,6 +770,13 @@ private:
             compile_expr(*expression.right);
             emit(OpCode::AllocPair, 0);
             break;
+        case Expr::Kind::RecordLiteral:
+            for (const auto& initializer : expression.arguments) {
+                compile_expr(*initializer);
+            }
+            emit(OpCode::AllocRecord,
+                 static_cast<std::int64_t>(expression.record_layout_index));
+            break;
         case Expr::Kind::ArrayLiteral:
             compile_array_literal(expression);
             break;
@@ -816,7 +846,26 @@ private:
             break;
         case Expr::Kind::Field:
             compile_expr(*expression.receiver);
-            emit(expression.name == "left" ? OpCode::GetLeft : OpCode::GetRight, 0);
+            if (expression.receiver->inferred_type.kind ==
+                TypeSpec::Kind::Record) {
+                emit(OpCode::RecordGet,
+                     static_cast<std::int64_t>(expression.record_layout_index),
+                     static_cast<std::int64_t>(expression.record_field_index));
+            } else if (expression.name == "len") {
+                if (expression.receiver->inferred_type.kind ==
+                    TypeSpec::Kind::Str) {
+                    emit(OpCode::StrLen, 0);
+                } else if (expression.receiver->inferred_type.kind ==
+                           TypeSpec::Kind::Map) {
+                    emit(OpCode::MapLen, 0);
+                } else {
+                    emit(OpCode::ArrayLen, 0);
+                }
+            } else {
+                emit(expression.name == "left" ? OpCode::GetLeft
+                                                : OpCode::GetRight,
+                     0);
+            }
             break;
         case Expr::Kind::Call:
             for (const auto& argument : expression.arguments) {
@@ -1002,7 +1051,15 @@ private:
         for (std::size_t i = 0; i + 1 < lvalue.steps.size(); ++i) {
             const auto& step = lvalue.steps[i];
             if (step.kind == LValueStep::Kind::Field) {
-                emit(step.name == "left" ? OpCode::GetLeft : OpCode::GetRight, 0);
+                if (step.receiver_type.kind == TypeSpec::Kind::Record) {
+                    emit(OpCode::RecordGet,
+                         static_cast<std::int64_t>(step.record_layout_index),
+                         static_cast<std::int64_t>(step.record_field_index));
+                } else {
+                    emit(step.name == "left" ? OpCode::GetLeft
+                                             : OpCode::GetRight,
+                         0);
+                }
             } else {
                 compile_expr(*step.index);
                 if (step.receiver_type.kind == TypeSpec::Kind::Map) {
@@ -1034,6 +1091,29 @@ CompileModuleResult compile_checked_program(const Program& program,
         module.named_types.push_back(
             NamedTypeSignature{declaration.name,
                                signature_value_from_type(declaration.body)});
+    }
+    module.record_layouts.reserve(program.records.size());
+    for (const auto& declaration : program.records) {
+        assert(declaration.layout_index == module.record_layouts.size() &&
+               "record layouts must preserve declaration order");
+        RecordLayout layout;
+        layout.name = declaration.name;
+        layout.field_types.reserve(declaration.fields.size());
+        layout.reference_map.reserve(declaration.fields.size());
+        for (const auto& field : declaration.fields) {
+            auto signature = signature_value_from_type(field.type);
+            const bool type_checker_classifies_reference =
+                field.type.kind != TypeSpec::Kind::Int64 &&
+                field.type.kind != TypeSpec::Kind::Bool;
+            const bool emitted_signature_is_reference =
+                signature_value_is_reference(signature);
+            assert(type_checker_classifies_reference ==
+                       emitted_signature_is_reference &&
+                   "compile boundary record bitmap disagrees with type classification");
+            layout.reference_map.push_back(type_checker_classifies_reference);
+            layout.field_types.push_back(std::move(signature));
+        }
+        module.record_layouts.push_back(std::move(layout));
     }
     module.functions.reserve(program.functions.size() + program.lambdas.size() + 1);
     module.closure_layouts.reserve(program.functions.size() +

@@ -488,6 +488,71 @@ Value VM::execute_verified(const Module& module,
             ++frame.pc;
             break;
         }
+        case OpCode::AllocRecord: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.record_layouts.size() &&
+                   "verifier invariant violated: AllocRecord layout must be in range");
+            const auto layout_index = static_cast<std::size_t>(ins.operand);
+            const auto& layout = module.record_layouts[layout_index];
+            std::vector<Value> fields(layout.field_types.size(), Value::nil());
+            for (std::size_t i = fields.size(); i > 0; --i) {
+                fields[i - 1] = pop(frame);
+            }
+            push(frame, Value::object(heap_.allocate_record(
+                            layout_index, std::move(fields),
+                            layout.reference_map)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::RecordGet: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.record_layouts.size() &&
+                   "verifier invariant violated: RecordGet layout must be in range");
+            const auto layout_index = static_cast<std::size_t>(ins.operand);
+            const auto& layout = module.record_layouts[layout_index];
+            assert(ins.operand2 >= 0 &&
+                   static_cast<std::size_t>(ins.operand2) <
+                       layout.field_types.size() &&
+                   "verifier invariant violated: RecordGet field must be in range");
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: RecordGet receiver must be object");
+            assert(heap_.TEST_ONLY_is_record(receiver.as_object()) &&
+                   "verifier invariant violated: RecordGet receiver must be record");
+            assert(heap_.record_layout_index(receiver.as_object()) == layout_index &&
+                   "verifier invariant violated: RecordGet receiver layout mismatch");
+            push(frame, heap_.record_get(
+                            receiver.as_object(),
+                            static_cast<std::size_t>(ins.operand2)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::RecordSet: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.record_layouts.size() &&
+                   "verifier invariant violated: RecordSet layout must be in range");
+            const auto layout_index = static_cast<std::size_t>(ins.operand);
+            const auto& layout = module.record_layouts[layout_index];
+            assert(ins.operand2 >= 0 &&
+                   static_cast<std::size_t>(ins.operand2) <
+                       layout.field_types.size() &&
+                   "verifier invariant violated: RecordSet field must be in range");
+            const auto stored = pop(frame);
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: RecordSet receiver must be object");
+            assert(heap_.TEST_ONLY_is_record(receiver.as_object()) &&
+                   "verifier invariant violated: RecordSet receiver must be record");
+            assert(heap_.record_layout_index(receiver.as_object()) == layout_index &&
+                   "verifier invariant violated: RecordSet receiver layout mismatch");
+            heap_.record_set(receiver.as_object(),
+                             static_cast<std::size_t>(ins.operand2), stored);
+            ++frame.pc;
+            break;
+        }
         case OpCode::AllocArray: {
             const auto init_value = pop(frame);
             const auto length_value = pop(frame);

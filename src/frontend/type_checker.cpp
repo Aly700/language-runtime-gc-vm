@@ -28,6 +28,8 @@ const char* type_name(Type type) {
         return "map";
     case Type::Weak:
         return "weak";
+    case Type::Record:
+        return "record";
     case Type::Invalid:
         return "invalid";
     }

@@ -1,0 +1,55 @@
+record Entry {
+  label: str,
+  amount: i64,
+  next: Entry
+}
+
+record Ledger {
+  title: str,
+  head: Entry,
+  count: i64,
+  audited: bool
+}
+
+fn total(entries: Entry) -> i64 {
+  let result: i64 = 0;
+  if is_nil(entries) {
+    result = 0;
+  } else {
+    result = entries.amount + total(entries.next);
+  }
+  result
+}
+
+fn print_entries(entries: Entry) -> i64 {
+  let count: i64 = 0;
+  if is_nil(entries) {
+    count = 0;
+  } else {
+    print(entries.label + "=" + to_str(entries.amount));
+    count = 1 + print_entries(entries.next);
+  }
+  count
+}
+
+let empty: Entry = nil;
+let entries: Entry = Entry { label: "beta", amount: 20, next: empty };
+entries = Entry { label: "alpha", amount: 10, next: entries };
+
+let ledger: Ledger = Ledger {
+  title: "records",
+  head: entries,
+  count: 2,
+  audited: false
+};
+
+ledger.head = Entry { label: "gamma", amount: 30, next: ledger.head };
+ledger.count = ledger.count + 1;
+ledger.audited = true;
+
+print(ledger.title);
+print("count=" + to_str(ledger.count));
+print("audited=" + to_str(ledger.audited));
+let printed: i64 = print_entries(ledger.head);
+print("total=" + to_str(total(ledger.head)));
+total(ledger.head) + printed
