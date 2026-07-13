@@ -2,6 +2,7 @@
 
 #include "diagnostics.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <optional>
@@ -91,6 +92,7 @@ bool is_scalar_array_element_type(const TypeSpec& type) {
 
 bool is_reference_array_element_type(const TypeSpec& type) {
     return type.kind == TypeSpec::Kind::Pair || type.kind == TypeSpec::Kind::Named ||
+           type.kind == TypeSpec::Kind::Record ||
            type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str ||
            type.kind == TypeSpec::Kind::Function || type.kind == TypeSpec::Kind::Map ||
            type.kind == TypeSpec::Kind::Weak;
@@ -103,6 +105,7 @@ bool is_object_type(const TypeSpec& type) {
 bool is_weak_target_type(const TypeSpec& type) {
     return type.kind == TypeSpec::Kind::Pair ||
            type.kind == TypeSpec::Kind::Named ||
+           type.kind == TypeSpec::Kind::Record ||
            type.kind == TypeSpec::Kind::Array ||
            type.kind == TypeSpec::Kind::Str ||
            type.kind == TypeSpec::Kind::Function ||
@@ -127,7 +130,8 @@ TypedValue value_from_type(TypeSpec type) {
         }
         return array_value(std::move(type), std::move(element));
     }
-    const bool includes_nil = type.kind == TypeSpec::Kind::Named;
+    const bool includes_nil = type.kind == TypeSpec::Kind::Named ||
+                              type.kind == TypeSpec::Kind::Record;
     return TypedValue{std::move(type), {}, includes_nil, nullptr};
 }
 
@@ -231,6 +235,13 @@ struct TypeSymbol {
     TypeSpec body{invalid_type()};
 };
 
+struct RecordSymbol {
+    std::string name;
+    SourcePosition position;
+    std::size_t index{0};
+    RecordDecl* declaration{nullptr};
+};
+
 class TypeChecker {
 public:
     explicit TypeChecker(std::size_t pair_site_count) : pair_site_count_(pair_site_count) {
@@ -258,9 +269,10 @@ public:
         const auto result = check_expr(*program.result, state_);
         if (result.type.kind == TypeSpec::Kind::Nil) {
             diagnose(program.result->position,
-                     "nil literal requires a named pair type context");
+                     "nil literal requires a named object type context");
         } else if (result.includes_nil &&
-                   result.type.kind != TypeSpec::Kind::Named) {
+                   result.type.kind != TypeSpec::Kind::Named &&
+                   result.type.kind != TypeSpec::Kind::Record) {
             diagnose(program.result->position,
                      "program result requires non-nil value of type " +
                          type_name(result.type));
@@ -360,6 +372,22 @@ private:
             types_.push_back(std::move(symbol));
         }
 
+        for (auto& declaration : program.records) {
+            if (find_type(declaration.name) != nullptr ||
+                find_record(declaration.name) != nullptr) {
+                diagnose(declaration.position,
+                         "type '" + declaration.name + "' is already defined");
+                continue;
+            }
+            RecordSymbol symbol;
+            symbol.name = declaration.name;
+            symbol.position = declaration.position;
+            symbol.index = records_.size();
+            symbol.declaration = &declaration;
+            declaration.layout_index = symbol.index;
+            records_.push_back(std::move(symbol));
+        }
+
         for (auto& declaration : program.types) {
             resolve_type(declaration.body);
             if (!declaration.body.has_pair_fields()) {
@@ -371,6 +399,20 @@ private:
             if (declaration.type_index < types_.size() &&
                 types_[declaration.type_index].name == declaration.name) {
                 types_[declaration.type_index].body = declaration.body;
+            }
+        }
+
+
+        for (auto& declaration : program.records) {
+            std::set<std::string> field_names;
+            for (auto& field : declaration.fields) {
+                if (!field_names.insert(field.name).second) {
+                    diagnose(field.position,
+                             "record field '" + field.name +
+                                 "' is already defined in '" +
+                                 declaration.name + "'");
+                }
+                resolve_type(field.type);
             }
         }
 
@@ -466,6 +508,33 @@ private:
         return nullptr;
     }
 
+    RecordSymbol* find_record(const std::string& name) {
+        for (auto& record : records_) {
+            if (record.name == name) {
+                return &record;
+            }
+        }
+        return nullptr;
+    }
+
+    const RecordSymbol* find_record(const std::string& name) const {
+        for (const auto& record : records_) {
+            if (record.name == name) {
+                return &record;
+            }
+        }
+        return nullptr;
+    }
+
+    const RecordSymbol* find_record(const TypeSpec& type) const {
+        if (type.kind != TypeSpec::Kind::Record ||
+            !type.record_layout_index.has_value() ||
+            *type.record_layout_index >= records_.size()) {
+            return nullptr;
+        }
+        return &records_[*type.record_layout_index];
+    }
+
     const TypeSymbol* find_type(const TypeSpec& type) const {
         if (type.kind != TypeSpec::Kind::Named || !type.named_type_index.has_value() ||
             *type.named_type_index >= types_.size()) {
@@ -513,16 +582,24 @@ private:
             }
             return;
         }
+        if (type.kind == TypeSpec::Kind::Record) {
+            return;
+        }
         if (type.kind != TypeSpec::Kind::Named) {
             return;
         }
         auto* symbol = find_type(type.name);
-        if (symbol == nullptr) {
+        if (symbol != nullptr) {
+            type.named_type_index = symbol->index;
+            return;
+        }
+        auto* record = find_record(type.name);
+        if (record == nullptr) {
             diagnose(type.position, "unknown type '" + type.name + "'");
             type = invalid_type();
             return;
         }
-        type.named_type_index = symbol->index;
+        type = record_type(record->name, record->index, type.position);
     }
 
     void resolve_statement_types(Statement& statement) {
@@ -726,6 +803,12 @@ private:
             return !value.includes_nil && value.type == target &&
                    target.weak_target != nullptr &&
                    is_weak_target_type(*target.weak_target);
+        }
+        if (target.kind == TypeSpec::Kind::Record) {
+            if (value.type.kind == TypeSpec::Kind::Nil) {
+                return true;
+            }
+            return value.type == target;
         }
         if (target.kind == TypeSpec::Kind::Named) {
             if (value.type.kind == TypeSpec::Kind::Nil) {
@@ -982,6 +1065,23 @@ private:
         }
 
         const auto& field = final_step;
+        if (receiver.type.kind == TypeSpec::Kind::Record) {
+            auto existing = load_record_field(
+                receiver, field.name, field.position,
+                &final_step.record_layout_index,
+                &final_step.record_field_index);
+            if (is_invalid(existing.type)) {
+                return;
+            }
+            statement.target.receiver_type = receiver.type;
+            if (!value_conforms_to_type(assigned, existing.type, state)) {
+                diagnose(statement.equals_position,
+                         "cannot assign " + type_name(assigned.type) +
+                             " to field '" + field.name + "' of type " +
+                             type_name(existing.type));
+            }
+            return;
+        }
         if (!is_pair(receiver.type)) {
             diagnose(field.position, "field assignment requires pair");
             return;
@@ -1324,6 +1424,8 @@ private:
             return check_variable(expression, state);
         case Expr::Kind::PairLiteral:
             return check_pair_literal(expression, state);
+        case Expr::Kind::RecordLiteral:
+            return check_record_literal(expression, state);
         case Expr::Kind::ArrayLiteral:
             return check_array_literal(expression, state);
         case Expr::Kind::ArraySized:
@@ -1491,6 +1593,91 @@ private:
         }
         const auto inferred_type = pair_type(left.type, right.type);
         return annotate(expression, pair_value(inferred_type, expression.pair_site));
+    }
+
+    std::optional<std::size_t> record_field_index(
+        const RecordSymbol& record, const std::string& name) const {
+        assert(record.declaration != nullptr);
+        for (std::size_t i = 0; i < record.declaration->fields.size(); ++i) {
+            if (record.declaration->fields[i].name == name) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+
+    TypedValue check_record_literal(Expr& expression, FlowState& state) {
+        std::vector<TypedValue> initializers;
+        initializers.reserve(expression.arguments.size());
+        for (auto& argument : expression.arguments) {
+            initializers.push_back(check_expr(*argument, state));
+        }
+
+        const auto* record = find_record(expression.name);
+        if (record == nullptr || record->declaration == nullptr) {
+            diagnose(expression.position,
+                     "unknown record type '" + expression.name + "'");
+            return annotate(expression, invalid_value());
+        }
+        expression.record_layout_index = record->index;
+        const auto& fields = record->declaration->fields;
+        bool valid = true;
+        if (expression.field_names.size() != fields.size()) {
+            diagnose(expression.position,
+                     "record literal for '" + expression.name +
+                         "' requires all " + std::to_string(fields.size()) +
+                         " field(s) in declared order");
+            valid = false;
+        }
+
+        std::set<std::string> seen;
+        for (std::size_t i = 0; i < expression.field_names.size(); ++i) {
+            const auto position = i < expression.field_positions.size()
+                                      ? expression.field_positions[i]
+                                      : expression.position;
+            const auto& name = expression.field_names[i];
+            if (!seen.insert(name).second) {
+                diagnose(position,
+                         "record initializer field '" + name +
+                             "' is specified more than once");
+                valid = false;
+            }
+            const auto actual_field = record_field_index(*record, name);
+            if (!actual_field.has_value()) {
+                diagnose(position,
+                         "unknown field '" + name + "' on record '" +
+                             expression.name + "'");
+                valid = false;
+            } else if (i >= fields.size() || fields[i].name != name) {
+                const auto expected = i < fields.size() ? fields[i].name
+                                                        : std::string("<none>");
+                diagnose(position,
+                         "record literal for '" + expression.name +
+                             "' requires field '" + expected +
+                             "' here (declared order)");
+                valid = false;
+            }
+        }
+
+        const auto checked_count = std::min(initializers.size(), fields.size());
+        for (std::size_t i = 0; i < checked_count; ++i) {
+            if (!is_invalid(initializers[i].type) &&
+                !value_conforms_to_type(initializers[i], fields[i].type, state)) {
+                diagnose(expression.arguments[i]->position,
+                         "record field '" + fields[i].name + "' expects " +
+                             type_name(fields[i].type) + " but got " +
+                             type_name(initializers[i].type));
+                valid = false;
+            }
+        }
+        if (!valid) {
+            return annotate(expression, invalid_value());
+        }
+
+        auto value = value_from_type(
+            record_type(record->name, record->index, expression.position));
+        value.includes_nil = false;
+        return annotate(expression, std::move(value));
     }
 
     bool require_nonnil_ref_array_element(const TypedValue& value,
@@ -1866,9 +2053,10 @@ private:
     TypedValue check_is_nil(Expr& expression, FlowState& state) {
         const auto value = check_expr(*expression.receiver, state);
         if (!is_invalid(value.type) && !is_pair(value.type) &&
+            value.type.kind != TypeSpec::Kind::Record &&
             !value.includes_nil && value.type.kind != TypeSpec::Kind::Nil) {
             diagnose(expression.position,
-                     "is_nil requires pair, nil, or nil-able object operand");
+                     "is_nil requires record, pair, nil, or nil-able object operand");
             return annotate(expression, invalid_value());
         }
         return annotate(expression, scalar_value(bool_type()));
@@ -1876,6 +2064,30 @@ private:
 
     TypedValue check_field_access(Expr& expression, FlowState& state) {
         const auto receiver = check_expr(*expression.receiver, state);
+        if (receiver.type.kind == TypeSpec::Kind::Record) {
+            const auto field = load_record_field(
+                receiver, expression.name, expression.position,
+                &expression.record_layout_index,
+                &expression.record_field_index);
+            return annotate(expression, field);
+        }
+        if (expression.name == "len") {
+            if (!is_invalid(receiver.type) && receiver.includes_nil) {
+                diagnose(expression.position,
+                         "len requires non-nil value of type " +
+                             type_name(receiver.type));
+                return annotate(expression, invalid_value());
+            }
+            if (!is_invalid(receiver.type) &&
+                receiver.type.kind != TypeSpec::Kind::Str &&
+                receiver.type.kind != TypeSpec::Kind::Map &&
+                (receiver.type.kind != TypeSpec::Kind::Array ||
+                 receiver.type.element == nullptr)) {
+                diagnose(expression.position, "len requires array, str, or map");
+                return annotate(expression, invalid_value());
+            }
+            return annotate(expression, scalar_value(int64_type()));
+        }
         const auto field = load_field(receiver, expression.name, expression.position, state);
         return annotate(expression, field);
     }
@@ -1994,7 +2206,13 @@ private:
                 return invalid_value();
             }
             if (step.kind == LValueStep::Kind::Field) {
-                current = load_field(current, step.name, step.position, state);
+                if (current.type.kind == TypeSpec::Kind::Record) {
+                    current = load_record_field(
+                        current, step.name, step.position,
+                        &step.record_layout_index, &step.record_field_index);
+                } else {
+                    current = load_field(current, step.name, step.position, state);
+                }
             } else {
                 const auto index = check_expr(*step.index, state);
                 if (current.type.kind == TypeSpec::Kind::Map &&
@@ -2036,6 +2254,11 @@ private:
             diagnose(position, "field access requires pair");
             return invalid_value();
         }
+        if (field != "left" && field != "right") {
+            diagnose(position,
+                     "pair field access requires 'left' or 'right'");
+            return invalid_value();
+        }
         if (receiver.includes_nil) {
             diagnose(position, "field access requires non-nil value of type " +
                                    type_name(receiver.type));
@@ -2047,6 +2270,34 @@ private:
             return invalid_value();
         }
         return *loaded_field;
+    }
+
+    TypedValue load_record_field(const TypedValue& receiver,
+                                 const std::string& field,
+                                 SourcePosition position,
+                                 std::size_t* layout_index,
+                                 std::size_t* field_index) {
+        if (receiver.includes_nil) {
+            diagnose(position,
+                     "field access requires non-nil value of type " +
+                         type_name(receiver.type));
+            return invalid_value();
+        }
+        const auto* record = find_record(receiver.type);
+        if (record == nullptr || record->declaration == nullptr) {
+            diagnose(position, "record layout is unknown");
+            return invalid_value();
+        }
+        const auto index = record_field_index(*record, field);
+        if (!index.has_value()) {
+            diagnose(position,
+                     "unknown field '" + field + "' on record '" +
+                         record->name + "'");
+            return invalid_value();
+        }
+        *layout_index = record->index;
+        *field_index = *index;
+        return value_from_type(record->declaration->fields[*index].type);
     }
 
     void store_field(const TypedValue& receiver, const std::string& field,
@@ -2066,6 +2317,7 @@ private:
     std::size_t pair_site_count_{0};
     FlowState state_;
     std::vector<TypeSymbol> types_;
+    std::vector<RecordSymbol> records_;
     std::vector<FunctionSymbol> functions_;
     CaptureContext* capture_context_{nullptr};
     LocalContext* local_context_{nullptr};

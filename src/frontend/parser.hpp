@@ -22,6 +22,7 @@ struct TypeSpec {
         Map,
         Weak,
         Named,
+        Record,
         Nil,
         Invalid,
     };
@@ -38,6 +39,7 @@ struct TypeSpec {
     std::string name;
     SourcePosition position;
     std::optional<std::size_t> named_type_index;
+    std::optional<std::size_t> record_layout_index;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == Kind::Pair && left != nullptr && right != nullptr;
@@ -61,6 +63,8 @@ TypeSpec bool_type();
 TypeSpec str_type();
 TypeSpec pair_type();
 TypeSpec named_type(std::string name, SourcePosition position);
+TypeSpec record_type(std::string name, std::size_t layout_index,
+                     SourcePosition position = {});
 TypeSpec nil_type();
 TypeSpec invalid_type();
 TypeSpec pair_type(TypeSpec left, TypeSpec right);
@@ -87,6 +91,7 @@ struct Expr {
         NilLiteral,
         Variable,
         PairLiteral,
+        RecordLiteral,
         ArrayLiteral,
         ArraySized,
         ArrayIndex,
@@ -122,6 +127,8 @@ struct Expr {
     TypeSpec map_key_type{invalid_type()};
     TypeSpec map_value_type{invalid_type()};
     std::vector<std::unique_ptr<Expr>> arguments;
+    std::vector<std::string> field_names;
+    std::vector<SourcePosition> field_positions;
     TypeSpec inferred_type{invalid_type()};
     std::set<std::size_t> object_sites;
     std::uint32_t local_index{0};
@@ -130,6 +137,8 @@ struct Expr {
     bool is_capture{false};
     bool is_function_reference{false};
     bool direct_call{false};
+    std::size_t record_layout_index{static_cast<std::size_t>(-1)};
+    std::size_t record_field_index{static_cast<std::size_t>(-1)};
     std::shared_ptr<LambdaExpr> lambda;
 };
 
@@ -152,6 +161,8 @@ struct LValueStep {
     std::unique_ptr<Expr> index;
     TypeSpec receiver_type{invalid_type()};
     TypeSpec element_type{invalid_type()};
+    std::size_t record_layout_index{static_cast<std::size_t>(-1)};
+    std::size_t record_field_index{static_cast<std::size_t>(-1)};
 };
 
 struct LValue {
@@ -236,8 +247,22 @@ struct TypeDecl {
     std::size_t type_index{static_cast<std::size_t>(-1)};
 };
 
+struct RecordFieldDecl {
+    std::string name;
+    SourcePosition position;
+    TypeSpec type{invalid_type()};
+};
+
+struct RecordDecl {
+    std::string name;
+    SourcePosition position;
+    std::vector<RecordFieldDecl> fields;
+    std::size_t layout_index{static_cast<std::size_t>(-1)};
+};
+
 struct Program {
     std::vector<TypeDecl> types;
+    std::vector<RecordDecl> records;
     std::vector<FunctionDecl> functions;
     std::vector<std::shared_ptr<LambdaExpr>> lambdas;
     std::vector<Statement> statements;

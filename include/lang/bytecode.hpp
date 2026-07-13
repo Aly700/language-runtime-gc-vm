@@ -58,11 +58,15 @@ enum class OpCode {
     BoolToStr,
     StrSub,
     StrLt,
+    AllocRecord,
+    RecordGet,
+    RecordSet,
 };
 
 struct Instruction {
     OpCode op{OpCode::Return};
     std::int64_t operand{0};
+    std::int64_t operand2{0};
 };
 
 enum class ValueKind {
@@ -75,6 +79,7 @@ enum class ValueKind {
     Function,
     Map,
     Weak,
+    Record,
 };
 
 struct SignatureValue {
@@ -88,42 +93,54 @@ struct SignatureValue {
     std::vector<SignatureValue> function_parameters;
     std::shared_ptr<SignatureValue> function_return;
     std::optional<std::size_t> named_type;
+    std::optional<std::size_t> record_layout;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == ValueKind::Object && !named_type.has_value() &&
                left != nullptr && right != nullptr && element == nullptr &&
-               key == nullptr && value == nullptr && weak_target == nullptr;
+               key == nullptr && value == nullptr && weak_target == nullptr &&
+               !record_layout.has_value();
     }
 
     [[nodiscard]] bool has_array_element() const {
         return kind == ValueKind::Array && element != nullptr &&
                left == nullptr && right == nullptr && key == nullptr &&
                value == nullptr && weak_target == nullptr &&
-               !named_type.has_value();
+               !named_type.has_value() && !record_layout.has_value();
     }
 
     [[nodiscard]] bool is_named_type_reference() const {
-        return kind == ValueKind::Object && named_type.has_value();
+        return kind == ValueKind::Object && named_type.has_value() &&
+               !record_layout.has_value();
     }
 
     [[nodiscard]] bool has_function_signature() const {
         return kind == ValueKind::Function && function_return != nullptr &&
                left == nullptr && right == nullptr && element == nullptr &&
                key == nullptr && value == nullptr && weak_target == nullptr &&
-               !named_type.has_value();
+               !named_type.has_value() && !record_layout.has_value();
     }
 
     [[nodiscard]] bool has_map_entries() const {
         return kind == ValueKind::Map && key != nullptr && value != nullptr &&
                left == nullptr && right == nullptr && element == nullptr &&
                function_return == nullptr && function_parameters.empty() &&
-               weak_target == nullptr && !named_type.has_value();
+               weak_target == nullptr && !named_type.has_value() &&
+               !record_layout.has_value();
     }
 
     [[nodiscard]] bool has_weak_target() const {
         return kind == ValueKind::Weak && weak_target != nullptr &&
                left == nullptr && right == nullptr && element == nullptr &&
                key == nullptr && value == nullptr &&
+               function_return == nullptr && function_parameters.empty() &&
+               !named_type.has_value() && !record_layout.has_value();
+    }
+
+    [[nodiscard]] bool is_record_layout_reference() const {
+        return kind == ValueKind::Record && record_layout.has_value() &&
+               left == nullptr && right == nullptr && element == nullptr &&
+               key == nullptr && value == nullptr && weak_target == nullptr &&
                function_return == nullptr && function_parameters.empty() &&
                !named_type.has_value();
     }
@@ -183,10 +200,18 @@ inline SignatureValue weak_signature(SignatureValue target) {
     return signature;
 }
 
+inline SignatureValue record_signature(std::size_t layout_index) {
+    SignatureValue signature;
+    signature.kind = ValueKind::Record;
+    signature.record_layout = layout_index;
+    return signature;
+}
+
 inline bool signature_value_is_reference(const SignatureValue& value) {
     return value.kind == ValueKind::Object || value.kind == ValueKind::Array ||
            value.kind == ValueKind::Str || value.kind == ValueKind::Function ||
-           value.kind == ValueKind::Map || value.kind == ValueKind::Weak;
+           value.kind == ValueKind::Map || value.kind == ValueKind::Weak ||
+           value.kind == ValueKind::Record;
 }
 
 struct NamedTypeSignature {
@@ -215,6 +240,12 @@ struct MapLayout {
     bool value_is_ref{false};
 };
 
+struct RecordLayout {
+    std::string name;
+    std::vector<SignatureValue> field_types;
+    std::vector<bool> reference_map;
+};
+
 struct StackMap {
     // Stack maps describe the abstract stack before executing the instruction at the same pc.
     // Bit i is true only when stack slot i is proven to contain an object reference.
@@ -239,6 +270,7 @@ struct Module {
     std::vector<std::string> string_constants;
     std::vector<ClosureLayout> closure_layouts;
     std::vector<MapLayout> map_layouts;
+    std::vector<RecordLayout> record_layouts;
 };
 
 struct VerificationResult {
@@ -325,6 +357,15 @@ enum class VerifierReason {
     StrSubRequiresStr,        // StrSub receiver is not a string.
     StrSubRequiresI64Bounds,  // StrSub lo or hi operand is not an i64.
     StrLtRequiresStr,         // StrLt operand is not a string.
+    BadRecordLayoutShape,     // Record layout fields/bitmap/name are malformed.
+    BadRecordLayoutIndex,     // Record opcode layout operand is out of range.
+    BadRecordFieldIndex,      // RecordGet/RecordSet field operand is out of range.
+    BadRecordInitializerArity,// AllocRecord stack lacks all declared fields.
+    BadRecordInitializerType, // AllocRecord initializer violates its field type.
+    RecordOperationOnNonRecord,// RecordGet/RecordSet receiver is not a record.
+    RecordLayoutMismatch,     // Record receiver nominal layout differs from opcode.
+    RecordReceiverMayBeNil,   // Record access/store receiver lacks nil refinement.
+    RecordFieldTypeMismatch,  // RecordSet value violates its declared field type.
 };
 
 struct VerifierDiagnostic {

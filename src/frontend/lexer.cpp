@@ -201,6 +201,8 @@ private:
             kind = TokenKind::Let;
         } else if (text == "type") {
             kind = TokenKind::Type;
+        } else if (text == "record") {
+            kind = TokenKind::Record;
         } else if (text == "fn") {
             kind = TokenKind::Fn;
         } else if (text == "if") {

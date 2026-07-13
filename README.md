@@ -39,21 +39,30 @@ layout carries a verifier-derived reference bitmap; scalar captures remain opaqu
 their bits resemble an object ID, while mapped captures are traced and forwarded. See
 [ADR 0003](adr/0003-closure-capture-maps.md).
 
+### Record layouts
+
+Top-level records are nominal fixed-width objects. Each module layout records the ordered
+field signatures and an exact per-field reference bitmap; the shared descriptor visits
+only mapped fields, so interleaved scalar payload bits remain opaque. All field mutation
+uses one pre-publication barrier funnel. See
+[ADR 0010](adr/0010-record-layouts.md).
+
 ### Descriptor-driven precision
 
 One object descriptor visitor defines every strong heap edge. It visits pair fields,
-reference-array elements, mapped closure captures, and statically reference-typed map
-slots; scalar arrays and immutable string bytes expose no edges. Marking, forwarding,
-remembered-set validation, and post-collection validation use that same authority. See
-[INVARIANTS.md](INVARIANTS.md#gc) and
+reference-array elements, mapped closure captures, statically reference-typed map slots,
+and bitmap-selected record fields; scalar arrays, scalar record fields, and immutable
+string bytes expose no edges. Marking, forwarding, remembered-set validation, and
+post-collection validation use that same authority. See [INVARIANTS.md](INVARIANTS.md#gc) and
 [ADR 0002](adr/0002-immutable-string-representation.md).
 
 ### Barriers
 
 All reference-publishing mutations pass through heap-owned funnels for pair fields,
-reference-array elements, and map entries. An old-to-young store records its owner before
-publication. Immutable strings and closures have no mutator barrier path; promotion
-records any closure edge created by the collector itself. See
+reference-array elements, record fields, and map entries. An old-to-young store records
+its owner before publication. Immutable strings and closures have no mutator barrier path;
+promotion records descriptor-declared closure or record edges created by the collector
+itself. See
 [ARCHITECTURE.md](ARCHITECTURE.md#generational-collection) and
 [ADR 0004](adr/0004-deterministic-insertion-order-maps.md).
 
@@ -99,22 +108,22 @@ counts["gc"]
 The language includes:
 
 - `i64`, `bool`, immutable byte `str`, typed and opaque pairs, nullable named recursive
-  pair types, scalar/reference arrays, insertion-order maps, weak references, and
-  structural function types;
+  pair types, nominal recursive records with ordered mutable fields, scalar/reference
+  arrays, insertion-order maps, weak references, and structural function types;
 - named functions, recursion, first-class function values, returned lambdas, and
   immutable capture snapshots;
-- local, pair-field, array-element, and map-entry assignment;
+- local, pair-field, record-field, array-element, and map-entry assignment;
 - `if`/`else`, `while`, array/map/range `for-in`, and nearest-loop `break`/`continue`;
 - string concat, equality, byte indexing, byte length, copying `sub`, unsigned byte-wise
   ordering, and explicit `to_str`/`to_i64` conversions;
 - deterministic bounded `print(str)` output captured by the VM rather than written to a
   host stream.
 
-Five executable programs live in [examples](examples): a named recursive linked list,
+Six executable programs live in [examples](examples): a named recursive linked list,
 a capture-snapshot accumulator factory, insertion-order word frequencies, a higher-order
-array pipeline, and string/conversion tools. Each `.lang` file has a byte-pinned
-`.expected` output. `lang_examples` compiles every file and runs it under both no stress
-and maximum combined major/minor/allocation/barrier stress.
+array pipeline, string/conversion tools, and a recursive record showcase. Each `.lang` file
+has a byte-pinned `.expected` output. `lang_examples` compiles every file and runs it under
+both no stress and maximum combined major/minor/allocation/barrier stress.
 
 Weak clearing is not presented as a source example because the language has no explicit
 collection primitive and [ADR 0005](adr/0005-weak-references.md) makes clearing
@@ -140,8 +149,8 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 13 isolated deterministic positive corpora containing 548 generated
-programs. Each runs under the same 10 schedules, for 5,480 positive executions per full
+The suite has 14 isolated deterministic positive corpora containing 580 generated
+programs. Each runs under the same 10 schedules, for 5,800 positive executions per full
 CTest run:
 
 - `no_stress`
@@ -158,11 +167,11 @@ liveness expectations because clearing is intentionally observable. Generated so
 bytecode are constructive and deterministic; each grammar has its own corpus dump and an
 embedded pinned representative snapshot.
 
-Negative testing applies 46 positioned mutation operators across fixed seed sets, for 598
+Negative testing applies 53 positioned mutation operators across fixed seed sets, for 822
 frontend rejection checks. The operators cover type errors, undefined values, arity and
 return mismatches, missing nil refinement, invalid container operations, closure misuse,
 map key/value errors, weak-target errors, loop-control errors, conversion errors, and
-substring/ordering errors.
+substring/ordering and nominal-record errors.
 
 Run every corpus through CTest with the build command above. Run the fuzz executables
 directly to see their per-corpus summaries:
@@ -175,6 +184,7 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration28_for_in
 ./build/lang_iteration29_output
 ./build/lang_iteration31_strings2
+./build/lang_iteration33_records_fuzz
 ```
 
 ### Replay by grammar
@@ -196,6 +206,7 @@ Use one of the schedule names above.
 | source `loops` | 10 | `./build/lang_iteration28_for_in --replay --seed N --schedule NAME` | `./build/lang_iteration28_for_in --replay --seed N --mutant 0..6` |
 | source `output` | 32 | `./build/lang_iteration29_output --grammar output --seed N --schedule NAME` | `./build/lang_iteration29_output --grammar output --seed N --mutant 0..3` |
 | source `strings2` | 32 | `./build/lang_iteration31_strings2 --grammar strings2 --seed N --schedule NAME` | `./build/lang_iteration31_strings2 --grammar strings2 --seed N --mutant 0..3` |
+| source `records` | 32 | `./build/lang_iteration33_records_fuzz --grammar records --seed N --schedule NAME` | `./build/lang_iteration33_records_fuzz --grammar records --seed N --mutant 0..6` |
 
 For example:
 
@@ -220,6 +231,7 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration28_for_in --dump-corpus loops
 ./build/lang_iteration29_output --dump-corpus output
 ./build/lang_iteration31_strings2 --dump-corpus strings2
+./build/lang_iteration33_records_fuzz --dump-corpus records
 ```
 
 The generator design, oracle, schedules, and replay behavior are detailed in

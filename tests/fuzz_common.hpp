@@ -236,6 +236,19 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             }
             break;
         }
+        case lang::gc::ObjectKind::Record:
+            rendered << "record(layout="
+                     << heap.record_layout_index(order[i]) << ", fields=[";
+            for (std::size_t field = 0;
+                 field < heap.record_field_count(order[i]); ++field) {
+                if (field != 0) {
+                    rendered << ", ";
+                }
+                rendered << value_token(
+                    heap, heap.record_get(order[i], field), indexes, order);
+            }
+            rendered << "])";
+            break;
         }
         objects.push_back(rendered.str());
     }

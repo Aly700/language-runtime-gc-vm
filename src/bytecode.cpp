@@ -29,6 +29,7 @@ enum class AbstractKind {
     Map,
     Weak,
     MaybeReference,
+    Record,
     Nil,
     Poison,
 };
@@ -47,6 +48,7 @@ struct AbstractValue {
     std::shared_ptr<const SignatureValue> signature_map;
     std::shared_ptr<const AbstractValue> reference_target;
     std::optional<std::size_t> signature_named_type;
+    std::optional<std::size_t> signature_record_layout;
     std::optional<std::size_t> source_local;
     std::optional<std::size_t> nil_test_local;
 };
@@ -170,6 +172,12 @@ const char* op_name(OpCode op) {
         return "StrSub";
     case OpCode::StrLt:
         return "StrLt";
+    case OpCode::AllocRecord:
+        return "AllocRecord";
+    case OpCode::RecordGet:
+        return "RecordGet";
+    case OpCode::RecordSet:
+        return "RecordSet";
     }
     return "<invalid>";
 }
@@ -194,6 +202,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Map";
     case ValueKind::Weak:
         return "Weak";
+    case ValueKind::Record:
+        return "Record";
     }
     return "<invalid>";
 }
@@ -220,6 +230,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "Weak";
     case AbstractKind::MaybeReference:
         return "MaybeReference";
+    case AbstractKind::Record:
+        return "Record";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -279,6 +291,7 @@ bool signature_value_ptr_equal(const std::shared_ptr<SignatureValue>& lhs,
 bool signature_values_equal(const SignatureValue& lhs,
                             const SignatureValue& rhs) {
     if (lhs.kind != rhs.kind || lhs.named_type != rhs.named_type ||
+        lhs.record_layout != rhs.record_layout ||
         lhs.function_parameters.size() != rhs.function_parameters.size() ||
         !signature_value_ptr_equal(lhs.left, rhs.left) ||
         !signature_value_ptr_equal(lhs.right, rhs.right) ||
@@ -335,6 +348,14 @@ AbstractValue named_signature_object_value(std::size_t index) {
     return value;
 }
 
+AbstractValue record_value(std::size_t layout_index, bool includes_nil = true) {
+    AbstractValue value;
+    value.kind = AbstractKind::Record;
+    value.includes_nil = includes_nil;
+    value.signature_record_layout = layout_index;
+    return value;
+}
+
 AbstractValue without_provenance(AbstractValue value) {
     value.source_local.reset();
     value.nil_test_local.reset();
@@ -352,6 +373,9 @@ std::shared_ptr<const AbstractValue> abstract_value_ptr(AbstractValue value) {
 AbstractValue weak_value(AbstractValue target) {
     AbstractValue value;
     value.kind = AbstractKind::Weak;
+    // A live WeakGet result is always the non-nil target; possible clearing is
+    // represented by the surrounding MaybeReference, not by the target shape.
+    target.includes_nil = false;
     value.reference_target = abstract_value_ptr(without_provenance(
         std::move(target)));
     return value;
@@ -385,6 +409,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Map;
     case ValueKind::Weak:
         return AbstractKind::Weak;
+    case ValueKind::Record:
+        return AbstractKind::Record;
     }
     return AbstractKind::Poison;
 }
@@ -402,6 +428,9 @@ bool signature_array_uses_ref_payload(const SignatureValue& signature) {
 }
 
 AbstractValue value_from_signature(const SignatureValue& signature) {
+    if (signature.is_record_layout_reference()) {
+        return record_value(*signature.record_layout);
+    }
     if (signature.has_weak_target()) {
         return weak_value(value_from_signature(*signature.weak_target));
     }
@@ -433,7 +462,8 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
         }
         auto value = ref_array_value();
         auto element = value_from_signature(*signature.element);
-        if (element.kind == AbstractKind::Object) {
+        if (element.kind == AbstractKind::Object ||
+            element.kind == AbstractKind::Record) {
             element.includes_nil = false;
         }
         value.signature_array_element = abstract_value_ptr(std::move(element));
@@ -446,7 +476,8 @@ bool is_reference_kind(AbstractKind kind) {
     return kind == AbstractKind::Object || kind == AbstractKind::Array ||
            kind == AbstractKind::RefArray || kind == AbstractKind::Str ||
            kind == AbstractKind::Function || kind == AbstractKind::Map ||
-           kind == AbstractKind::Weak || kind == AbstractKind::MaybeReference;
+           kind == AbstractKind::Weak || kind == AbstractKind::MaybeReference ||
+           kind == AbstractKind::Record;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -478,6 +509,9 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
     if (signature.kind != kind) {
         return false;
     }
+    if (signature.is_record_layout_reference()) {
+        return *signature.record_layout < module.record_layouts.size();
+    }
     if (signature.is_named_type_reference()) {
         return signature.kind == ValueKind::Object &&
                *signature.named_type < module.named_types.size() &&
@@ -485,7 +519,8 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature.element == nullptr && signature.key == nullptr &&
                signature.value == nullptr && signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
-               signature.function_parameters.empty();
+               signature.function_parameters.empty() &&
+               !signature.record_layout.has_value();
     }
     if (signature.has_pair_fields()) {
         return signature_shape_matches_kind(*signature.left, signature.left->kind,
@@ -496,7 +531,8 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature.key == nullptr && signature.value == nullptr &&
                signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
-               signature.function_parameters.empty();
+               signature.function_parameters.empty() &&
+               !signature.record_layout.has_value();
     }
     if (signature.has_array_element()) {
         return signature.kind == ValueKind::Array &&
@@ -506,7 +542,8 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature.key == nullptr && signature.value == nullptr &&
                signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
-               signature.function_parameters.empty();
+               signature.function_parameters.empty() &&
+               !signature.record_layout.has_value();
     }
     if (signature.has_function_signature()) {
         if (!signature_shape_matches_kind(*signature.function_return,
@@ -542,11 +579,15 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
     if (signature.kind == ValueKind::Weak) {
         return false;
     }
+    if (signature.kind == ValueKind::Record) {
+        return false;
+    }
     return signature.left == nullptr && signature.right == nullptr &&
            signature.element == nullptr && signature.function_return == nullptr &&
            signature.key == nullptr && signature.value == nullptr &&
            signature.weak_target == nullptr &&
-           signature.function_parameters.empty() && !signature.named_type.has_value();
+           signature.function_parameters.empty() && !signature.named_type.has_value() &&
+           !signature.record_layout.has_value();
 }
 
 bool is_valid_map_key_type(const SignatureValue& key) {
@@ -669,6 +710,14 @@ bool module_weak_target_types_are_valid(
             return false;
         }
     }
+    for (const auto& layout : module.record_layouts) {
+        for (const auto& field : layout.field_types) {
+            if (reject_invalid(0, field,
+                               "record field contains a non-object weak target")) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -717,6 +766,46 @@ bool module_map_key_types_are_valid(
             return reject(diagnostics, 0, std::nullopt,
                           VerifierReason::InvalidMapKeyType,
                           "map layout contains a key type other than i64, bool, or str");
+        }
+    }
+    for (const auto& layout : module.record_layouts) {
+        for (const auto& field : layout.field_types) {
+            if (signature_has_invalid_map_key(field)) {
+                return reject(diagnostics, 0, std::nullopt,
+                              VerifierReason::InvalidMapKeyType,
+                              "record field contains a map key other than i64, bool, or str");
+            }
+        }
+    }
+    return true;
+}
+
+bool record_layouts_are_well_formed(
+    const Module& module, std::vector<VerifierDiagnostic>& diagnostics) {
+    std::set<std::string> names;
+    for (std::size_t i = 0; i < module.record_layouts.size(); ++i) {
+        const auto& layout = module.record_layouts[i];
+        if (layout.name.empty() || !names.insert(layout.name).second ||
+            layout.field_types.size() != layout.reference_map.size()) {
+            std::ostringstream message;
+            message << "record layout " << i
+                    << " has an empty/duplicate name or mismatched field bitmap";
+            return reject(diagnostics, 0, std::nullopt,
+                          VerifierReason::BadRecordLayoutShape,
+                          message.str());
+        }
+        for (std::size_t field = 0; field < layout.field_types.size(); ++field) {
+            const auto& type = layout.field_types[field];
+            if (!signature_shape_matches_kind(type, type.kind, module) ||
+                layout.reference_map[field] !=
+                    signature_value_is_reference(type)) {
+                std::ostringstream message;
+                message << "record layout " << i << " field " << field
+                        << " disagrees with its signature or derived reference bitmap";
+                return reject(diagnostics, 0, std::nullopt,
+                              VerifierReason::BadRecordLayoutShape,
+                              message.str());
+            }
         }
     }
     return true;
@@ -769,11 +858,23 @@ bool signature_is_well_formed(const FunctionSignature& signature,
         signature.parameter_types.size() != signature.parameters.size()) {
         return false;
     }
+    for (std::size_t i = 0; i < signature.parameters.size(); ++i) {
+        if (signature.parameters[i] == ValueKind::Record &&
+            (signature.parameter_types.empty() ||
+             !signature.parameter_types[i].is_record_layout_reference())) {
+            return false;
+        }
+    }
     for (std::size_t i = 0; i < signature.parameter_types.size(); ++i) {
         if (!signature_shape_matches_kind(signature.parameter_types[i],
                                           signature.parameters[i], module)) {
             return false;
         }
+    }
+    if (signature.return_type == ValueKind::Record &&
+        (!signature.return_type_detail.has_value() ||
+         !signature.return_type_detail->is_record_layout_reference())) {
+        return false;
     }
     if (signature.return_type_detail.has_value() &&
         !signature_shape_matches_kind(*signature.return_type_detail,
@@ -871,6 +972,7 @@ bool operator==(const AbstractValue& lhs, const AbstractValue& rhs) {
            abstract_value_ptr_equal(lhs.reference_target,
                                     rhs.reference_target) &&
            lhs.signature_named_type == rhs.signature_named_type &&
+           lhs.signature_record_layout == rhs.signature_record_layout &&
            lhs.source_local == rhs.source_local &&
            lhs.nil_test_local == rhs.nil_test_local;
 }
@@ -907,6 +1009,17 @@ bool is_poison(const AbstractValue& value) {
     return value.kind == AbstractKind::Poison;
 }
 
+bool is_canonical_nil_object(const AbstractValue& value) {
+    return value.kind == AbstractKind::Object && value.includes_nil &&
+           value.object_sites.empty() && value.ref_array_sites.empty() &&
+           !value.includes_opaque_object && value.signature_fields == nullptr &&
+           value.signature_array_element == nullptr &&
+           value.signature_function == nullptr && value.signature_map == nullptr &&
+           value.reference_target == nullptr &&
+           !value.signature_named_type.has_value() &&
+           !value.signature_record_layout.has_value();
+}
+
 AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
     const auto join_maybe_with_target = [](const AbstractValue& maybe,
                                            const AbstractValue& target)
@@ -927,6 +1040,24 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
     }
     if (auto joined = join_maybe_with_target(rhs, lhs); joined.has_value()) {
         return *joined;
+    }
+    const auto join_record_with_nil = [](const AbstractValue& record,
+                                         const AbstractValue& nil) {
+        auto joined = record;
+        joined.includes_nil = true;
+        if (record.source_local != nil.source_local) {
+            joined.source_local.reset();
+        }
+        if (record.nil_test_local != nil.nil_test_local) {
+            joined.nil_test_local.reset();
+        }
+        return joined;
+    };
+    if (lhs.kind == AbstractKind::Record && is_canonical_nil_object(rhs)) {
+        return join_record_with_nil(lhs, rhs);
+    }
+    if (rhs.kind == AbstractKind::Record && is_canonical_nil_object(lhs)) {
+        return join_record_with_nil(rhs, lhs);
     }
     if (lhs.kind != rhs.kind || is_poison(lhs) || is_poison(rhs)) {
         return poison_value();
@@ -985,6 +1116,12 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
                                     *rhs.signature_map)) {
             return poison_value();
         }
+    } else if (joined.kind == AbstractKind::Record) {
+        if (!lhs.signature_record_layout.has_value() ||
+            lhs.signature_record_layout != rhs.signature_record_layout) {
+            return poison_value();
+        }
+        joined.includes_nil = lhs.includes_nil || rhs.includes_nil;
     } else if (joined.kind == AbstractKind::Weak ||
                joined.kind == AbstractKind::MaybeReference) {
         if (lhs.reference_target == nullptr ||
@@ -1235,8 +1372,7 @@ bool pop_reference_or_report(AbstractState& state,
         return false;
     }
     if (!is_reference_kind(actual.kind) ||
-        actual.kind == AbstractKind::MaybeReference ||
-        (actual.kind == AbstractKind::Object && actual.includes_nil)) {
+        actual.kind == AbstractKind::MaybeReference || actual.includes_nil) {
         std::ostringstream message;
         message << context << " expected a non-nil reference but found "
                 << abstract_kind_name(actual.kind);
@@ -1404,12 +1540,12 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
     if (is_poison(value) || is_poison(expected)) {
         return false;
     }
-    if (expected.kind == AbstractKind::Nil &&
-        value.kind == AbstractKind::Object && value.includes_nil &&
-        value.object_sites.empty() && !value.includes_opaque_object &&
-        value.signature_fields == nullptr &&
-        !value.signature_named_type.has_value()) {
+    if (expected.kind == AbstractKind::Nil && is_canonical_nil_object(value)) {
         return true;
+    }
+    if (expected.kind == AbstractKind::Record &&
+        is_canonical_nil_object(value)) {
+        return expected.includes_nil;
     }
     if (value.kind == AbstractKind::MaybeReference &&
         value.reference_target != nullptr &&
@@ -1467,6 +1603,13 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
                expected.signature_function != nullptr &&
                signature_values_equal(*value.signature_function,
                                       *expected.signature_function);
+    }
+    if (expected.kind == AbstractKind::Record) {
+        return value.signature_record_layout.has_value() &&
+               expected.signature_record_layout.has_value() &&
+               value.signature_record_layout ==
+                   expected.signature_record_layout &&
+               (!value.includes_nil || expected.includes_nil);
     }
     if (expected.kind != AbstractKind::Object) {
         return true;
@@ -1870,6 +2013,136 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         state.stack.push_back(object_value(pc));
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    }
+    case OpCode::AllocRecord: {
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                module.record_layouts.size()) {
+            std::ostringstream message;
+            message << "record layout " << ins.operand
+                    << " is outside layout count "
+                    << module.record_layouts.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadRecordLayoutIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto layout_index = static_cast<std::size_t>(ins.operand);
+        const auto& layout = module.record_layouts[layout_index];
+        if (state.stack.size() < layout.field_types.size()) {
+            std::ostringstream message;
+            message << "record initializer requires "
+                    << layout.field_types.size() << " fields but stack has "
+                    << state.stack.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadRecordInitializerArity,
+                          instruction_message(function, pc, message.str()));
+        }
+        for (std::size_t i = layout.field_types.size(); i > 0; --i) {
+            const auto field_index = i - 1;
+            AbstractValue initializer;
+            std::ostringstream context;
+            context << "record initializer field " << field_index;
+            if (!pop_any_or_report(
+                    state, diagnostics, function, function_index, pc,
+                    VerifierReason::BadRecordInitializerArity,
+                    context.str(), &initializer)) {
+                return false;
+            }
+            if (!value_conforms_to_signature(
+                    module, state, initializer,
+                    layout.field_types[field_index])) {
+                std::ostringstream message;
+                message << "record initializer field " << field_index
+                        << " does not conform to its declared type";
+                return reject(diagnostics, function_index, pc,
+                              VerifierReason::BadRecordInitializerType,
+                              instruction_message(function, pc,
+                                                  message.str()));
+            }
+        }
+        state.stack.push_back(record_value(layout_index, false));
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
+    }
+    case OpCode::RecordGet:
+    case OpCode::RecordSet: {
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                module.record_layouts.size()) {
+            std::ostringstream message;
+            message << "record layout " << ins.operand
+                    << " is outside layout count "
+                    << module.record_layouts.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadRecordLayoutIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto layout_index = static_cast<std::size_t>(ins.operand);
+        const auto& layout = module.record_layouts[layout_index];
+        if (ins.operand2 < 0 ||
+            static_cast<std::uint64_t>(ins.operand2) >=
+                layout.field_types.size()) {
+            std::ostringstream message;
+            message << "record field " << ins.operand2
+                    << " is outside field count "
+                    << layout.field_types.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadRecordFieldIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto field_index = static_cast<std::size_t>(ins.operand2);
+        AbstractValue stored;
+        if (ins.op == OpCode::RecordSet &&
+            !pop_any_or_report(state, diagnostics, function, function_index,
+                               pc, VerifierReason::StackUnderflow,
+                               "record stored value", &stored)) {
+            return false;
+        }
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index,
+                               pc, VerifierReason::StackUnderflow,
+                               "record receiver", &receiver)) {
+            return false;
+        }
+        if (receiver.kind != AbstractKind::Record) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::RecordOperationOnNonRecord,
+                          instruction_message(
+                              function, pc,
+                              "receiver is not a typed record reference"));
+        }
+        if (receiver.includes_nil) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::RecordReceiverMayBeNil,
+                          instruction_message(
+                              function, pc,
+                              "record receiver may be nil without refinement"));
+        }
+        if (!receiver.signature_record_layout.has_value() ||
+            *receiver.signature_record_layout != layout_index) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::RecordLayoutMismatch,
+                          instruction_message(
+                              function, pc,
+                              "receiver nominal layout differs from opcode layout"));
+        }
+        if (ins.op == OpCode::RecordSet) {
+            if (!value_conforms_to_signature(
+                    module, state, stored, layout.field_types[field_index])) {
+                return reject(diagnostics, function_index, pc,
+                              VerifierReason::RecordFieldTypeMismatch,
+                              instruction_message(
+                                  function, pc,
+                                  "stored value violates record field type"));
+            }
+        } else {
+            state.stack.push_back(
+                value_from_signature(layout.field_types[field_index]));
+        }
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
     }
     case OpCode::AllocArray:
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
@@ -2710,6 +2983,24 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "StrSubRequiresI64Bounds";
     case VerifierReason::StrLtRequiresStr:
         return "StrLtRequiresStr";
+    case VerifierReason::BadRecordLayoutShape:
+        return "BadRecordLayoutShape";
+    case VerifierReason::BadRecordLayoutIndex:
+        return "BadRecordLayoutIndex";
+    case VerifierReason::BadRecordFieldIndex:
+        return "BadRecordFieldIndex";
+    case VerifierReason::BadRecordInitializerArity:
+        return "BadRecordInitializerArity";
+    case VerifierReason::BadRecordInitializerType:
+        return "BadRecordInitializerType";
+    case VerifierReason::RecordOperationOnNonRecord:
+        return "RecordOperationOnNonRecord";
+    case VerifierReason::RecordLayoutMismatch:
+        return "RecordLayoutMismatch";
+    case VerifierReason::RecordReceiverMayBeNil:
+        return "RecordReceiverMayBeNil";
+    case VerifierReason::RecordFieldTypeMismatch:
+        return "RecordFieldTypeMismatch";
     }
     return "<unknown>";
 }
@@ -2757,6 +3048,9 @@ ModuleVerifierReport verify_with_diagnostics(const Module& module) {
                 << " is outside function count " << module.functions.size();
         reject(report.diagnostics, module.entry_function, std::nullopt,
                VerifierReason::ModuleShapeMismatch, message.str());
+        return report;
+    }
+    if (!record_layouts_are_well_formed(module, report.diagnostics)) {
         return report;
     }
     if (!module_weak_target_types_are_valid(module, report.diagnostics)) {

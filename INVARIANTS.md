@@ -34,6 +34,11 @@
   the exact result from the map layout. Runtime out-of-bounds access traps with the stable
   `map entry index out of bounds` diagnostic; lowered iteration deliberately reaches that
   boundary when the entry count grows after its entry snapshot.
+- `AllocRecord`, `RecordGet`, and `RecordSet` may execute only after the verifier has
+  proved the module record-layout identity, field bounds, declared-order initializer
+  types, receiver identity and non-nil state, and stored-value type. Record signatures
+  retain exact nominal layout identity through calls, containers, captures, and recursive
+  fields, and their stack/local slots carry exact reference bits.
 - VM observable behavior must not depend on host pointer addresses.
 - The VM output buffer is execution-local copied byte state, never a heap root. Its
   contents are a pure function of the verified module and its inputs and must be
@@ -45,10 +50,10 @@
 - Every live object is reachable from an explicit root or another live object at collection start.
 - The collector must never treat non-reference values as references.
 - Every object-payload reference belongs to exactly one of two exhaustive categories.
-  Descriptor visitors define **all strong edges**: `Pair`, `RefArray`, `Closure`, and
-  `Map` expose exactly their statically declared reference slots. The exact heap-owned
-  WeakRef registry defines **all weak edges**. No third payload reference path may mark,
-  retain, forward, clear, or validate an object ID.
+  Descriptor visitors define **all strong edges**: `Pair`, `RefArray`, `Closure`, `Map`,
+  and `Record` expose exactly their statically declared reference slots. The exact
+  heap-owned WeakRef registry defines **all weak edges**. No third payload reference path
+  may mark, retain, forward, clear, or validate an object ID.
 - Reference-bearing variable-length strong payloads must use the same descriptor visitor
   as fixed-size strong payloads. Marking, strong forwarding, remembered-set validation,
   and strong post-collection validation may not add one-off object-kind scans outside
@@ -90,6 +95,12 @@
   their payload bits equal a live, dead, stale, or forwarded `ObjectId`. Descriptor shape
   validation requires the entry count to match the payload and every slot tag to agree
   with its static reference flag; reference values may carry `Object` or `Nil`.
+- `Record` payloads are mutable ordered tagged field slots. Each heap record retains its
+  validated module layout index and the exactly-derived per-field reference bitmap. The
+  descriptor visits only bitmap-selected fields in declaration order; scalar fields stay
+  opaque even when their payload bits equal a live, dead, stale, or forwarded `ObjectId`.
+  Shape validation requires the field count and bitmap length to agree and every slot tag
+  to match its static reference bit; reference fields may carry `Object` or `Nil`.
 - Object IDs name object base slots only. Payload/reserved storage slots are never valid
   object headers, and variable-size compaction must advance by the descriptor storage
   width without allowing overlapping live objects.
@@ -97,9 +108,10 @@
 - If a moving collector is introduced, every root and heap reference must be updated before mutator execution resumes.
 - Every live embedder handle is a precise mutable root slot; handle destruction removes that slot before the next collection, and the heap must outlive all handles.
 - Write barriers must run on every old-to-young reference store once generations exist,
-  including `Pair` field stores and `RefArray` element stores. Raw `ScalarArray` stores
-  are not reference-publishing mutations and must not enter the remembered set; immutable
-  strings cannot publish references at all.
+  including `Pair` field stores, `RefArray` element stores, and statically reference-typed
+  `Record` field stores. Raw `ScalarArray` and scalar-record-field stores are not
+  reference-publishing mutations and must not enter the remembered set; immutable strings
+  cannot publish references at all.
 - Every map insertion or update flows through `Heap::store_map_entry`. Before publishing
   an inserted young string key or a young reference value into an old map, that single
   funnel records the old owner in the remembered set. Updates barrier the replacement
@@ -113,11 +125,21 @@
   append cannot claim the adjacent two logical slots, deterministic relocation rewrites
   all roots, descriptor-declared references, and remembered-set entries before the entry
   is published.
+- Every record mutation flows through `Heap::store_record_field`. The funnel validates the
+  owner's immutable layout identity, field bounds, bitmap shape, and stored tag; before
+  publishing a young object in a reference field of an old record it records the owner in
+  the remembered set. No mutable record payload is exposed outside this funnel, and
+  remembered-set validation must reject every omitted old-record-to-young edge.
+- A record's logical storage width is permanently `1 + field_count`. Allocation,
+  storage-layout validation, compaction cursors, and forwarding all derive the same width
+  from the retained layout payload and assert that it does not change during collection.
+  Field mutation may replace a slot but can never add, remove, or reorder one.
 - Closure captures have no post-construction store path and therefore no mutator barrier.
-  If collector promotion creates an old closure with a mapped young capture, the promotion
-  path itself must insert the closure into the remembered set before collection-boundary
-  validation. This GC-internal insertion must be exact, deterministic, and must not count
-  as a mutator write-barrier hit.
+  If collector promotion creates an old closure with a mapped young capture, or an old
+  record with a mapped young field, the generic descriptor-driven promotion path itself
+  must insert the owner into the remembered set before collection-boundary validation.
+  This GC-internal insertion must be exact, deterministic, and must not count as a mutator
+  write-barrier hit. Record mutator-created edges still require the ordinary store funnel.
 - Weak edges never enter the remembered set and never run a write barrier. Minor
   collection finds old WeakRef owners through the exact weak registry, not through
   strong-edge remembered-set scanning. A young weak target survives only if a strong
@@ -125,10 +147,22 @@
 
 ## Frontend
 
+- Top-level `record Name { field: T, ... }` declarations introduce nominal object types.
+  All declarations are registered before fields are resolved so self and forward
+  references remain finite. Two records with identical field lists are distinct types;
+  complete nominal identity must survive parameters, returns, arrays, maps, closure
+  captures, weak targets, and field reads/writes.
+- Record construction must supply every field exactly once in declared order. A constructed
+  record is proven non-nil, while record-typed parameters, recursive fields, and other
+  nullable values require the existing `is_nil(local)` false-branch refinement before
+  field access. All record writes preserve the selected field's declared type.
+- At the compile boundary, `i64` and `bool` record fields must emit scalar bitmap bits and
+  every other field must emit reference bits. The compiler asserts that this emitted
+  bitmap exactly matches the type checker's classification before module verification.
 - Structural `fn(T1, ..., Tn) -> R` types must survive the compile boundary in locals,
-  parameters, returns, pair fields, and reference-array elements. Lambda captures are
-  immutable creation-time snapshots in deterministic first-use order; later assignment to
-  the source local cannot alter an existing closure.
+  parameters, returns, pair fields, record fields, and reference-array elements. Lambda
+  captures are immutable creation-time snapshots in deterministic first-use order; later
+  assignment to the source local cannot alter an existing closure.
 - Every type-checked lambda and named-function value must lower through a verifier-accepted
   closure layout whose ordered capture types and derived bitmap agree exactly. Function
   arrays must use `RefArray`, and closure-valued stack slots must carry the existing precise
@@ -172,14 +206,15 @@
 
 - A source array type's element type determines its runtime representation at the compile
   boundary: `[i64]` and `[bool]` must emit only scalar `AllocArray`/`ArrayGet`/`ArraySet`
-  operations, while `[pair<...>]`, named-pair arrays, and nested array elements must emit
-  only `AllocRefArray`/`RefArrayGet`/`RefArraySet`.
+  operations, while `[pair<...>]`, named-pair arrays, record arrays, and nested array
+  elements must emit only `AllocRefArray`/`RefArrayGet`/`RefArraySet`.
 - The frontend must never compile a `nil` or maybe-nil value into a RefArray element.
   Reference array literals enumerate every element, and sized reference array
   construction requires a non-nil initializer expression.
 - Indexing a typed reference array must recover the declared element type in frontend and
   verifier metadata even though the runtime value is a coarse object reference.
-- `weak<T>` accepts only object types (`pair`/named pair, array, map, `str`, or `fn`).
+- `weak<T>` accepts only object types (`pair`/named pair, record, array, map, `str`, or
+  `fn`).
   `weak(x)` requires a proven non-nil object and lowers to `AllocWeak`; `.get()` lowers to
   `WeakGet` and produces nil-able `T`. Every object operation, argument, store, or return
   requires the existing `is_nil(local)` false-branch refinement first. `WeakIsAlive` is
