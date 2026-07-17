@@ -164,6 +164,15 @@
   collection finds old WeakRef owners through the exact weak registry, not through
   strong-edge remembered-set scanning. A young weak target survives only if a strong
   minor root marks it; survivors are promoted/forwarded and dead young targets clear.
+- `Ephemeron` descriptors expose zero strong fields. Their exact slot-ordered registry
+  owns an immutable weak key and a conditional value. A value is marked only when its key
+  is independently live; registry scans and descriptor draining repeat to a deterministic
+  fixpoint. Each productive pass marks a new object, so finite monotone marking terminates.
+- Ephemeron fixpoint marking precedes movement. Active keys/reference values forward;
+  inactive entries clear to canonical nil/nil and never resurrect. Minor collection
+  treats old keys as independently live and young keys as live only when marked.
+- Every ephemeron value mutation flows through `Heap::store_ephemeron_value`, which
+  validates scalar/reference shape and performs the old-to-young barrier before publish.
 
 ## Frontend
 
@@ -246,6 +255,11 @@
   `WeakGet` and produces nil-able `T`. Every object operation, argument, store, or return
   requires the existing `is_nil(local)` false-branch refinement first. `WeakIsAlive` is
   intentionally absent so `is_nil` remains the single refinement mechanism.
+- `ephemeron<K, V>` requires object-typed `K`; construction requires a proven non-nil key
+  and non-nil initial value. Structural `K,V` identity survives calls, containers, and
+  captures. `.key()` and reference `.value()` produce nil-able results requiring
+  `is_nil` refinement, while `.set_value(v)` lowers only to `EphemeronSetValue` and the
+  heap's barrier-before-publish funnel.
 
 ## Testing
 

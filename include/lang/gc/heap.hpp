@@ -68,6 +68,8 @@ struct HeapMetrics {
     std::uint64_t compaction_closure_bytes{0};
     std::uint64_t compaction_map_bytes{0};
     std::uint64_t compaction_weak_ref_bytes{0};
+    std::uint64_t ephemeron_fixpoint_passes{0};
+    std::uint64_t ephemeron_activations{0};
 };
 
 enum class ObjectGeneration {
@@ -85,6 +87,7 @@ enum class ObjectKind {
     WeakRef,
     Record,
     Variant,
+    Ephemeron,
 };
 
 struct MapEntry {
@@ -108,8 +111,12 @@ struct Object {
     static Object variant(std::size_t layout_index, std::size_t case_index,
                           std::vector<Value> fields,
                           std::vector<std::vector<bool>> case_ref_maps);
+    static Object ephemeron(Value key, Value value, bool value_is_ref);
 
     [[nodiscard]] Value weak_target() const { return weak_target_; }
+    [[nodiscard]] Value ephemeron_key() const { return ephemeron_key_; }
+    [[nodiscard]] Value ephemeron_value() const { return ephemeron_value_; }
+    [[nodiscard]] bool ephemeron_value_is_ref() const { return ephemeron_value_is_ref_; }
 
     bool marked{false};
     ObjectGeneration generation{ObjectGeneration::Young};
@@ -139,6 +146,9 @@ struct Object {
 private:
     friend class Heap;
     Value weak_target_{Value::nil()};
+    Value ephemeron_key_{Value::nil()};
+    Value ephemeron_value_{Value::nil()};
+    bool ephemeron_value_is_ref_{false};
 };
 
 class Handle {
@@ -189,6 +199,7 @@ public:
     ObjectId allocate_map(std::size_t layout_index, bool key_is_ref,
                           bool value_is_ref);
     ObjectId allocate_weak(Value target);
+    ObjectId allocate_ephemeron(Value key, Value value, bool value_is_ref);
     ObjectId allocate_record(std::size_t layout_index,
                              std::vector<Value> fields,
                              std::vector<bool> ref_map);
@@ -233,6 +244,9 @@ public:
     [[nodiscard]] Value map_key_at(ObjectId id, std::size_t index) const;
     [[nodiscard]] Value map_value_at(ObjectId id, std::size_t index) const;
     [[nodiscard]] Value weak_get(ObjectId id) const;
+    [[nodiscard]] Value ephemeron_key(ObjectId id) const;
+    [[nodiscard]] Value ephemeron_value(ObjectId id) const;
+    void ephemeron_set_value(ObjectId id, Value value);
     [[nodiscard]] std::size_t record_layout_index(ObjectId id) const;
     [[nodiscard]] std::size_t record_field_count(ObjectId id) const;
     [[nodiscard]] Value record_get(ObjectId id, std::size_t index) const;
@@ -256,6 +270,7 @@ public:
     [[nodiscard]] bool TEST_ONLY_is_weak_ref(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_record(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_variant(ObjectId id) const;
+    [[nodiscard]] bool TEST_ONLY_is_ephemeron(ObjectId id) const;
     [[nodiscard]] std::size_t TEST_ONLY_remembered_set_size() const {
         return remembered_set_.size();
     }
@@ -307,6 +322,8 @@ private:
     [[nodiscard]] const Object& checked_record(ObjectId id) const;
     [[nodiscard]] Object& checked_record(ObjectId id);
     [[nodiscard]] const Object& checked_variant(ObjectId id) const;
+    [[nodiscard]] const Object& checked_ephemeron(ObjectId id) const;
+    [[nodiscard]] Object& checked_ephemeron(ObjectId id);
     void register_handle_root(Value* slot);
     void deregister_handle_root(Value* slot) noexcept;
     void move_handle_root(Value* from, Value* to) noexcept;
@@ -319,6 +336,7 @@ private:
     void store_ref_array_element(ObjectId id, std::size_t index, Value value);
     void store_map_entry(ObjectId id, Value key, Value value);
     void store_record_field(ObjectId id, std::size_t index, Value value);
+    void store_ephemeron_value(ObjectId id, Value value);
     void ensure_map_growth_storage(Value& owner, Value& key, Value& value,
                                    std::size_t required_width);
     void relocate_map_for_growth(Value& owner, Value& key, Value& value,
@@ -338,6 +356,7 @@ private:
     void enqueue_mark_value(Value value, std::vector<ObjectId>& worklist, CollectionKind kind);
     void enqueue_young_references_from_remembered_set(std::vector<ObjectId>& worklist);
     void drain_mark_worklist(std::vector<ObjectId>& worklist, CollectionKind kind);
+    void process_ephemeron_fixpoint(std::vector<ObjectId>& worklist, CollectionKind kind);
     [[nodiscard]] CompactionResult compact_live_objects(CollectionKind kind) const;
     void rewrite_references(const ForwardingTable& forwarding,
                             std::vector<std::optional<Object>>& compacted_objects,
@@ -347,6 +366,9 @@ private:
         const ForwardingTable& forwarding,
         std::vector<std::optional<Object>>& moved_objects,
         std::optional<CollectionKind> collection_kind) const;
+    [[nodiscard]] std::vector<ObjectId> process_ephemerons(
+        const ForwardingTable& forwarding,
+        std::vector<std::optional<Object>>& moved_objects) const;
     [[nodiscard]] std::vector<ObjectId> rewrite_remembered_set(
         const ForwardingTable& forwarding) const;
     void prune_remembered_set();
@@ -354,6 +376,7 @@ private:
     void validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const;
     void validate_remembered_set() const;
     void validate_weak_targets() const;
+    void validate_ephemerons() const;
     void validate_value(Value value) const;
 
     RootProvider* root_provider_{nullptr};
@@ -363,6 +386,7 @@ private:
     std::vector<std::uint32_t> generations_;
     std::vector<ObjectId> remembered_set_;
     std::vector<ObjectId> weak_refs_;
+    std::vector<ObjectId> ephemerons_;
     std::vector<Value*> handle_roots_;
     // Performance metrics are passive observations, including logically-const
     // validation and lookup work. No metric participates in runtime control flow.

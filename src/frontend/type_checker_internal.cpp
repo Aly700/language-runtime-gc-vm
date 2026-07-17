@@ -98,7 +98,8 @@ bool is_reference_array_element_type(const TypeSpec& type) {
            type.kind == TypeSpec::Kind::Variant ||
            type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str ||
            type.kind == TypeSpec::Kind::Function || type.kind == TypeSpec::Kind::Map ||
-           type.kind == TypeSpec::Kind::Weak;
+           type.kind == TypeSpec::Kind::Weak ||
+           type.kind == TypeSpec::Kind::Ephemeron;
 }
 
 bool is_object_type(const TypeSpec& type) {
@@ -113,7 +114,9 @@ bool is_weak_target_type(const TypeSpec& type) {
            type.kind == TypeSpec::Kind::Array ||
            type.kind == TypeSpec::Kind::Str ||
            type.kind == TypeSpec::Kind::Function ||
-           type.kind == TypeSpec::Kind::Map;
+           type.kind == TypeSpec::Kind::Map ||
+           type.kind == TypeSpec::Kind::Weak ||
+           type.kind == TypeSpec::Kind::Ephemeron;
 }
 
 bool is_valid_map_key_type(const TypeSpec& type) {
@@ -651,6 +654,17 @@ private:
             }
             return;
         }
+        if (type.kind == TypeSpec::Kind::Ephemeron && type.key != nullptr &&
+            type.value != nullptr) {
+            resolve_type(*type.key);
+            resolve_type(*type.value);
+            if (!is_invalid(*type.key) && !is_weak_target_type(*type.key)) {
+                diagnose(type.key->position,
+                         "ephemeron key type must be an object type");
+                type = invalid_type();
+            }
+            return;
+        }
         if (type.kind == TypeSpec::Kind::Record ||
             type.kind == TypeSpec::Kind::Variant) {
             return;
@@ -899,6 +913,11 @@ private:
                    target.weak_target != nullptr &&
                    is_weak_target_type(*target.weak_target);
         }
+        if (target.kind == TypeSpec::Kind::Ephemeron) {
+            return !value.includes_nil && value.type == target &&
+                   target.key != nullptr && target.value != nullptr &&
+                   is_weak_target_type(*target.key);
+        }
         if (target.kind == TypeSpec::Kind::Record) {
             if (value.type.kind == TypeSpec::Kind::Nil) {
                 return true;
@@ -999,6 +1018,20 @@ private:
                          value.type == str_type()
                              ? "print requires non-nil str"
                              : "print expects str");
+            }
+            return true;
+        }
+        case Statement::Kind::EphemeronSet: {
+            const auto receiver = check_expr(*statement.initializer, state);
+            const auto value = check_expr(*statement.value, state);
+            if (receiver.includes_nil ||
+                receiver.type.kind != TypeSpec::Kind::Ephemeron ||
+                receiver.type.value == nullptr) {
+                diagnose(statement.position, "set_value requires ephemeron");
+            } else if (!value_conforms_to_type(value, *receiver.type.value, state)) {
+                diagnose(statement.value->position,
+                         "set_value expects " + type_name(*receiver.type.value) +
+                             " but got " + type_name(value.type));
             }
             return true;
         }
@@ -1793,6 +1826,11 @@ private:
             return check_weak_construct(expression, state);
         case Expr::Kind::WeakGet:
             return check_weak_get(expression, state);
+        case Expr::Kind::EphemeronConstruct:
+            return check_ephemeron_construct(expression, state);
+        case Expr::Kind::EphemeronKey:
+        case Expr::Kind::EphemeronValue:
+            return check_ephemeron_get(expression, state);
         case Expr::Kind::ToStr:
         case Expr::Kind::ToI64:
             return check_conversion(expression, state);
@@ -2224,6 +2262,42 @@ private:
         auto target = value_from_type(*receiver.type.weak_target);
         target.includes_nil = true;
         return annotate(expression, std::move(target));
+    }
+
+    TypedValue check_ephemeron_construct(Expr& expression, FlowState& state) {
+        const auto key = check_expr(*expression.left, state);
+        const auto value = check_expr(*expression.right, state);
+        if (is_invalid(key.type) || is_invalid(value.type))
+            return annotate(expression, invalid_value());
+        if (!is_weak_target_type(key.type) || key.includes_nil) {
+            diagnose(expression.left->position,
+                     "ephemeron() requires a non-nil object key");
+            return annotate(expression, invalid_value());
+        }
+        if (value.type.kind == TypeSpec::Kind::Nil || value.includes_nil) {
+            diagnose(expression.right->position,
+                     "ephemeron() requires a non-nil initial value");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, value_from_type(
+            ephemeron_type(key.type, value.type)));
+    }
+
+    TypedValue check_ephemeron_get(Expr& expression, FlowState& state) {
+        const auto receiver = check_expr(*expression.receiver, state);
+        if (is_invalid(receiver.type)) return annotate(expression, invalid_value());
+        if (receiver.includes_nil ||
+            receiver.type.kind != TypeSpec::Kind::Ephemeron ||
+            receiver.type.key == nullptr || receiver.type.value == nullptr) {
+            diagnose(expression.position, "ephemeron getter requires ephemeron");
+            return annotate(expression, invalid_value());
+        }
+        auto result = value_from_type(expression.kind == Expr::Kind::EphemeronKey
+                                          ? *receiver.type.key
+                                          : *receiver.type.value);
+        if (expression.kind == Expr::Kind::EphemeronKey ||
+            is_object_type(result.type)) result.includes_nil = true;
+        return annotate(expression, std::move(result));
     }
 
     TypedValue check_conversion(Expr& expression, FlowState& state) {

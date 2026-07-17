@@ -139,6 +139,8 @@ const char* op_name(lang::OpCode op) {
         return "TryEnd";
     case lang::OpCode::Throw:
         return "Throw";
+    default:
+        break;
     }
     return "<unknown>";
 }

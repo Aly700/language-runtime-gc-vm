@@ -250,6 +250,8 @@ private:
             kind = TokenKind::Map;
         } else if (text == "weak") {
             kind = TokenKind::Weak;
+        } else if (text == "ephemeron") {
+            kind = TokenKind::Ephemeron;
         } else if (text == "print") {
             kind = TokenKind::Print;
         } else if (text == "to_str") {

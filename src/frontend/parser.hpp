@@ -21,6 +21,7 @@ struct TypeSpec {
         Function,
         Map,
         Weak,
+        Ephemeron,
         Named,
         Record,
         Variant,
@@ -58,6 +59,9 @@ struct TypeSpec {
     [[nodiscard]] bool has_weak_target() const {
         return kind == Kind::Weak && weak_target != nullptr;
     }
+    [[nodiscard]] bool has_ephemeron_entries() const {
+        return kind == Kind::Ephemeron && key != nullptr && value != nullptr;
+    }
 };
 
 TypeSpec int64_type();
@@ -76,6 +80,7 @@ TypeSpec array_type(TypeSpec element);
 TypeSpec function_type(std::vector<TypeSpec> parameters, TypeSpec result);
 TypeSpec map_type(TypeSpec key, TypeSpec value);
 TypeSpec weak_type(TypeSpec target);
+TypeSpec ephemeron_type(TypeSpec key, TypeSpec value);
 
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs);
 bool operator!=(const TypeSpec& lhs, const TypeSpec& rhs);
@@ -111,6 +116,9 @@ struct Expr {
         MapHas,
         WeakConstruct,
         WeakGet,
+        EphemeronConstruct,
+        EphemeronKey,
+        EphemeronValue,
         ToStr,
         ToI64,
     };
@@ -210,6 +218,7 @@ struct Statement {
         Break,
         Continue,
         Print,
+        EphemeronSet,
     };
 
     Kind kind{Kind::Let};

@@ -452,6 +452,47 @@ Value VM::execute_verified(const Module& module,
             ++frame.pc;
             break;
         }
+        case OpCode::AllocEphemeron: {
+            const auto value = pop(frame);
+            const auto key = pop(frame);
+            const auto layout_index = static_cast<std::size_t>(ins.operand);
+            assert(layout_index < module.ephemeron_layouts.size());
+            const auto& layout = module.ephemeron_layouts[layout_index];
+            push(frame, Value::object(heap_.allocate_ephemeron(
+                            key, value, layout.value_is_ref)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::EphemeronKey: {
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   heap_.TEST_ONLY_is_ephemeron(receiver.as_object()));
+            push(frame, heap_.ephemeron_key(receiver.as_object()));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::EphemeronValue: {
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   heap_.TEST_ONLY_is_ephemeron(receiver.as_object()));
+            const auto value = heap_.ephemeron_value(receiver.as_object());
+            if (value.tag() == Value::Tag::Nil) {
+                throw runtime_trap(frame.function_index, frame.pc,
+                                   "ephemeron entry cleared");
+            }
+            push(frame, value);
+            ++frame.pc;
+            break;
+        }
+        case OpCode::EphemeronSetValue: {
+            const auto value = pop(frame);
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   heap_.TEST_ONLY_is_ephemeron(receiver.as_object()));
+            heap_.ephemeron_set_value(receiver.as_object(), value);
+            ++frame.pc;
+            break;
+        }
         case OpCode::IsNil: {
             const auto value = pop(frame);
             assert((value.tag() == Value::Tag::Object ||

@@ -151,6 +151,8 @@ const char* op_name(lang::OpCode op) {
         return "TryEnd";
     case lang::OpCode::Throw:
         return "Throw";
+    default:
+        break;
     }
     return "<unknown>";
 }
@@ -179,6 +181,8 @@ const char* value_kind_name(lang::ValueKind kind) {
         return "record";
     case lang::ValueKind::Variant:
         return "variant";
+    case lang::ValueKind::Ephemeron:
+        return "ephemeron";
     }
     return "<unknown>";
 }
@@ -290,6 +294,7 @@ Kind kind_from_value_kind(lang::ValueKind kind) {
     case lang::ValueKind::Weak:
     case lang::ValueKind::Record:
     case lang::ValueKind::Variant:
+    case lang::ValueKind::Ephemeron:
         break;
     }
     throw std::logic_error("fuzzer generator does not emit nil values");
