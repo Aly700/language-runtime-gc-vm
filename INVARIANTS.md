@@ -44,6 +44,13 @@
   types, receiver non-nil state, and scalar/reference stack maps. `VariantGet` also checks
   the runtime raw tag and traps with `variant case tag mismatch` rather than trusting the
   statically expected case.
+- `Throw` consumes only a proven non-nil nominal variant. Verified handler ranges add
+  exceptional dataflow edges whose target stack is exactly that one reference; handler
+  locals are joined from exceptional predecessors and ordinary flow cannot enter a handler.
+- Runtime traps are never translated into language exceptions. During iterative unwind,
+  the in-flight exception is exactly one mutable `pending_exception_` root. Moving
+  collection rewrites it and every surviving frame root before another frame is removed
+  or a handler resumes.
 - VM observable behavior must not depend on host pointer addresses.
 - The VM output buffer is execution-local copied byte state, never a heap root. Its
   contents are a pure function of the verified module and its inputs and must be
@@ -176,6 +183,9 @@
   Constructors are non-nil; exhaustive matches require a refined non-nil scrutinee, cover
   every case exactly once, and expose immutable arm-local bindings. Per-case bitmap bits
   use the same `i64`/`bool` scalar and all-other-types reference rule.
+- `throw e;` requires a proven non-nil nominal variant. `try { ... } catch (e: V) { ... }`
+  catches exact nominal variant layout `V`; the catch binding is non-nil, immutable, and
+  scoped to its handler body. Unmatched exceptions propagate.
 - Structural `fn(T1, ..., Tn) -> R` types must survive the compile boundary in locals,
   parameters, returns, pair fields, record fields, and reference-array elements. Lambda
   captures are immutable creation-time snapshots in deterministic first-use order; later

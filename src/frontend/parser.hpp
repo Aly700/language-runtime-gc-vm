@@ -205,6 +205,8 @@ struct Statement {
         While,
         ForIn,
         Match,
+        TryCatch,
+        Throw,
         Break,
         Continue,
         Print,
@@ -232,6 +234,12 @@ struct Statement {
     bool match_locals_allocated{false};
     std::vector<MatchArm> match_arms;
     std::size_t match_variant_layout_index{static_cast<std::size_t>(-1)};
+    std::vector<Statement> catch_body;
+    std::string catch_name;
+    SourcePosition catch_position;
+    TypeSpec catch_type{invalid_type()};
+    std::uint32_t catch_local_index{0};
+    bool catch_local_allocated{false};
 };
 
 struct CaptureSpec {

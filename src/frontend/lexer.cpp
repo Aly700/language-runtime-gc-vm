@@ -214,6 +214,12 @@ private:
             kind = TokenKind::Variant;
         } else if (text == "match") {
             kind = TokenKind::Match;
+        } else if (text == "try") {
+            kind = TokenKind::Try;
+        } else if (text == "catch") {
+            kind = TokenKind::Catch;
+        } else if (text == "throw") {
+            kind = TokenKind::Throw;
         } else if (text == "fn") {
             kind = TokenKind::Fn;
         } else if (text == "if") {

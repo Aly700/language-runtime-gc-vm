@@ -67,6 +67,7 @@ private:
                     std::vector<Value> arguments,
                     std::optional<Value> closure = std::nullopt);
     std::vector<Frame> frames_;
+    std::optional<Value> pending_exception_;
     gc::Heap heap_;
     gc::StressConfig gc_stress_{};
     std::uint64_t instructions_executed_{0};

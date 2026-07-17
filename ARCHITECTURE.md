@@ -6,6 +6,18 @@
 source -> lexer -> parser -> AST -> type checker -> compiler -> verifier -> VM -> heap/GC
 ```
 
+Iteration 35 adds typed exceptions without adding a heap kind. Non-nil nominal variants
+are the exception representation. Compiler-emitted handler ranges and append-only
+`TryBegin`/`TryEnd`/`Throw` bytecode feed exceptional successors into the verifier
+fixpoint. Handler entry has one reference on its operand stack and locals joined from all
+exceptional predecessors.
+
+The VM uses its existing explicit frame vector for deterministic unwind. An exception
+between frames lives in `pending_exception_`, a precise mutable root traced alongside all
+frame stacks, locals, and closures. Exact-layout handlers receive the forwarded object;
+unmatched values continue outward. Host/runtime traps never enter this path. See
+[ADR-0012](adr/0012-exception-unwind-roots.md).
+
 ## Frontend surface
 
 `lang::frontend::compile_program` is the narrow public entry point. On success,

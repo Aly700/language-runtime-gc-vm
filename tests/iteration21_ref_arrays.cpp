@@ -109,6 +109,12 @@ const char* op_name(lang::OpCode op) {
         return "VariantTag";
     case lang::OpCode::VariantGet:
         return "VariantGet";
+    case lang::OpCode::TryBegin:
+        return "TryBegin";
+    case lang::OpCode::TryEnd:
+        return "TryEnd";
+    case lang::OpCode::Throw:
+        return "Throw";
     case lang::OpCode::LoadLocal:
         return "LoadLocal";
     case lang::OpCode::StoreLocal:

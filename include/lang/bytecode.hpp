@@ -64,6 +64,9 @@ enum class OpCode {
     AllocVariant,
     VariantTag,
     VariantGet,
+    TryBegin,
+    TryEnd,
+    Throw,
 };
 
 struct Instruction {
@@ -290,12 +293,20 @@ struct StackMap {
     std::vector<bool> local_object_slots;
 };
 
+struct ExceptionHandler {
+    std::size_t try_begin{0};
+    std::size_t try_end{0};
+    std::size_t target{0};
+    std::size_t variant_layout{0};
+};
+
 struct Function {
     FunctionSignature signature;
     std::vector<Instruction> code;
     std::vector<StackMap> stack_maps;
     std::uint32_t local_count{0};
     std::optional<std::size_t> closure_layout;
+    std::vector<ExceptionHandler> exception_handlers;
 };
 
 struct Module {
@@ -411,6 +422,8 @@ enum class VerifierReason {
     VariantOperationOnNonVariant, // VariantTag/Get receiver is not a variant.
     VariantLayoutMismatch,    // Variant receiver nominal layout differs from opcode.
     VariantReceiverMayBeNil,  // VariantTag/Get receiver lacks nil refinement.
+    BadExceptionHandler,      // Handler metadata or delimiters are malformed.
+    ThrowRequiresVariant,     // Throw operand is not a non-nil nominal variant.
 };
 
 struct VerifierDiagnostic {
