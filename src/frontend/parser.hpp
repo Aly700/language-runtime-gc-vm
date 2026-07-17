@@ -23,6 +23,7 @@ struct TypeSpec {
         Weak,
         Named,
         Record,
+        Variant,
         Nil,
         Invalid,
     };
@@ -40,6 +41,7 @@ struct TypeSpec {
     SourcePosition position;
     std::optional<std::size_t> named_type_index;
     std::optional<std::size_t> record_layout_index;
+    std::optional<std::size_t> variant_layout_index;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == Kind::Pair && left != nullptr && right != nullptr;
@@ -65,6 +67,8 @@ TypeSpec pair_type();
 TypeSpec named_type(std::string name, SourcePosition position);
 TypeSpec record_type(std::string name, std::size_t layout_index,
                      SourcePosition position = {});
+TypeSpec variant_type(std::string name, std::size_t layout_index,
+                      SourcePosition position = {});
 TypeSpec nil_type();
 TypeSpec invalid_type();
 TypeSpec pair_type(TypeSpec left, TypeSpec right);
@@ -92,6 +96,7 @@ struct Expr {
         Variable,
         PairLiteral,
         RecordLiteral,
+        VariantLiteral,
         ArrayLiteral,
         ArraySized,
         ArrayIndex,
@@ -139,6 +144,8 @@ struct Expr {
     bool direct_call{false};
     std::size_t record_layout_index{static_cast<std::size_t>(-1)};
     std::size_t record_field_index{static_cast<std::size_t>(-1)};
+    std::size_t variant_layout_index{static_cast<std::size_t>(-1)};
+    std::size_t variant_case_index{static_cast<std::size_t>(-1)};
     std::shared_ptr<LambdaExpr> lambda;
 };
 
@@ -174,6 +181,22 @@ struct LValue {
     TypeSpec element_type{invalid_type()};
 };
 
+struct Statement;
+
+struct MatchBinding {
+    std::string name;
+    SourcePosition position;
+    std::uint32_t local_index{0};
+};
+
+struct MatchArm {
+    std::string case_name;
+    SourcePosition position;
+    std::vector<MatchBinding> bindings;
+    std::vector<Statement> body;
+    std::size_t case_index{static_cast<std::size_t>(-1)};
+};
+
 struct Statement {
     enum class Kind {
         Let,
@@ -181,6 +204,7 @@ struct Statement {
         If,
         While,
         ForIn,
+        Match,
         Break,
         Continue,
         Print,
@@ -205,6 +229,9 @@ struct Statement {
     std::unique_ptr<Expr> iterable;
     std::unique_ptr<Expr> range_upper;
     bool loop_locals_allocated{false};
+    bool match_locals_allocated{false};
+    std::vector<MatchArm> match_arms;
+    std::size_t match_variant_layout_index{static_cast<std::size_t>(-1)};
 };
 
 struct CaptureSpec {
@@ -260,9 +287,23 @@ struct RecordDecl {
     std::size_t layout_index{static_cast<std::size_t>(-1)};
 };
 
+struct VariantCaseDecl {
+    std::string name;
+    SourcePosition position;
+    std::vector<TypeSpec> fields;
+};
+
+struct VariantDecl {
+    std::string name;
+    SourcePosition position;
+    std::vector<VariantCaseDecl> cases;
+    std::size_t layout_index{static_cast<std::size_t>(-1)};
+};
+
 struct Program {
     std::vector<TypeDecl> types;
     std::vector<RecordDecl> records;
+    std::vector<VariantDecl> variants;
     std::vector<FunctionDecl> functions;
     std::vector<std::shared_ptr<LambdaExpr>> lambdas;
     std::vector<Statement> statements;

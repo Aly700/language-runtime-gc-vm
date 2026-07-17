@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
         return ValueKind::Object;
     case TypeSpec::Kind::Record:
         return ValueKind::Record;
+    case TypeSpec::Kind::Variant:
+        return ValueKind::Variant;
     case TypeSpec::Kind::Array:
         return ValueKind::Array;
     case TypeSpec::Kind::Function:
@@ -40,6 +43,10 @@ ValueKind bytecode_kind(const TypeSpec& type) {
 }
 
 SignatureValue signature_value_from_type(const TypeSpec& type) {
+    if (type.kind == TypeSpec::Kind::Variant &&
+        type.variant_layout_index.has_value()) {
+        return variant_signature(*type.variant_layout_index);
+    }
     if (type.kind == TypeSpec::Kind::Record &&
         type.record_layout_index.has_value()) {
         return record_signature(*type.record_layout_index);
@@ -138,6 +145,16 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
                 block_fallthrough_and_current_break(statement.else_branch);
             has_break = has_break || then_flow.second || else_flow.second;
             falls_through = then_flow.first || else_flow.first;
+            break;
+        }
+        case Statement::Kind::Match: {
+            bool arm_falls = false;
+            for (const auto& arm : statement.match_arms) {
+                const auto flow = block_fallthrough_and_current_break(arm.body);
+                has_break = has_break || flow.second;
+                arm_falls = arm_falls || flow.first;
+            }
+            falls_through = arm_falls;
             break;
         }
         case Statement::Kind::Let:
@@ -239,6 +256,14 @@ bool add_statement_array_counts(const Statement& statement,
             }
         }
         return true;
+    case Statement::Kind::Match: {
+        add_expr_array_counts(*statement.condition, counts);
+        bool falls = false;
+        for (const auto& arm : statement.match_arms) {
+            falls = add_block_array_counts(arm.body, counts) || falls;
+        }
+        return falls;
+    }
     case Statement::Kind::Break:
     case Statement::Kind::Continue:
         return false;
@@ -270,6 +295,7 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
         add_expr_array_counts(*expression.right, counts);
         return;
     case Expr::Kind::RecordLiteral:
+    case Expr::Kind::VariantLiteral:
         for (const auto& argument : expression.arguments) {
             add_expr_array_counts(*argument, counts);
         }
@@ -457,6 +483,12 @@ private:
         return function_.code.size() - 1;
     }
 
+    std::size_t emit(OpCode op, std::int64_t operand,
+                     std::int64_t operand2, std::int64_t operand3) {
+        function_.code.push_back(Instruction{op, operand, operand2, operand3});
+        return function_.code.size() - 1;
+    }
+
     void patch(std::size_t instruction, std::size_t target) {
         assert(instruction < function_.code.size());
         assert(target <= static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
@@ -464,6 +496,17 @@ private:
     }
 
     std::size_t pc() const { return function_.code.size(); }
+
+    void emit_guarded_variant_get(std::size_t layout, std::size_t case_index,
+                                  std::size_t field_index) {
+        assert(active_variant_case_.has_value() &&
+               active_variant_case_->first == layout &&
+               active_variant_case_->second == case_index &&
+               "VariantGet must be dominated by its active match-case guard");
+        emit(OpCode::VariantGet, static_cast<std::int64_t>(layout),
+             static_cast<std::int64_t>(case_index),
+             static_cast<std::int64_t>(field_index));
+    }
 
     std::uint32_t allocate_temp_local() {
         return function_.local_count++;
@@ -504,6 +547,8 @@ private:
         case Statement::Kind::ForIn:
             compile_for_in(statement);
             return true;
+        case Statement::Kind::Match:
+            return compile_match(statement);
         case Statement::Kind::Break:
         case Statement::Kind::Continue: {
             assert(!loop_contexts_.empty() &&
@@ -575,6 +620,62 @@ private:
             patch(*jump_to_end, pc());
         }
         return then_falls || else_falls;
+    }
+
+    bool compile_match(const Statement& statement) {
+        const auto subject = allocate_temp_local();
+        const auto tag = allocate_temp_local();
+        compile_expr(*statement.condition);
+        emit(OpCode::StoreLocal, subject);
+        emit(OpCode::LoadLocal, subject);
+        emit(OpCode::VariantTag, 0);
+        emit(OpCode::StoreLocal, tag);
+
+        std::vector<const MatchArm*> arms(statement.match_arms.size(), nullptr);
+        for (const auto& arm : statement.match_arms) {
+            assert(arm.case_index < arms.size());
+            arms[arm.case_index] = &arm;
+        }
+        std::vector<std::size_t> end_jumps;
+        bool any_falls = false;
+        for (std::size_t case_index = 0; case_index < arms.size(); ++case_index) {
+            assert(arms[case_index] != nullptr &&
+                   "type checker guarantees exhaustive unique match arms");
+            std::optional<std::size_t> next_case;
+            if (case_index + 1 < arms.size()) {
+                emit(OpCode::LoadLocal, tag);
+                emit(OpCode::ConstantI64,
+                     static_cast<std::int64_t>(case_index + 1));
+                emit(OpCode::LessI64, 0);
+                next_case = emit(OpCode::JumpIfFalse, -1);
+            }
+            const auto& arm = *arms[case_index];
+            const auto enclosing_variant_case = active_variant_case_;
+            active_variant_case_ = std::pair{
+                statement.match_variant_layout_index, case_index};
+            for (std::size_t field_index = 0;
+                 field_index < arm.bindings.size(); ++field_index) {
+                emit(OpCode::LoadLocal, subject);
+                emit_guarded_variant_get(statement.match_variant_layout_index,
+                                         case_index, field_index);
+                emit(OpCode::StoreLocal, arm.bindings[field_index].local_index);
+            }
+            const bool falls = compile_block(arm.body);
+            active_variant_case_.reset();
+            active_variant_case_ = enclosing_variant_case;
+            any_falls = any_falls || falls;
+            if (falls && case_index + 1 < arms.size()) {
+                end_jumps.push_back(emit(OpCode::Jump, -1));
+            }
+            if (next_case.has_value()) {
+                patch(*next_case, pc());
+            }
+        }
+        const auto end = pc();
+        for (const auto jump : end_jumps) {
+            patch(jump, end);
+        }
+        return any_falls;
     }
 
     bool compile_while(const Statement& statement) {
@@ -776,6 +877,14 @@ private:
             }
             emit(OpCode::AllocRecord,
                  static_cast<std::int64_t>(expression.record_layout_index));
+            break;
+        case Expr::Kind::VariantLiteral:
+            for (const auto& argument : expression.arguments) {
+                compile_expr(*argument);
+            }
+            emit(OpCode::AllocVariant,
+                 static_cast<std::int64_t>(expression.variant_layout_index),
+                 static_cast<std::int64_t>(expression.variant_case_index));
             break;
         case Expr::Kind::ArrayLiteral:
             compile_array_literal(expression);
@@ -1076,6 +1185,7 @@ private:
 
     Function function_;
     std::vector<LoopPatchContext*> loop_contexts_;
+    std::optional<std::pair<std::size_t, std::size_t>> active_variant_case_;
     std::vector<std::string>& string_constants_;
     std::vector<MapLayout>& map_layouts_;
 };
@@ -1114,6 +1224,36 @@ CompileModuleResult compile_checked_program(const Program& program,
             layout.field_types.push_back(std::move(signature));
         }
         module.record_layouts.push_back(std::move(layout));
+    }
+    module.variant_layouts.reserve(program.variants.size());
+    for (const auto& declaration : program.variants) {
+        assert(declaration.layout_index == module.variant_layouts.size() &&
+               "variant layouts must preserve declaration order");
+        VariantLayout layout;
+        layout.name = declaration.name;
+        layout.cases.reserve(declaration.cases.size());
+        for (const auto& source_case : declaration.cases) {
+            VariantCaseLayout emitted_case;
+            emitted_case.name = source_case.name;
+            emitted_case.field_types.reserve(source_case.fields.size());
+            emitted_case.reference_map.reserve(source_case.fields.size());
+            for (const auto& field : source_case.fields) {
+                auto signature = signature_value_from_type(field);
+                const bool type_checker_classifies_reference =
+                    field.kind != TypeSpec::Kind::Int64 &&
+                    field.kind != TypeSpec::Kind::Bool;
+                const bool emitted_signature_is_reference =
+                    signature_value_is_reference(signature);
+                assert(type_checker_classifies_reference ==
+                           emitted_signature_is_reference &&
+                       "compile boundary variant bitmap disagrees with type classification");
+                emitted_case.reference_map.push_back(
+                    type_checker_classifies_reference);
+                emitted_case.field_types.push_back(std::move(signature));
+            }
+            layout.cases.push_back(std::move(emitted_case));
+        }
+        module.variant_layouts.push_back(std::move(layout));
     }
     module.functions.reserve(program.functions.size() + program.lambdas.size() + 1);
     module.closure_layouts.reserve(program.functions.size() +

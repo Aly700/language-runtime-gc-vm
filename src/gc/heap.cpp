@@ -72,6 +72,8 @@ std::size_t storage_slot_count(const Object& object) {
         return 1;
     case ObjectKind::Record:
         return 1 + static_cast<std::size_t>(object.length);
+    case ObjectKind::Variant:
+        return 2 + static_cast<std::size_t>(object.length);
     }
     throw std::logic_error("unknown object kind");
 }
@@ -81,6 +83,12 @@ void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = null
         (!object.record_fields.empty() || !object.record_ref_map.empty())) {
         throw std::logic_error(
             "non-record descriptor contains collector-visible record payload");
+    }
+    if (object.kind != ObjectKind::Variant &&
+        (!object.variant_fields.empty() ||
+         !object.variant_case_ref_maps.empty())) {
+        throw std::logic_error(
+            "non-variant descriptor contains collector-visible variant payload");
     }
     if (metrics != nullptr) {
         if (object.kind == ObjectKind::Closure) {
@@ -234,6 +242,41 @@ void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = null
             }
         }
         return;
+    case ObjectKind::Variant: {
+        if (static_cast<std::size_t>(object.variant_case_index) >=
+            object.variant_case_ref_maps.size()) {
+            throw std::logic_error("variant case tag out of range");
+        }
+        const auto& selected_ref_map =
+            object.variant_case_ref_maps[object.variant_case_index];
+        if (selected_ref_map.size() != object.variant_fields.size() ||
+            object.variant_fields.size() != object.length) {
+            throw std::logic_error(
+                "variant payload width does not match selected case");
+        }
+        if (!object.scalar_elements.empty() || !object.ref_elements.empty() ||
+            !object.string_bytes.empty() || !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty() || !object.map_entries.empty() ||
+            object.left.tag() != Value::Tag::Nil ||
+            object.right.tag() != Value::Tag::Nil ||
+            object.weak_target().tag() != Value::Tag::Nil) {
+            throw std::logic_error(
+                "variant descriptor length does not match selected case payload");
+        }
+        for (std::size_t i = 0; i < object.variant_fields.size(); ++i) {
+            const auto tag = object.variant_fields[i].tag();
+            if (selected_ref_map[i]) {
+                if (tag != Value::Tag::Object && tag != Value::Tag::Nil) {
+                    throw std::logic_error(
+                        "variant reference bitmap marks a scalar payload as a reference");
+                }
+            } else if (tag != Value::Tag::Int64 && tag != Value::Tag::Bool) {
+                throw std::logic_error(
+                    "variant reference bitmap marks a reference payload as scalar");
+            }
+        }
+        return;
+    }
     }
     throw std::logic_error("unknown object kind");
 }
@@ -294,6 +337,16 @@ void visit_reference_fields(Object& object, Fn&& fn,
             }
         }
         return;
+    case ObjectKind::Variant: {
+        const auto& selected_ref_map =
+            object.variant_case_ref_maps[object.variant_case_index];
+        for (std::size_t i = 0; i < object.variant_fields.size(); ++i) {
+            if (selected_ref_map[i]) {
+                fn(object.variant_fields[i]);
+            }
+        }
+        return;
+    }
     }
     throw std::logic_error("unknown object kind");
 }
@@ -348,6 +401,16 @@ void visit_reference_fields(const Object& object, Fn&& fn,
             }
         }
         return;
+    case ObjectKind::Variant: {
+        const auto& selected_ref_map =
+            object.variant_case_ref_maps[object.variant_case_index];
+        for (std::size_t i = 0; i < object.variant_fields.size(); ++i) {
+            if (selected_ref_map[i]) {
+                fn(object.variant_fields[i]);
+            }
+        }
+        return;
+    }
     }
     throw std::logic_error("unknown object kind");
 }
@@ -407,6 +470,16 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn,
             }
         }
         return;
+    case ObjectKind::Variant: {
+        const auto& selected_ref_map =
+            object.variant_case_ref_maps[object.variant_case_index];
+        for (std::size_t i = object.variant_fields.size(); i > 0; --i) {
+            if (selected_ref_map[i - 1]) {
+                fn(object.variant_fields[i - 1]);
+            }
+        }
+        return;
+    }
     }
     throw std::logic_error("unknown object kind");
 }
@@ -530,6 +603,40 @@ Object Object::record(std::size_t layout_index, std::vector<Value> fields,
     object.record_layout_index = static_cast<std::uint32_t>(layout_index);
     object.record_fields = std::move(fields);
     object.record_ref_map = std::move(ref_map);
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object Object::variant(
+    std::size_t layout_index, std::size_t case_index,
+    std::vector<Value> fields,
+    std::vector<std::vector<bool>> case_ref_maps) {
+    if (case_index >= case_ref_maps.size()) {
+        throw std::logic_error("variant case tag out of range");
+    }
+    if (case_ref_maps[case_index].size() != fields.size()) {
+        throw std::logic_error(
+            "variant payload width does not match selected case");
+    }
+    if (fields.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("variant field count exceeds object header limit");
+    }
+    if (layout_index > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("variant layout index exceeds object header limit");
+    }
+    if (case_index > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("variant case tag exceeds object header limit");
+    }
+
+    Object object;
+    object.kind = ObjectKind::Variant;
+    object.length = static_cast<std::uint32_t>(fields.size());
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.variant_layout_index = static_cast<std::uint32_t>(layout_index);
+    object.variant_case_index = static_cast<std::uint32_t>(case_index);
+    object.variant_fields = std::move(fields);
+    object.variant_case_ref_maps = std::move(case_ref_maps);
     validate_descriptor_shape(object);
     return object;
 }
@@ -885,6 +992,33 @@ ObjectId Heap::allocate_record(std::size_t layout_index,
     return id;
 }
 
+ObjectId Heap::allocate_variant(
+    std::size_t layout_index, std::size_t case_index,
+    std::vector<Value> fields,
+    std::vector<std::vector<bool>> case_ref_maps) {
+    (void)Object::variant(layout_index, case_index, fields, case_ref_maps);
+
+    if (stress_config_.collect_before_every_allocation) {
+        std::vector<Value*> initializer_roots;
+        initializer_roots.reserve(fields.size());
+        for (auto& field : fields) {
+            initializer_roots.push_back(&field);
+        }
+        collect_with_extra_roots(initializer_roots);
+    }
+
+    auto id = allocate_object(Object::variant(
+        layout_index, case_index, std::move(fields),
+        std::move(case_ref_maps)));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+    return id;
+}
+
 Handle Heap::make_handle(Value value) {
     if (value.is_object()) {
         (void)checked_slot(value.as_object());
@@ -1123,6 +1257,15 @@ Object& Heap::checked_record(ObjectId id) {
     auto& object = *objects_[checked_slot(id)];
     if (object.kind != ObjectKind::Record) {
         throw std::logic_error("object is not a record");
+    }
+    validate_descriptor_shape(object, &metrics_);
+    return object;
+}
+
+const Object& Heap::checked_variant(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Variant) {
+        throw std::logic_error("object is not a variant");
     }
     validate_descriptor_shape(object, &metrics_);
     return object;
@@ -1369,6 +1512,26 @@ Value Heap::record_get(ObjectId id, std::size_t index) const {
 
 void Heap::record_set(ObjectId id, std::size_t index, Value value) {
     store_record_field(id, index, value);
+}
+
+std::size_t Heap::variant_layout_index(ObjectId id) const {
+    return checked_variant(id).variant_layout_index;
+}
+
+std::size_t Heap::variant_tag(ObjectId id) const {
+    return checked_variant(id).variant_case_index;
+}
+
+std::size_t Heap::variant_field_count(ObjectId id) const {
+    return checked_variant(id).variant_fields.size();
+}
+
+Value Heap::variant_get(ObjectId id, std::size_t index) const {
+    const auto& variant = checked_variant(id);
+    if (index >= variant.variant_fields.size()) {
+        throw std::out_of_range("variant field index out of bounds");
+    }
+    return variant.variant_fields[index];
 }
 
 void Heap::map_set(ObjectId id, Value key, Value value) {
@@ -1858,6 +2021,10 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
             // Record accounting is intentionally not appended to the public benchmark
             // counter stream; legacy workloads must remain byte-identical.
             break;
+        case ObjectKind::Variant:
+            // Variant accounting is likewise omitted from the legacy public counter
+            // stream while its exact descriptor width still advances the cursor.
+            break;
         }
         if (next_live_slot + required_slots > result.objects.size()) {
             throw std::logic_error("compaction cursor exceeded heap storage capacity");
@@ -2188,6 +2355,10 @@ bool Heap::TEST_ONLY_is_weak_ref(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_record(ObjectId id) const {
     return object(id).kind == ObjectKind::Record;
+}
+
+bool Heap::TEST_ONLY_is_variant(ObjectId id) const {
+    return object(id).kind == ObjectKind::Variant;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {

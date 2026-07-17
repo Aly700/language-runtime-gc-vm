@@ -39,6 +39,11 @@
   types, receiver identity and non-nil state, and stored-value type. Record signatures
   retain exact nominal layout identity through calls, containers, captures, and recursive
   fields, and their stack/local slots carry exact reference bits.
+- `AllocVariant`, `VariantTag`, and `VariantGet` may execute only after the verifier has
+  proved exact nominal layout identity, case and field bounds, selected-case payload
+  types, receiver non-nil state, and scalar/reference stack maps. `VariantGet` also checks
+  the runtime raw tag and traps with `variant case tag mismatch` rather than trusting the
+  statically expected case.
 - VM observable behavior must not depend on host pointer addresses.
 - The VM output buffer is execution-local copied byte state, never a heap root. Its
   contents are a pure function of the verified module and its inputs and must be
@@ -101,6 +106,10 @@
   opaque even when their payload bits equal a live, dead, stale, or forwarded `ObjectId`.
   Shape validation requires the field count and bitmap length to agree and every slot tag
   to match its static reference bit; reference fields may carry `Object` or `Nil`.
+- `Variant` payloads are immutable active-case tagged slots. Each heap variant retains its
+  validated nominal layout index, raw case tag, active fields, and a full copied per-case
+  bitmap table. Its descriptor validates the tag and selected width, then visits only true
+  bits in the selected case; inactive cases and scalar active fields expose no edges.
 - Object IDs name object base slots only. Payload/reserved storage slots are never valid
   object headers, and variable-size compaction must advance by the descriptor storage
   width without allowing overlapping live objects.
@@ -134,9 +143,13 @@
   storage-layout validation, compaction cursors, and forwarding all derive the same width
   from the retained layout payload and assert that it does not change during collection.
   Field mutation may replace a slot but can never add, remove, or reorder one.
-- Closure captures have no post-construction store path and therefore no mutator barrier.
-  If collector promotion creates an old closure with a mapped young capture, or an old
-  record with a mapped young field, the generic descriptor-driven promotion path itself
+- A variant's logical storage width is exactly `2 + active_field_count`: header, raw tag,
+  and selected payload. Allocation, storage validation, compaction, and forwarding derive
+  that same case-dependent width. Payloads have no post-construction mutation path.
+- Closure captures and variant payloads have no post-construction store path and therefore
+  no mutator barrier. If collector promotion creates an old closure, variant, or record
+  with a descriptor-selected young edge, the generic descriptor-driven promotion path
+  itself
   must insert the owner into the remembered set before collection-boundary validation.
   This GC-internal insertion must be exact, deterministic, and must not count as a mutator
   write-barrier hit. Record mutator-created edges still require the ordinary store funnel.
@@ -159,6 +172,10 @@
 - At the compile boundary, `i64` and `bool` record fields must emit scalar bitmap bits and
   every other field must emit reference bits. The compiler asserts that this emitted
   bitmap exactly matches the type checker's classification before module verification.
+- Top-level variants introduce nominal nullable types in the same declaration namespace.
+  Constructors are non-nil; exhaustive matches require a refined non-nil scrutinee, cover
+  every case exactly once, and expose immutable arm-local bindings. Per-case bitmap bits
+  use the same `i64`/`bool` scalar and all-other-types reference rule.
 - Structural `fn(T1, ..., Tn) -> R` types must survive the compile boundary in locals,
   parameters, returns, pair fields, record fields, and reference-array elements. Lambda
   captures are immutable creation-time snapshots in deterministic first-use order; later

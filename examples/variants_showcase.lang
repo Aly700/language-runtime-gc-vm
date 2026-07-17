@@ -1,0 +1,37 @@
+variant Tree {
+  Empty(),
+  Leaf(i64, str),
+  Branch(str, Tree, Tree, bool)
+}
+
+fn score(tree: Tree) -> i64 {
+  let result: i64 = 0;
+  if is_nil(tree) {
+    result = 0;
+  } else {
+    match tree {
+      Empty => { result = 0; },
+      Leaf(value, label) => {
+        print(label + "=" + to_str(value));
+        result = value;
+      },
+      Branch(label, first, second, marked) => {
+        print("branch=" + label);
+        if marked {
+          result = score(first) + score(second) + 1;
+        } else {
+          result = score(first) + score(second);
+        }
+      }
+    }
+  }
+  result
+}
+
+let empty: Tree = Tree.Empty();
+let first: Tree = Tree.Leaf(20, "left");
+let second: Tree = Tree.Leaf(22, "right");
+let root: Tree = Tree.Branch("root", first, second, true);
+let total: i64 = score(root);
+print("total=" + to_str(total));
+total

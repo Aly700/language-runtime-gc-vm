@@ -139,6 +139,12 @@ const char* op_name(lang::OpCode op) {
         return "RecordGet";
     case lang::OpCode::RecordSet:
         return "RecordSet";
+    case lang::OpCode::AllocVariant:
+        return "AllocVariant";
+    case lang::OpCode::VariantTag:
+        return "VariantTag";
+    case lang::OpCode::VariantGet:
+        return "VariantGet";
     }
     return "<unknown>";
 }
@@ -165,6 +171,8 @@ const char* value_kind_name(lang::ValueKind kind) {
         return "weak";
     case lang::ValueKind::Record:
         return "record";
+    case lang::ValueKind::Variant:
+        return "variant";
     }
     return "<unknown>";
 }
@@ -275,6 +283,7 @@ Kind kind_from_value_kind(lang::ValueKind kind) {
     case lang::ValueKind::Map:
     case lang::ValueKind::Weak:
     case lang::ValueKind::Record:
+    case lang::ValueKind::Variant:
         break;
     }
     throw std::logic_error("fuzzer generator does not emit nil values");

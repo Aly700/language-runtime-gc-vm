@@ -30,6 +30,8 @@ const char* type_name(Type type) {
         return "weak";
     case Type::Record:
         return "record";
+    case Type::Variant:
+        return "variant";
     case Type::Invalid:
         return "invalid";
     }

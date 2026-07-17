@@ -249,6 +249,20 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             }
             rendered << "])";
             break;
+        case lang::gc::ObjectKind::Variant:
+            rendered << "variant(layout="
+                     << heap.variant_layout_index(order[i]) << ", case="
+                     << heap.variant_tag(order[i]) << ", fields=[";
+            for (std::size_t field = 0;
+                 field < heap.variant_field_count(order[i]); ++field) {
+                if (field != 0) {
+                    rendered << ", ";
+                }
+                rendered << value_token(
+                    heap, heap.variant_get(order[i], field), indexes, order);
+            }
+            rendered << "])";
+            break;
         }
         objects.push_back(rendered.str());
     }

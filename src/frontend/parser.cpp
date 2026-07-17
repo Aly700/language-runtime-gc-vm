@@ -40,6 +40,16 @@ TypeSpec record_type(std::string name, std::size_t layout_index,
     return type;
 }
 
+TypeSpec variant_type(std::string name, std::size_t layout_index,
+                      SourcePosition position) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Variant;
+    type.name = std::move(name);
+    type.position = position;
+    type.variant_layout_index = layout_index;
+    return type;
+}
+
 TypeSpec pair_type(TypeSpec left, TypeSpec right) {
     TypeSpec type;
     type.kind = TypeSpec::Kind::Pair;
@@ -92,6 +102,13 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
         if (lhs.record_layout_index.has_value() &&
             rhs.record_layout_index.has_value()) {
             return lhs.record_layout_index == rhs.record_layout_index;
+        }
+        return lhs.name == rhs.name;
+    }
+    if (lhs.kind == TypeSpec::Kind::Variant) {
+        if (lhs.variant_layout_index.has_value() &&
+            rhs.variant_layout_index.has_value()) {
+            return lhs.variant_layout_index == rhs.variant_layout_index;
         }
         return lhs.name == rhs.name;
     }
@@ -170,6 +187,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Pair;
     case TypeSpec::Kind::Record:
         return Type::Record;
+    case TypeSpec::Kind::Variant:
+        return Type::Variant;
     case TypeSpec::Kind::Nil:
         return Type::Invalid;
     case TypeSpec::Kind::Invalid:
@@ -224,6 +243,8 @@ std::string type_name(const TypeSpec& type) {
         return type.name;
     case TypeSpec::Kind::Record:
         return type.name;
+    case TypeSpec::Kind::Variant:
+        return type.name;
     case TypeSpec::Kind::Nil:
         return "nil";
     case TypeSpec::Kind::Invalid:
@@ -243,11 +264,13 @@ TypeSpec join_types(const TypeSpec& lhs, const TypeSpec& rhs) {
         return lhs;
     }
     if (lhs.kind == TypeSpec::Kind::Nil &&
-        (is_pair(rhs) || rhs.kind == TypeSpec::Kind::Record)) {
+        (is_pair(rhs) || rhs.kind == TypeSpec::Kind::Record ||
+         rhs.kind == TypeSpec::Kind::Variant)) {
         return rhs;
     }
     if (rhs.kind == TypeSpec::Kind::Nil &&
-        (is_pair(lhs) || lhs.kind == TypeSpec::Kind::Record)) {
+        (is_pair(lhs) || lhs.kind == TypeSpec::Kind::Record ||
+         lhs.kind == TypeSpec::Kind::Variant)) {
         return lhs;
     }
     if (lhs.kind == TypeSpec::Kind::Array && rhs.kind == TypeSpec::Kind::Array &&
@@ -269,6 +292,7 @@ public:
     std::optional<Program> parse() {
         Program program;
         while (check(TokenKind::Type) || check(TokenKind::Record) ||
+               check(TokenKind::Variant) ||
                (check(TokenKind::Fn) && check_next(TokenKind::Identifier))) {
             if (match(TokenKind::Type)) {
                 auto declaration = parse_type_declaration(previous());
@@ -281,6 +305,13 @@ public:
                 auto declaration = parse_record_declaration(previous());
                 if (declaration.has_value()) {
                     program.records.push_back(std::move(*declaration));
+                } else {
+                    synchronize();
+                }
+            } else if (match(TokenKind::Variant)) {
+                auto declaration = parse_variant_declaration(previous());
+                if (declaration.has_value()) {
+                    program.variants.push_back(std::move(*declaration));
                 } else {
                     synchronize();
                 }
@@ -432,6 +463,42 @@ private:
         return declaration;
     }
 
+    std::optional<VariantDecl> parse_variant_declaration(
+        const Token& variant_token) {
+        VariantDecl declaration;
+        declaration.position = variant_token.position;
+        const auto name = expect(TokenKind::Identifier,
+                                 "expected variant name after 'variant'");
+        if (name.has_value()) {
+            declaration.name = name->text;
+            declaration.position = name->position;
+        }
+        expect(TokenKind::LBrace, "expected '{' before variant cases");
+        if (!check(TokenKind::RBrace)) {
+            do {
+                VariantCaseDecl variant_case;
+                const auto case_name =
+                    expect(TokenKind::Identifier, "expected variant case name");
+                if (case_name.has_value()) {
+                    variant_case.name = case_name->text;
+                    variant_case.position = case_name->position;
+                }
+                expect(TokenKind::LParen,
+                       "expected '(' after variant case name");
+                if (!check(TokenKind::RParen)) {
+                    do {
+                        variant_case.fields.push_back(parse_type());
+                    } while (match(TokenKind::Comma));
+                }
+                expect(TokenKind::RParen,
+                       "expected ')' after variant case payload");
+                declaration.cases.push_back(std::move(variant_case));
+            } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
+        }
+        expect(TokenKind::RBrace, "expected '}' after variant cases");
+        return declaration;
+    }
+
     std::optional<FunctionDecl> parse_function(const Token& fn_token) {
         FunctionDecl declaration;
         declaration.position = fn_token.position;
@@ -485,7 +552,8 @@ private:
 
     [[nodiscard]] bool starts_statement() const {
         if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While) ||
-            check(TokenKind::For) || check(TokenKind::Break) ||
+            check(TokenKind::For) || check(TokenKind::Match) ||
+            check(TokenKind::Break) ||
             check(TokenKind::Continue) || check(TokenKind::Print)) {
             return true;
         }
@@ -535,6 +603,9 @@ private:
         }
         if (match(TokenKind::For)) {
             return parse_for_in(previous());
+        }
+        if (match(TokenKind::Match)) {
+            return parse_match(previous());
         }
         if (match(TokenKind::Break)) {
             return parse_loop_control(previous(), Statement::Kind::Break,
@@ -730,6 +801,51 @@ private:
         statement.value = parse_expression();
         expect(TokenKind::RParen, "expected ')' after print operand");
         expect(TokenKind::Semicolon, "expected ';' after print statement");
+        return statement;
+    }
+
+    std::optional<Statement> parse_match(const Token& match_token) {
+        Statement statement;
+        statement.kind = Statement::Kind::Match;
+        statement.position = match_token.position;
+        const bool previous_record_literal_mode = allow_record_literal_;
+        allow_record_literal_ = false;
+        statement.condition = parse_expression();
+        allow_record_literal_ = previous_record_literal_mode;
+        if (!expect(TokenKind::LBrace, "expected '{' before match arms").has_value()) {
+            return statement;
+        }
+        while (!check(TokenKind::RBrace) && !check(TokenKind::End)) {
+            MatchArm arm;
+            const auto case_name = expect(TokenKind::Identifier,
+                                          "expected variant case name in match arm");
+            if (case_name.has_value()) {
+                arm.case_name = case_name->text;
+                arm.position = case_name->position;
+            }
+            if (match(TokenKind::LParen)) {
+                if (!check(TokenKind::RParen)) {
+                    do {
+                        const auto binding =
+                            expect_field_name("expected match binding name");
+                        if (binding.has_value()) {
+                            arm.bindings.push_back(MatchBinding{
+                                binding->text, binding->position, 0});
+                        }
+                    } while (match(TokenKind::Comma));
+                }
+                expect(TokenKind::RParen, "expected ')' after match bindings");
+            }
+            expect(TokenKind::FatArrow, "expected '=>' after match arm pattern");
+            arm.body = parse_block("expected '{' before match arm body");
+            statement.match_arms.push_back(std::move(arm));
+            if (!match(TokenKind::Comma) && !check(TokenKind::RBrace)) {
+                add_diagnostic(diagnostics_, peek().position,
+                               "expected ',' between match arms");
+                synchronize();
+            }
+        }
+        expect(TokenKind::RBrace, "expected '}' after match arms");
         return statement;
     }
 
@@ -1057,9 +1173,11 @@ private:
                        : "expected ')' after to_i64 operand");
             return node;
         }
-        if (match(TokenKind::Identifier)) {
+        if (match(TokenKind::Identifier) || match(TokenKind::Left) ||
+            match(TokenKind::Right)) {
             const auto identifier = previous();
-            if (looks_like_record_literal(identifier) &&
+            if (identifier.kind == TokenKind::Identifier &&
+                allow_record_literal_ && looks_like_record_literal(identifier) &&
                 match(TokenKind::LBrace)) {
                 auto node = std::make_unique<Expr>();
                 node->kind = Expr::Kind::RecordLiteral;
@@ -1164,6 +1282,7 @@ private:
                 return;
             }
             if (check(TokenKind::Type) || check(TokenKind::Record) ||
+                check(TokenKind::Variant) ||
                 check(TokenKind::Fn) ||
                 check(TokenKind::Let) || check(TokenKind::If) ||
                 check(TokenKind::While) || check(TokenKind::For) ||
@@ -1179,6 +1298,7 @@ private:
     std::size_t next_pair_site_{0};
     std::set<std::string> record_names_;
     std::vector<std::shared_ptr<LambdaExpr>> lambdas_;
+    bool allow_record_literal_{true};
     std::vector<Diagnostic> diagnostics_;
 };
 

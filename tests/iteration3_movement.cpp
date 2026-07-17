@@ -117,6 +117,12 @@ const char* op_name(lang::OpCode op) {
         return "RecordGet";
     case lang::OpCode::RecordSet:
         return "RecordSet";
+    case lang::OpCode::AllocVariant:
+        return "AllocVariant";
+    case lang::OpCode::VariantTag:
+        return "VariantTag";
+    case lang::OpCode::VariantGet:
+        return "VariantGet";
     }
     return "<unknown>";
 }
