@@ -1,10 +1,11 @@
 # Architecture — Language Runtime
 
-Iteration 36 adds collector-level ephemerons. Their descriptors expose no strong fields;
-after ordinary marking, a strict slot-ordered registry repeatedly activates conditional
-values whose weak keys are independently live. Descriptor draining between passes permits
-activated values to make later keys live. The finite monotone mark set guarantees
-termination, and compaction forwards active entries or clears inactive ones.
+Iteration 37 completes Wave 3 with deterministic incremental major marking. Integer
+budgets consume complete descriptor scans at VM instruction boundaries; insertion
+barriers preserve no-black-to-white, allocation shades new objects, and a final atomic
+remark makes liveness identical to stop-the-world marking. Ephemeron fixpoint, weak
+clearing, and movement remain in the final stop-the-world phase. See
+[ADR-0014](adr/0014-incremental-marking.md).
 
 ## Pipeline
 
@@ -340,6 +341,10 @@ control remains deferred.
   instructions. Every stress collection runs the same post-collection reference validation
   as explicit collections. No stress trigger depends on wall-clock time, randomness,
   threads, or host addresses.
+- Incremental stress adds cyclic positive object-scan budgets. `incremental_1` and
+  `incremental_3_1` run independently, while `combined` composes budgets with allocation,
+  atomic major/minor, and barrier triggers. Map-growth movement forwards the grey list;
+  VM execution finishes an active cycle before returning.
 - Differential fuzz outcomes retain both the canonical return value/heap graph and the
   exact output bytes. Every schedule comparison checks both fields. Iteration 29 owns a
   separate pinned `output` grammar so the eleven legacy generators and corpus dumps remain

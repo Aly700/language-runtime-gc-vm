@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     const auto schedules = fuzz::schedules();
-    if (schedules.size() != 10) throw std::runtime_error("expected ten schedules");
+    if (schedules.size() != 12) throw std::runtime_error("expected twelve schedules");
     for (std::uint64_t seed = 1; seed <= kSeeds; ++seed) {
         const auto module = compile(seed);
         const auto baseline = fuzz::execute_once(module, schedules.front());

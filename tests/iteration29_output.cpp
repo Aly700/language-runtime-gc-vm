@@ -548,8 +548,8 @@ pair(rendered, table)
 
 void output_grammar_checks_both_oracles_and_mutants() {
     const auto all_schedules = fuzz::schedules();
-    require(all_schedules.size() == 10,
-            "output grammar requires exactly ten shared schedules");
+    require(all_schedules.size() == 12,
+            "output grammar requires exactly twelve shared schedules");
     for (std::uint64_t seed = kOutputCorpusFirstSeed;
          seed < kOutputCorpusFirstSeed + kOutputCorpusSize; ++seed) {
         for (const auto& schedule : all_schedules) {
