@@ -102,6 +102,9 @@ void VM::trace_roots(gc::RootVisitor& visitor) {
             visitor.visit(*frame.closure);
         }
     }
+    if (pending_exception_.has_value()) {
+        visitor.visit(*pending_exception_);
+    }
 }
 
 void VM::assert_stack_matches_map(const ModuleVerificationResult& verification,
@@ -248,6 +251,7 @@ Value VM::execute(const VerifiedModule& module) {
 Value VM::execute_verified(const Module& module,
                            const ModuleVerificationResult& verification) {
     frames_.clear();
+    pending_exception_.reset();
     instructions_executed_ = 0;
     push_frame(module, module.entry_function, {});
 
@@ -634,6 +638,57 @@ Value VM::execute_verified(const Module& module,
                             object,
                             static_cast<std::size_t>(ins.operand3)));
             ++frame.pc;
+            break;
+        }
+        case OpCode::TryBegin:
+        case OpCode::TryEnd:
+            ++frame.pc;
+            break;
+        case OpCode::Throw: {
+            pending_exception_ = pop(frame);
+            assert(pending_exception_->is_object() &&
+                   heap_.TEST_ONLY_is_variant(pending_exception_->as_object()) &&
+                   "verifier invariant violated: thrown value must be a variant");
+            bool initial = true;
+            bool handled = false;
+            while (!frames_.empty()) {
+                auto& unwind_frame = frames_.back();
+                const auto& unwind_function = module.functions[unwind_frame.function_index];
+                const auto site = initial ? unwind_frame.pc
+                                          : (unwind_frame.pc == 0 ? 0 : unwind_frame.pc - 1);
+                const auto layout = heap_.variant_layout_index(
+                    pending_exception_->as_object());
+                const ExceptionHandler* selected = nullptr;
+                for (const auto& handler : unwind_function.exception_handlers) {
+                    if (handler.try_begin < site && site < handler.try_end &&
+                        handler.variant_layout == layout &&
+                        (selected == nullptr || handler.try_begin > selected->try_begin)) {
+                        selected = &handler;
+                    }
+                }
+                if (selected != nullptr) {
+                    unwind_frame.stack.clear();
+                    unwind_frame.pc = selected->target;
+                    push(unwind_frame, *pending_exception_);
+                    pending_exception_.reset();
+                    handled = true;
+                    break;
+                }
+                if (gc_stress_.collect_every_n_instructions == 1) {
+                    heap_.collect();
+                }
+                frames_.pop_back();
+                initial = false;
+            }
+            if (!handled) {
+                const auto layout = heap_.variant_layout_index(
+                    pending_exception_->as_object());
+                const auto name = layout < module.variant_layouts.size()
+                                      ? module.variant_layouts[layout].name
+                                      : std::string("<invalid>");
+                pending_exception_.reset();
+                throw std::runtime_error("uncaught exception " + name);
+            }
             break;
         }
         case OpCode::AllocArray: {

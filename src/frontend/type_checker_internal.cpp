@@ -680,6 +680,9 @@ private:
         if (statement.kind == Statement::Kind::Let) {
             resolve_type(statement.declared_type);
         }
+        if (statement.kind == Statement::Kind::TryCatch) {
+            resolve_type(statement.catch_type);
+        }
         for (auto& inner : statement.then_branch) {
             resolve_statement_types(inner);
         }
@@ -693,6 +696,9 @@ private:
             for (auto& inner : arm.body) {
                 resolve_statement_types(inner);
             }
+        }
+        for (auto& inner : statement.catch_body) {
+            resolve_statement_types(inner);
         }
     }
 
@@ -972,6 +978,16 @@ private:
             return true;
         case Statement::Kind::Match:
             return check_match(statement, state);
+        case Statement::Kind::Throw: {
+            const auto value = check_expr(*statement.value, state);
+            if (value.type.kind != TypeSpec::Kind::Variant || value.includes_nil) {
+                diagnose(statement.position,
+                         "throw requires a proven non-nil variant value");
+            }
+            return false;
+        }
+        case Statement::Kind::TryCatch:
+            return check_try_catch(statement, state);
         case Statement::Kind::Break:
         case Statement::Kind::Continue:
             return check_loop_control(statement, state);
@@ -988,6 +1004,46 @@ private:
         }
         }
         return true;
+    }
+
+    bool check_try_catch(Statement& statement, FlowState& state) {
+        if (statement.catch_type.kind != TypeSpec::Kind::Variant) {
+            diagnose(statement.catch_type.position,
+                     "catch type must be a nominal variant");
+        }
+        auto try_state = state;
+        const bool try_falls = check_block(statement.body, try_state, false);
+        if (!statement.catch_local_allocated) {
+            statement.catch_local_index = static_cast<std::uint32_t>(
+                local_context_->prototypes.size());
+            local_context_->prototypes.push_back(LocalState{
+                hidden_match_local_name(statement.catch_local_index),
+                statement.catch_type, statement.catch_local_index, false,
+                value_from_type(statement.catch_type), statement.catch_position,
+                false, false});
+            statement.catch_local_allocated = true;
+        }
+        sync_locals(state);
+        sync_locals(try_state);
+        auto catch_state = state;
+        catch_state.locals[statement.catch_local_index].name = statement.catch_name;
+        catch_state.locals[statement.catch_local_index].initialized = true;
+        auto caught = value_from_type(statement.catch_type);
+        caught.includes_nil = false;
+        catch_state.locals[statement.catch_local_index].value = std::move(caught);
+        catch_state.locals[statement.catch_local_index].immutable_match_binding = true;
+        const bool catch_falls = check_block(statement.catch_body, catch_state, false);
+        sync_locals(catch_state);
+        catch_state.locals[statement.catch_local_index].name =
+            hidden_match_local_name(statement.catch_local_index);
+        catch_state.locals[statement.catch_local_index].initialized = false;
+        catch_state.locals[statement.catch_local_index].immutable_match_binding = false;
+        sync_locals(try_state);
+        sync_locals(catch_state);
+        if (try_falls && catch_falls) state = join_states(try_state, catch_state);
+        else if (try_falls) state = std::move(try_state);
+        else if (catch_falls) state = std::move(catch_state);
+        return try_falls || catch_falls;
     }
 
     bool check_block(std::vector<Statement>& statements, FlowState& state,

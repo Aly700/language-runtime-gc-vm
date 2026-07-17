@@ -186,6 +186,12 @@ const char* op_name(OpCode op) {
         return "VariantTag";
     case OpCode::VariantGet:
         return "VariantGet";
+    case OpCode::TryBegin:
+        return "TryBegin";
+    case OpCode::TryEnd:
+        return "TryEnd";
+    case OpCode::Throw:
+        return "Throw";
     }
     return "<invalid>";
 }
@@ -1541,6 +1547,28 @@ bool push_fallthrough_or_report(
     return true;
 }
 
+const ExceptionHandler* enclosing_handler(const Function& function,
+                                          std::size_t pc,
+                                          std::optional<std::size_t> layout = std::nullopt) {
+    const ExceptionHandler* selected = nullptr;
+    for (const auto& handler : function.exception_handlers) {
+        if (handler.try_begin < pc && pc < handler.try_end &&
+            (!layout.has_value() || handler.variant_layout == *layout) &&
+            (selected == nullptr || handler.try_begin > selected->try_begin)) {
+            selected = &handler;
+        }
+    }
+    return selected;
+}
+
+void add_exception_successor(const ExceptionHandler& handler,
+                             AbstractState state,
+                             std::vector<std::pair<std::size_t, AbstractState>>& successors) {
+    state.stack.clear();
+    state.stack.push_back(variant_value(handler.variant_layout, false));
+    successors.emplace_back(handler.target, std::move(state));
+}
+
 bool load_pair_field(const Module& module, const AbstractState& state,
                      const AbstractValue& receiver, bool left, AbstractValue& out) {
     if (receiver.includes_nil || receiver.includes_opaque_object) {
@@ -2457,6 +2485,45 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             pc, function, function_index, std::move(state), successors,
             diagnostics);
     }
+    case OpCode::TryBegin:
+        if (ins.operand < 0 || static_cast<std::size_t>(ins.operand) >=
+                                   function.exception_handlers.size() ||
+            function.exception_handlers[static_cast<std::size_t>(ins.operand)].try_begin != pc) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadExceptionHandler,
+                          instruction_message(function, pc, "invalid try-begin delimiter"));
+        }
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors, diagnostics);
+    case OpCode::TryEnd:
+        if (ins.operand < 0 || static_cast<std::size_t>(ins.operand) >=
+                                   function.exception_handlers.size() ||
+            function.exception_handlers[static_cast<std::size_t>(ins.operand)].try_end != pc) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadExceptionHandler,
+                          instruction_message(function, pc, "invalid try-end delimiter"));
+        }
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors, diagnostics);
+    case OpCode::Throw: {
+        AbstractValue thrown;
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow, "throw operand", &thrown)) {
+            return false;
+        }
+        if (thrown.kind != AbstractKind::Variant || thrown.includes_nil ||
+            !thrown.signature_variant_layout.has_value()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::ThrowRequiresVariant,
+                          instruction_message(function, pc,
+                                              "throw requires non-nil nominal variant"));
+        }
+        if (const auto* handler = enclosing_handler(
+                function, pc, thrown.signature_variant_layout)) {
+            add_exception_successor(*handler, std::move(state), successors);
+        }
+        return true;
+    }
     case OpCode::AllocArray:
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64, VerifierReason::StackUnderflow,
@@ -3105,6 +3172,37 @@ std::optional<VerificationResult> verify_function_with_stack_maps(
                VerifierReason::LocalCountMismatch, message.str());
         return std::nullopt;
     }
+    for (std::size_t i = 0; i < function.exception_handlers.size(); ++i) {
+        const auto& handler = function.exception_handlers[i];
+        const bool bounds = handler.try_begin < handler.try_end &&
+                            handler.try_end < function.code.size() &&
+                            handler.target < function.code.size() &&
+                            handler.target > handler.try_end &&
+                            handler.variant_layout < module.variant_layouts.size();
+        const bool delimiters = bounds &&
+            function.code[handler.try_begin].op == OpCode::TryBegin &&
+            function.code[handler.try_begin].operand == static_cast<std::int64_t>(i) &&
+            function.code[handler.try_end].op == OpCode::TryEnd &&
+            function.code[handler.try_end].operand == static_cast<std::int64_t>(i);
+        if (!delimiters) {
+            reject(diagnostics, function_index, std::nullopt,
+                   VerifierReason::BadExceptionHandler,
+                   "exception handler range, target, layout, or delimiters are malformed");
+            return std::nullopt;
+        }
+        for (std::size_t j = 0; j < i; ++j) {
+            const auto& other = function.exception_handlers[j];
+            const bool crossing = other.try_begin < handler.try_begin &&
+                                  handler.try_begin < other.try_end &&
+                                  other.try_end < handler.try_end;
+            if (crossing || other.target == handler.target) {
+                reject(diagnostics, function_index, std::nullopt,
+                       VerifierReason::BadExceptionHandler,
+                       "exception handlers must be properly nested with distinct targets");
+                return std::nullopt;
+            }
+        }
+    }
 
     std::vector<std::optional<AbstractState>> states(function.code.size());
     std::deque<std::size_t> worklist;
@@ -3130,6 +3228,17 @@ std::optional<VerificationResult> verify_function_with_stack_maps(
         if (!transfer_instruction(module, function_index, pc, *states[pc], successors,
                                   diagnostics)) {
             return std::nullopt;
+        }
+        const auto op = function.code[pc].op;
+        if (op == OpCode::TryBegin) {
+            const auto index = static_cast<std::size_t>(function.code[pc].operand);
+            add_exception_successor(function.exception_handlers[index],
+                                    *states[pc], successors);
+        }
+        if (op == OpCode::Call || op == OpCode::CallClosure) {
+            if (const auto* handler = enclosing_handler(function, pc)) {
+                add_exception_successor(*handler, *states[pc], successors);
+            }
         }
 
         for (auto& [target, state] : successors) {
@@ -3332,6 +3441,10 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "VariantLayoutMismatch";
     case VerifierReason::VariantReceiverMayBeNil:
         return "VariantReceiverMayBeNil";
+    case VerifierReason::BadExceptionHandler:
+        return "BadExceptionHandler";
+    case VerifierReason::ThrowRequiresVariant:
+        return "ThrowRequiresVariant";
     }
     return "<unknown>";
 }

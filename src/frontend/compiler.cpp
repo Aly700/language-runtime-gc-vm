@@ -157,6 +157,16 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
             falls_through = arm_falls;
             break;
         }
+        case Statement::Kind::TryCatch: {
+            const auto try_flow = block_fallthrough_and_current_break(statement.body);
+            const auto catch_flow = block_fallthrough_and_current_break(statement.catch_body);
+            has_break = has_break || try_flow.second || catch_flow.second;
+            falls_through = try_flow.first || catch_flow.first;
+            break;
+        }
+        case Statement::Kind::Throw:
+            falls_through = false;
+            break;
         case Statement::Kind::Let:
         case Statement::Kind::Assign:
         case Statement::Kind::While:
@@ -264,6 +274,14 @@ bool add_statement_array_counts(const Statement& statement,
         }
         return falls;
     }
+    case Statement::Kind::TryCatch: {
+        const bool try_falls = add_block_array_counts(statement.body, counts);
+        const bool catch_falls = add_block_array_counts(statement.catch_body, counts);
+        return try_falls || catch_falls;
+    }
+    case Statement::Kind::Throw:
+        add_expr_array_counts(*statement.value, counts);
+        return false;
     case Statement::Kind::Break:
     case Statement::Kind::Continue:
         return false;
@@ -549,6 +567,12 @@ private:
             return true;
         case Statement::Kind::Match:
             return compile_match(statement);
+        case Statement::Kind::Throw:
+            compile_expr(*statement.value);
+            emit(OpCode::Throw, 0);
+            return false;
+        case Statement::Kind::TryCatch:
+            return compile_try_catch(statement);
         case Statement::Kind::Break:
         case Statement::Kind::Continue: {
             assert(!loop_contexts_.empty() &&
@@ -676,6 +700,26 @@ private:
             patch(jump, end);
         }
         return any_falls;
+    }
+
+    bool compile_try_catch(const Statement& statement) {
+        const auto handler_index = function_.exception_handlers.size();
+        function_.exception_handlers.push_back(ExceptionHandler{});
+        const auto begin = emit(OpCode::TryBegin,
+                                static_cast<std::int64_t>(handler_index));
+        const bool try_falls = compile_block(statement.body);
+        const auto end = emit(OpCode::TryEnd,
+                              static_cast<std::int64_t>(handler_index));
+        const auto skip = try_falls
+                              ? std::optional<std::size_t>(emit(OpCode::Jump, -1))
+                              : std::nullopt;
+        const auto target = pc();
+        emit(OpCode::StoreLocal, statement.catch_local_index);
+        const bool catch_falls = compile_block(statement.catch_body);
+        if (skip.has_value()) patch(*skip, pc());
+        function_.exception_handlers[handler_index] = ExceptionHandler{
+            begin, end, target, *statement.catch_type.variant_layout_index};
+        return try_falls || catch_falls;
     }
 
     bool compile_while(const Statement& statement) {

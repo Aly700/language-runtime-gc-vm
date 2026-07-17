@@ -552,7 +552,8 @@ private:
 
     [[nodiscard]] bool starts_statement() const {
         if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While) ||
-            check(TokenKind::For) || check(TokenKind::Match) ||
+            check(TokenKind::For) || check(TokenKind::Match) || check(TokenKind::Try) ||
+            check(TokenKind::Throw) ||
             check(TokenKind::Break) ||
             check(TokenKind::Continue) || check(TokenKind::Print)) {
             return true;
@@ -606,6 +607,17 @@ private:
         }
         if (match(TokenKind::Match)) {
             return parse_match(previous());
+        }
+        if (match(TokenKind::Try)) {
+            return parse_try(previous());
+        }
+        if (match(TokenKind::Throw)) {
+            Statement statement;
+            statement.kind = Statement::Kind::Throw;
+            statement.position = previous().position;
+            statement.value = parse_expression();
+            expect(TokenKind::Semicolon, "expected ';' after throw expression");
+            return statement;
         }
         if (match(TokenKind::Break)) {
             return parse_loop_control(previous(), Statement::Kind::Break,
@@ -801,6 +813,25 @@ private:
         statement.value = parse_expression();
         expect(TokenKind::RParen, "expected ')' after print operand");
         expect(TokenKind::Semicolon, "expected ';' after print statement");
+        return statement;
+    }
+
+    std::optional<Statement> parse_try(const Token& try_token) {
+        Statement statement;
+        statement.kind = Statement::Kind::TryCatch;
+        statement.position = try_token.position;
+        statement.body = parse_block("expected '{' after 'try'");
+        expect(TokenKind::Catch, "expected 'catch' after try body");
+        expect(TokenKind::LParen, "expected '(' after 'catch'");
+        const auto name = expect(TokenKind::Identifier, "expected catch binding name");
+        if (name.has_value()) {
+            statement.catch_name = name->text;
+            statement.catch_position = name->position;
+        }
+        expect(TokenKind::Colon, "expected ':' after catch binding");
+        statement.catch_type = parse_type();
+        expect(TokenKind::RParen, "expected ')' after catch type");
+        statement.catch_body = parse_block("expected '{' before catch body");
         return statement;
     }
 

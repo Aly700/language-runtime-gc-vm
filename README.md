@@ -55,6 +55,12 @@ by the shared descriptor. Exhaustive matches introduce immutable bindings, and g
 payload reads preserve exact stack maps across movement. See
 [ADR 0011](adr/0011-variant-layouts.md).
 
+Typed exceptions use nominal variants: `throw error;` transfers a proven non-nil variant
+through explicit VM frames to `try { ... } catch (error: Error) { ... }`. Catch matching
+uses exact nominal layout identity, the in-flight object remains a precise moving-GC root,
+and existing runtime traps remain uncatchable. See
+[ADR 0012](adr/0012-exception-unwind-roots.md).
+
 ### Descriptor-driven precision
 
 One object descriptor visitor defines every strong heap edge. It visits pair fields,
@@ -149,7 +155,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The acceptance gate contains 32 CTest targets. The Iteration 34 correctness target reports
+The acceptance gate contains 34 CTest targets. The Iteration 34 correctness target reports
 nine internal variant cases; keeping those two levels distinct avoids inflating the CTest
 tally with executable-local case counts.
 
@@ -201,6 +207,7 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration31_strings2
 ./build/lang_iteration33_records_fuzz
 ./build/lang_iteration34_variants_fuzz
+./build/lang_iteration35_exceptions_fuzz
 ```
 
 ### Replay by grammar
@@ -224,6 +231,7 @@ Use one of the schedule names above.
 | source `strings2` | 32 | `./build/lang_iteration31_strings2 --grammar strings2 --seed N --schedule NAME` | `./build/lang_iteration31_strings2 --grammar strings2 --seed N --mutant 0..3` |
 | source `records` | 32 | `./build/lang_iteration33_records_fuzz --grammar records --seed N --schedule NAME` | `./build/lang_iteration33_records_fuzz --grammar records --seed N --mutant 0..6` |
 | source `variants` | 32 | `./build/lang_iteration34_variants_fuzz --grammar variants --seed N --schedule NAME` | `./build/lang_iteration34_variants_fuzz --grammar variants --seed N --mutant 0..8` |
+| source `exceptions` | 32 | deterministic ten-schedule sweep in `lang_iteration35_exceptions_fuzz` | typed rejection cases in `lang_iteration35_exceptions` |
 
 For example:
 
@@ -250,6 +258,7 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration31_strings2 --dump-corpus strings2
 ./build/lang_iteration33_records_fuzz --dump-corpus records
 ./build/lang_iteration34_variants_fuzz --dump-corpus variants
+./build/lang_iteration35_exceptions_fuzz --dump-corpus exceptions
 ```
 
 The generator design, oracle, schedules, and replay behavior are detailed in
