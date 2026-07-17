@@ -34,6 +34,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
         return ValueKind::Map;
     case TypeSpec::Kind::Weak:
         return ValueKind::Weak;
+    case TypeSpec::Kind::Ephemeron:
+        return ValueKind::Ephemeron;
     case TypeSpec::Kind::Nil:
         return ValueKind::Nil;
     case TypeSpec::Kind::Invalid:
@@ -85,6 +87,11 @@ SignatureValue signature_value_from_type(const TypeSpec& type) {
         type.weak_target != nullptr) {
         return weak_signature(
             signature_value_from_type(*type.weak_target));
+    }
+    if (type.kind == TypeSpec::Kind::Ephemeron && type.key != nullptr &&
+        type.value != nullptr) {
+        return ephemeron_signature(signature_value_from_type(*type.key),
+                                   signature_value_from_type(*type.value));
     }
     return signature_value(bytecode_kind(type));
 }
@@ -172,6 +179,7 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
         case Statement::Kind::While:
         case Statement::Kind::ForIn:
         case Statement::Kind::Print:
+        case Statement::Kind::EphemeronSet:
             break;
         }
     }
@@ -288,6 +296,10 @@ bool add_statement_array_counts(const Statement& statement,
     case Statement::Kind::Print:
         add_expr_array_counts(*statement.value, counts);
         return true;
+    case Statement::Kind::EphemeronSet:
+        add_expr_array_counts(*statement.initializer, counts);
+        add_expr_array_counts(*statement.value, counts);
+        return true;
     }
     return true;
 }
@@ -369,9 +381,15 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::IsNil:
     case Expr::Kind::WeakConstruct:
     case Expr::Kind::WeakGet:
+    case Expr::Kind::EphemeronKey:
+    case Expr::Kind::EphemeronValue:
     case Expr::Kind::ToStr:
     case Expr::Kind::ToI64:
         add_expr_array_counts(*expression.receiver, counts);
+        return;
+    case Expr::Kind::EphemeronConstruct:
+        add_expr_array_counts(*expression.left, counts);
+        add_expr_array_counts(*expression.right, counts);
         return;
     case Expr::Kind::MapHas:
         add_expr_array_counts(*expression.receiver, counts);
@@ -464,8 +482,10 @@ public:
     Compiler(std::uint32_t local_count, FunctionSignature signature,
              std::vector<std::string>& string_constants,
              std::vector<MapLayout>& map_layouts,
+             std::vector<EphemeronLayout>& ephemeron_layouts,
              std::optional<std::size_t> closure_layout = std::nullopt)
-        : string_constants_(string_constants), map_layouts_(map_layouts) {
+        : string_constants_(string_constants), map_layouts_(map_layouts),
+          ephemeron_layouts_(ephemeron_layouts) {
         function_.signature = std::move(signature);
         function_.local_count = local_count;
         function_.closure_layout = closure_layout;
@@ -588,6 +608,11 @@ private:
         case Statement::Kind::Print:
             compile_expr(*statement.value);
             emit(OpCode::Print, 0);
+            return true;
+        case Statement::Kind::EphemeronSet:
+            compile_expr(*statement.initializer);
+            compile_expr(*statement.value);
+            emit(OpCode::EphemeronSetValue, 0);
             return true;
         }
         return true;
@@ -1052,6 +1077,26 @@ private:
             compile_expr(*expression.receiver);
             emit(OpCode::WeakGet, 0);
             break;
+        case Expr::Kind::EphemeronConstruct: {
+            compile_expr(*expression.left);
+            compile_expr(*expression.right);
+            assert(expression.inferred_type.has_ephemeron_entries());
+            auto key = signature_value_from_type(*expression.inferred_type.key);
+            auto value = signature_value_from_type(*expression.inferred_type.value);
+            const auto layout = ephemeron_layouts_.size();
+            ephemeron_layouts_.push_back(EphemeronLayout{
+                key, value, signature_value_is_reference(value)});
+            emit(OpCode::AllocEphemeron, static_cast<std::int64_t>(layout));
+            break;
+        }
+        case Expr::Kind::EphemeronKey:
+            compile_expr(*expression.receiver);
+            emit(OpCode::EphemeronKey, 0);
+            break;
+        case Expr::Kind::EphemeronValue:
+            compile_expr(*expression.receiver);
+            emit(OpCode::EphemeronValue, 0);
+            break;
         case Expr::Kind::ToStr:
             compile_expr(*expression.receiver);
             emit(expression.receiver->inferred_type.kind == TypeSpec::Kind::Bool
@@ -1232,6 +1277,7 @@ private:
     std::optional<std::pair<std::size_t, std::size_t>> active_variant_case_;
     std::vector<std::string>& string_constants_;
     std::vector<MapLayout>& map_layouts_;
+    std::vector<EphemeronLayout>& ephemeron_layouts_;
 };
 
 } // namespace
@@ -1331,6 +1377,7 @@ CompileModuleResult compile_checked_program(const Program& program,
                                    signature_from_types(declaration.parameters,
                                                         declaration.return_type),
                                    module.string_constants, module.map_layouts,
+                                   module.ephemeron_layouts,
                                    declaration.closure_layout_index);
         compiled_functions.push_back(
             function_compiler.compile(declaration.statements, *declaration.result));
@@ -1340,6 +1387,7 @@ CompileModuleResult compile_checked_program(const Program& program,
             lambda->local_count,
             signature_from_types(lambda->parameters, lambda->return_type),
             module.string_constants, module.map_layouts,
+            module.ephemeron_layouts,
             lambda->closure_layout_index);
         compiled_functions.push_back(
             lambda_compiler.compile(lambda->statements, *lambda->result));
@@ -1349,7 +1397,8 @@ CompileModuleResult compile_checked_program(const Program& program,
     entry_signature.return_type = bytecode_kind(result_type);
     entry_signature.return_type_detail = signature_value_from_type(result_type);
     Compiler entry_compiler(program.entry_local_count, std::move(entry_signature),
-                            module.string_constants, module.map_layouts);
+                            module.string_constants, module.map_layouts,
+                            module.ephemeron_layouts);
     module.functions.push_back(entry_compiler.compile(program.statements, *program.result));
     for (auto& function : compiled_functions) {
         module.functions.push_back(std::move(function));

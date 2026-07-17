@@ -31,6 +31,7 @@ enum class AbstractKind {
     MaybeReference,
     Record,
     Variant,
+    Ephemeron,
     Nil,
     Poison,
 };
@@ -192,6 +193,14 @@ const char* op_name(OpCode op) {
         return "TryEnd";
     case OpCode::Throw:
         return "Throw";
+    case OpCode::AllocEphemeron:
+        return "AllocEphemeron";
+    case OpCode::EphemeronKey:
+        return "EphemeronKey";
+    case OpCode::EphemeronValue:
+        return "EphemeronValue";
+    case OpCode::EphemeronSetValue:
+        return "EphemeronSetValue";
     }
     return "<invalid>";
 }
@@ -220,6 +229,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Record";
     case ValueKind::Variant:
         return "Variant";
+    case ValueKind::Ephemeron:
+        return "Ephemeron";
     }
     return "<invalid>";
 }
@@ -250,6 +261,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "Record";
     case AbstractKind::Variant:
         return "Variant";
+    case AbstractKind::Ephemeron:
+        return "Ephemeron";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -292,6 +305,13 @@ AbstractValue map_value(SignatureValue signature) {
     value.kind = AbstractKind::Map;
     value.signature_map =
         std::make_shared<const SignatureValue>(std::move(signature));
+    return value;
+}
+
+AbstractValue ephemeron_value(SignatureValue signature) {
+    AbstractValue value;
+    value.kind = AbstractKind::Ephemeron;
+    value.signature_map = std::make_shared<const SignatureValue>(std::move(signature));
     return value;
 }
 
@@ -441,6 +461,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Record;
     case ValueKind::Variant:
         return AbstractKind::Variant;
+    case ValueKind::Ephemeron:
+        return AbstractKind::Ephemeron;
     }
     return AbstractKind::Poison;
 }
@@ -477,6 +499,9 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
     if (signature.has_map_entries()) {
         return map_value(signature);
     }
+    if (signature.has_ephemeron_entries()) {
+        return ephemeron_value(signature);
+    }
     if (signature.is_named_type_reference()) {
         return named_signature_object_value(*signature.named_type);
     }
@@ -511,7 +536,8 @@ bool is_reference_kind(AbstractKind kind) {
            kind == AbstractKind::RefArray || kind == AbstractKind::Str ||
            kind == AbstractKind::Function || kind == AbstractKind::Map ||
            kind == AbstractKind::Weak || kind == AbstractKind::MaybeReference ||
-           kind == AbstractKind::Record || kind == AbstractKind::Variant;
+           kind == AbstractKind::Record || kind == AbstractKind::Variant ||
+           kind == AbstractKind::Ephemeron;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -610,6 +636,11 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                                             signature.weak_target->kind,
                                             module);
     }
+    if (signature.has_ephemeron_entries()) {
+        return signature_value_is_reference(*signature.key) &&
+               signature_shape_matches_kind(*signature.key, signature.key->kind, module) &&
+               signature_shape_matches_kind(*signature.value, signature.value->kind, module);
+    }
     if (signature.kind == ValueKind::Function) {
         return false;
     }
@@ -623,6 +654,9 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
         return false;
     }
     if (signature.kind == ValueKind::Variant) {
+        return false;
+    }
+    if (signature.kind == ValueKind::Ephemeron) {
         return false;
     }
     return signature.left == nullptr && signature.right == nullptr &&
@@ -655,6 +689,10 @@ bool signature_has_invalid_map_key(const SignatureValue& signature) {
     if (signature.has_weak_target()) {
         return signature_has_invalid_map_key(*signature.weak_target);
     }
+    if (signature.has_ephemeron_entries()) {
+        return signature_has_invalid_map_key(*signature.key) ||
+               signature_has_invalid_map_key(*signature.value);
+    }
     if (signature.has_function_signature()) {
         if (signature_has_invalid_map_key(*signature.function_return)) {
             return true;
@@ -684,6 +722,10 @@ bool signature_has_invalid_weak_target(const SignatureValue& signature) {
         return signature_has_invalid_weak_target(*signature.element);
     }
     if (signature.has_map_entries()) {
+        return signature_has_invalid_weak_target(*signature.key) ||
+               signature_has_invalid_weak_target(*signature.value);
+    }
+    if (signature.has_ephemeron_entries()) {
         return signature_has_invalid_weak_target(*signature.key) ||
                signature_has_invalid_weak_target(*signature.value);
     }
@@ -958,6 +1000,29 @@ bool map_layouts_are_well_formed(
                     << " type shape or derived reference flags are invalid";
             return reject(diagnostics, 0, std::nullopt,
                           VerifierReason::BadMapLayoutIndex, message.str());
+        }
+    }
+    return true;
+}
+
+bool ephemeron_layouts_are_well_formed(
+    const Module& module, std::vector<VerifierDiagnostic>& diagnostics) {
+    for (std::size_t i = 0; i < module.ephemeron_layouts.size(); ++i) {
+        const auto& layout = module.ephemeron_layouts[i];
+        if (!signature_value_is_reference(layout.key_type) ||
+            !signature_shape_matches_kind(layout.key_type, layout.key_type.kind, module) ||
+            !signature_shape_matches_kind(layout.value_type, layout.value_type.kind, module) ||
+            layout.value_is_ref != signature_value_is_reference(layout.value_type) ||
+            signature_has_invalid_weak_target(layout.key_type) ||
+            signature_has_invalid_weak_target(layout.value_type) ||
+            signature_has_invalid_map_key(layout.key_type) ||
+            signature_has_invalid_map_key(layout.value_type)) {
+            std::ostringstream message;
+            message << "ephemeron layout " << i
+                    << " has an invalid key/value shape or reference flag";
+            return reject(diagnostics, 0, std::nullopt,
+                          VerifierReason::BadEphemeronLayoutIndex,
+                          message.str());
         }
     }
     return true;
@@ -1251,7 +1316,8 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
                                     *rhs.signature_function)) {
             return poison_value();
         }
-    } else if (joined.kind == AbstractKind::Map) {
+    } else if (joined.kind == AbstractKind::Map ||
+               joined.kind == AbstractKind::Ephemeron) {
         if (lhs.signature_map == nullptr || rhs.signature_map == nullptr ||
             !signature_values_equal(*lhs.signature_map,
                                     *rhs.signature_map)) {
@@ -1765,7 +1831,8 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
         return value.signature_array_element != nullptr ||
                !value.ref_array_sites.empty();
     }
-    if (expected.kind == AbstractKind::Map) {
+    if (expected.kind == AbstractKind::Map ||
+        expected.kind == AbstractKind::Ephemeron) {
         return value.signature_map != nullptr &&
                expected.signature_map != nullptr &&
                signature_values_equal(*value.signature_map,
@@ -2129,6 +2196,77 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         return push_fallthrough_or_report(pc, function, function_index,
                                           std::move(state), successors,
                                           diagnostics);
+    }
+    case OpCode::AllocEphemeron: {
+        if (ins.operand < 0 || static_cast<std::size_t>(ins.operand) >=
+                                   module.ephemeron_layouts.size()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadEphemeronLayoutIndex,
+                          instruction_message(function, pc,
+                                              "ephemeron layout is out of range"));
+        }
+        const auto& layout = module.ephemeron_layouts[static_cast<std::size_t>(ins.operand)];
+        AbstractValue value;
+        AbstractValue key;
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow,
+                               "ephemeron value", &value) ||
+            !pop_reference_or_report(state, diagnostics, function, function_index, pc,
+                                     VerifierReason::StackUnderflow,
+                                     VerifierReason::BadEphemeronKeyType,
+                                     "ephemeron key", &key)) return false;
+        if (!value_conforms_to_signature(module, state, key, layout.key_type)) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadEphemeronKeyType,
+                          instruction_message(function, pc, "ephemeron key type mismatch"));
+        }
+        if (!value_conforms_to_signature(module, state, value, layout.value_type)) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::EphemeronValueTypeMismatch,
+                          instruction_message(function, pc, "ephemeron value type mismatch"));
+        }
+        state.stack.push_back(ephemeron_value(ephemeron_signature(
+            layout.key_type, layout.value_type)));
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors, diagnostics);
+    }
+    case OpCode::EphemeronKey:
+    case OpCode::EphemeronValue:
+    case OpCode::EphemeronSetValue: {
+        AbstractValue stored;
+        if (ins.op == OpCode::EphemeronSetValue &&
+            !pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow,
+                               "ephemeron stored value", &stored)) return false;
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
+                               VerifierReason::StackUnderflow,
+                               "ephemeron receiver", &receiver)) return false;
+        if (receiver.kind != AbstractKind::Ephemeron || receiver.signature_map == nullptr ||
+            !receiver.signature_map->has_ephemeron_entries()) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::EphemeronOperationOnNonEphemeron,
+                          instruction_message(function, pc, "receiver is not an ephemeron"));
+        }
+        if (ins.op == OpCode::EphemeronSetValue) {
+            if (!value_conforms_to_signature(module, state, stored,
+                                             *receiver.signature_map->value)) {
+                return reject(diagnostics, function_index, pc,
+                              VerifierReason::EphemeronValueTypeMismatch,
+                              instruction_message(function, pc,
+                                                  "stored ephemeron value type mismatch"));
+            }
+        } else if (ins.op == OpCode::EphemeronKey) {
+            state.stack.push_back(maybe_reference_value(
+                value_from_signature(*receiver.signature_map->key)));
+        } else {
+            auto loaded = value_from_signature(*receiver.signature_map->value);
+            if (signature_value_is_reference(*receiver.signature_map->value))
+                loaded = maybe_reference_value(std::move(loaded));
+            state.stack.push_back(std::move(loaded));
+        }
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors, diagnostics);
     }
     case OpCode::IsNil: {
         AbstractValue value;
@@ -3445,6 +3583,14 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "BadExceptionHandler";
     case VerifierReason::ThrowRequiresVariant:
         return "ThrowRequiresVariant";
+    case VerifierReason::BadEphemeronLayoutIndex:
+        return "BadEphemeronLayoutIndex";
+    case VerifierReason::BadEphemeronKeyType:
+        return "BadEphemeronKeyType";
+    case VerifierReason::EphemeronOperationOnNonEphemeron:
+        return "EphemeronOperationOnNonEphemeron";
+    case VerifierReason::EphemeronValueTypeMismatch:
+        return "EphemeronValueTypeMismatch";
     }
     return "<unknown>";
 }
@@ -3507,6 +3653,9 @@ ModuleVerifierReport verify_with_diagnostics(const Module& module) {
         return report;
     }
     if (!map_layouts_are_well_formed(module, report.diagnostics)) {
+        return report;
+    }
+    if (!ephemeron_layouts_are_well_formed(module, report.diagnostics)) {
         return report;
     }
     if (!named_types_are_well_formed(module)) {

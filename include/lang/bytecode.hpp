@@ -67,6 +67,10 @@ enum class OpCode {
     TryBegin,
     TryEnd,
     Throw,
+    AllocEphemeron,
+    EphemeronKey,
+    EphemeronValue,
+    EphemeronSetValue,
 };
 
 struct Instruction {
@@ -88,6 +92,7 @@ enum class ValueKind {
     Weak,
     Record,
     Variant,
+    Ephemeron,
 };
 
 struct SignatureValue {
@@ -147,6 +152,14 @@ struct SignatureValue {
                function_return == nullptr && function_parameters.empty() &&
                !named_type.has_value() && !record_layout.has_value() &&
                !variant_layout.has_value();
+    }
+
+    [[nodiscard]] bool has_ephemeron_entries() const {
+        return kind == ValueKind::Ephemeron && key != nullptr && value != nullptr &&
+               left == nullptr && right == nullptr && element == nullptr &&
+               weak_target == nullptr && function_return == nullptr &&
+               function_parameters.empty() && !named_type.has_value() &&
+               !record_layout.has_value() && !variant_layout.has_value();
     }
 
     [[nodiscard]] bool is_record_layout_reference() const {
@@ -220,6 +233,15 @@ inline SignatureValue weak_signature(SignatureValue target) {
     return signature;
 }
 
+inline SignatureValue ephemeron_signature(SignatureValue key,
+                                           SignatureValue value) {
+    SignatureValue signature;
+    signature.kind = ValueKind::Ephemeron;
+    signature.key = std::make_shared<SignatureValue>(std::move(key));
+    signature.value = std::make_shared<SignatureValue>(std::move(value));
+    return signature;
+}
+
 inline SignatureValue record_signature(std::size_t layout_index) {
     SignatureValue signature;
     signature.kind = ValueKind::Record;
@@ -238,7 +260,8 @@ inline bool signature_value_is_reference(const SignatureValue& value) {
     return value.kind == ValueKind::Object || value.kind == ValueKind::Array ||
            value.kind == ValueKind::Str || value.kind == ValueKind::Function ||
            value.kind == ValueKind::Map || value.kind == ValueKind::Weak ||
-           value.kind == ValueKind::Record || value.kind == ValueKind::Variant;
+           value.kind == ValueKind::Record || value.kind == ValueKind::Variant ||
+           value.kind == ValueKind::Ephemeron;
 }
 
 struct NamedTypeSignature {
@@ -264,6 +287,12 @@ struct MapLayout {
     SignatureValue key_type{signature_value(ValueKind::Nil)};
     SignatureValue value_type{signature_value(ValueKind::Nil)};
     bool key_is_ref{false};
+    bool value_is_ref{false};
+};
+
+struct EphemeronLayout {
+    SignatureValue key_type{signature_value(ValueKind::Nil)};
+    SignatureValue value_type{signature_value(ValueKind::Nil)};
     bool value_is_ref{false};
 };
 
@@ -318,6 +347,7 @@ struct Module {
     std::vector<MapLayout> map_layouts;
     std::vector<RecordLayout> record_layouts;
     std::vector<VariantLayout> variant_layouts;
+    std::vector<EphemeronLayout> ephemeron_layouts;
 };
 
 struct VerificationResult {
@@ -424,6 +454,10 @@ enum class VerifierReason {
     VariantReceiverMayBeNil,  // VariantTag/Get receiver lacks nil refinement.
     BadExceptionHandler,      // Handler metadata or delimiters are malformed.
     ThrowRequiresVariant,     // Throw operand is not a non-nil nominal variant.
+    BadEphemeronLayoutIndex,
+    BadEphemeronKeyType,
+    EphemeronOperationOnNonEphemeron,
+    EphemeronValueTypeMismatch,
 };
 
 struct VerifierDiagnostic {

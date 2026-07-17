@@ -1,5 +1,11 @@
 # Architecture — Language Runtime
 
+Iteration 36 adds collector-level ephemerons. Their descriptors expose no strong fields;
+after ordinary marking, a strict slot-ordered registry repeatedly activates conditional
+values whose weak keys are independently live. Descriptor draining between passes permits
+activated values to make later keys live. The finite monotone mark set guarantees
+termination, and compaction forwards active entries or clears inactive ones.
+
 ## Pipeline
 
 ```text
@@ -78,6 +84,9 @@ The source language is intentionally small:
 - `weak(x)` constructs an immutable WeakRef to a proven non-nil object. `w.get()` returns
   nil-able `T`; callers bind it and use the same `is_nil(local)` false-branch refinement
   before any object operation. There is no separate `is_alive` surface.
+- `ephemeron(key, value)` requires a proven non-nil object key and retains complete
+  structural `K,V` facts. `.key()` and reference `.value()` are nil-able after clearing;
+  `.set_value(value)` lowers to the single barriered store opcode.
 - A program ends with a final expression, which becomes the VM result.
 
 Minimal cuts: there is no string interning/mutation, expression-valued blocks, capture

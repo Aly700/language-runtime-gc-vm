@@ -127,6 +127,14 @@ const char* op_name(lang::OpCode op) {
         return "TryEnd";
     case lang::OpCode::Throw:
         return "Throw";
+    case lang::OpCode::AllocEphemeron:
+        return "AllocEphemeron";
+    case lang::OpCode::EphemeronKey:
+        return "EphemeronKey";
+    case lang::OpCode::EphemeronValue:
+        return "EphemeronValue";
+    case lang::OpCode::EphemeronSetValue:
+        return "EphemeronSetValue";
     }
     return "<unknown>";
 }

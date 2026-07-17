@@ -88,6 +88,14 @@ TypeSpec weak_type(TypeSpec target) {
     return type;
 }
 
+TypeSpec ephemeron_type(TypeSpec key, TypeSpec value) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::Ephemeron;
+    type.key = std::make_shared<TypeSpec>(std::move(key));
+    type.value = std::make_shared<TypeSpec>(std::move(value));
+    return type;
+}
+
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs.kind != rhs.kind) {
         return false;
@@ -144,6 +152,11 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
         }
         return *lhs.weak_target == *rhs.weak_target;
     }
+    if (lhs.kind == TypeSpec::Kind::Ephemeron) {
+        if (lhs.key == nullptr || rhs.key == nullptr || lhs.value == nullptr ||
+            rhs.value == nullptr) return lhs.key == rhs.key && lhs.value == rhs.value;
+        return *lhs.key == *rhs.key && *lhs.value == *rhs.value;
+    }
     if (!lhs.has_pair_fields() && !rhs.has_pair_fields()) {
         return true;
     }
@@ -183,6 +196,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Map;
     case TypeSpec::Kind::Weak:
         return Type::Weak;
+    case TypeSpec::Kind::Ephemeron:
+        return Type::Ephemeron;
     case TypeSpec::Kind::Named:
         return Type::Pair;
     case TypeSpec::Kind::Record:
@@ -239,6 +254,11 @@ std::string type_name(const TypeSpec& type) {
         return type.weak_target == nullptr
                    ? "weak<invalid>"
                    : "weak<" + type_name(*type.weak_target) + ">";
+    case TypeSpec::Kind::Ephemeron:
+        return type.key == nullptr || type.value == nullptr
+                   ? "ephemeron<invalid, invalid>"
+                   : "ephemeron<" + type_name(*type.key) + ", " +
+                         type_name(*type.value) + ">";
     case TypeSpec::Kind::Named:
         return type.name;
     case TypeSpec::Kind::Record:
@@ -558,7 +578,16 @@ private:
             check(TokenKind::Continue) || check(TokenKind::Print)) {
             return true;
         }
-        return assignment_ahead();
+        return assignment_ahead() || ephemeron_set_ahead();
+    }
+
+    [[nodiscard]] bool ephemeron_set_ahead() const {
+        return current_ + 3 < tokens_.size() &&
+               tokens_[current_].kind == TokenKind::Identifier &&
+               tokens_[current_ + 1].kind == TokenKind::Dot &&
+               tokens_[current_ + 2].kind == TokenKind::Identifier &&
+               tokens_[current_ + 2].text == "set_value" &&
+               tokens_[current_ + 3].kind == TokenKind::LParen;
     }
 
     [[nodiscard]] bool assignment_ahead() const {
@@ -630,6 +659,24 @@ private:
         if (match(TokenKind::Print)) {
             return parse_print(previous());
         }
+        if (ephemeron_set_ahead()) {
+            Statement statement;
+            statement.kind = Statement::Kind::EphemeronSet;
+            statement.position = peek().position;
+            auto receiver = std::make_unique<Expr>();
+            receiver->kind = Expr::Kind::Variable;
+            receiver->position = peek().position;
+            receiver->name = peek().text;
+            ++current_;
+            statement.initializer = std::move(receiver);
+            expect(TokenKind::Dot, "expected '.' before set_value");
+            ++current_;
+            expect(TokenKind::LParen, "expected '(' after set_value");
+            statement.value = parse_expression();
+            expect(TokenKind::RParen, "expected ')' after ephemeron value");
+            expect(TokenKind::Semicolon, "expected ';' after set_value");
+            return statement;
+        }
         if (assignment_ahead()) {
             return parse_assignment();
         }
@@ -698,6 +745,17 @@ private:
             auto target = parse_type();
             expect(TokenKind::Greater, "expected '>' after weak target type");
             auto type = weak_type(std::move(target));
+            type.position = position;
+            return type;
+        }
+        if (match(TokenKind::Ephemeron)) {
+            const auto position = previous().position;
+            expect(TokenKind::Less, "expected '<' after 'ephemeron'");
+            auto key = parse_type();
+            expect(TokenKind::Comma, "expected ',' between ephemeron key and value types");
+            auto value = parse_type();
+            expect(TokenKind::Greater, "expected '>' after ephemeron value type");
+            auto type = ephemeron_type(std::move(key), std::move(value));
             type.position = position;
             return type;
         }
@@ -1038,6 +1096,18 @@ private:
                     expect(TokenKind::LParen, "expected '(' after 'get'");
                     expect(TokenKind::RParen, "weak get takes no arguments");
                     expression = std::move(node);
+                } else if (check(TokenKind::Identifier) &&
+                           (peek().text == "key" || peek().text == "value") &&
+                           check_next(TokenKind::LParen)) {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = peek().text == "key" ? Expr::Kind::EphemeronKey
+                                                       : Expr::Kind::EphemeronValue;
+                    node->position = peek().position;
+                    node->receiver = std::move(expression);
+                    ++current_;
+                    expect(TokenKind::LParen, "expected '(' after ephemeron getter");
+                    expect(TokenKind::RParen, "ephemeron getter takes no arguments");
+                    expression = std::move(node);
                 } else if (check(TokenKind::Identifier) && peek().text == "sub" &&
                            check_next(TokenKind::LParen)) {
                     auto node = std::make_unique<Expr>();
@@ -1185,6 +1255,17 @@ private:
             expect(TokenKind::LParen, "expected '(' after 'weak'");
             node->receiver = parse_expression();
             expect(TokenKind::RParen, "expected ')' after weak target");
+            return node;
+        }
+        if (match(TokenKind::Ephemeron)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::EphemeronConstruct;
+            node->position = previous().position;
+            expect(TokenKind::LParen, "expected '(' after 'ephemeron'");
+            node->left = parse_expression();
+            expect(TokenKind::Comma, "expected ',' between ephemeron key and value");
+            node->right = parse_expression();
+            expect(TokenKind::RParen, "expected ')' after ephemeron value");
             return node;
         }
         if (match(TokenKind::ToStr) || match(TokenKind::ToI64)) {

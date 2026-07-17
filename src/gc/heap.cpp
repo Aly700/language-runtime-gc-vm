@@ -74,11 +74,18 @@ std::size_t storage_slot_count(const Object& object) {
         return 1 + static_cast<std::size_t>(object.length);
     case ObjectKind::Variant:
         return 2 + static_cast<std::size_t>(object.length);
+    case ObjectKind::Ephemeron:
+        return 1;
     }
     throw std::logic_error("unknown object kind");
 }
 
 void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = nullptr) {
+    if (object.kind != ObjectKind::Ephemeron &&
+        (object.ephemeron_key().tag() != Value::Tag::Nil ||
+         object.ephemeron_value().tag() != Value::Tag::Nil)) {
+        throw std::logic_error("non-ephemeron descriptor contains ephemeron payload");
+    }
     if (object.kind != ObjectKind::Record &&
         (!object.record_fields.empty() || !object.record_ref_map.empty())) {
         throw std::logic_error(
@@ -277,6 +284,32 @@ void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = null
         }
         return;
     }
+    case ObjectKind::Ephemeron: {
+        const auto key_tag = object.ephemeron_key().tag();
+        const auto value_tag = object.ephemeron_value().tag();
+        if (object.length != 2 || !object.scalar_elements.empty() ||
+            !object.ref_elements.empty() || !object.string_bytes.empty() ||
+            !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty() || !object.map_entries.empty() ||
+            object.left.tag() != Value::Tag::Nil ||
+            object.right.tag() != Value::Tag::Nil ||
+            object.weak_target().tag() != Value::Tag::Nil ||
+            (key_tag != Value::Tag::Object && key_tag != Value::Tag::Nil)) {
+            throw std::logic_error("ephemeron descriptor does not match registry payload");
+        }
+        if (key_tag == Value::Tag::Nil && value_tag != Value::Tag::Nil) {
+            throw std::logic_error("cleared ephemeron retains a value");
+        }
+        if (object.ephemeron_value_is_ref()) {
+            if (value_tag != Value::Tag::Object && value_tag != Value::Tag::Nil) {
+                throw std::logic_error("ephemeron reference value has scalar tag");
+            }
+        } else if (key_tag != Value::Tag::Nil && value_tag != Value::Tag::Int64 &&
+                   value_tag != Value::Tag::Bool) {
+            throw std::logic_error("ephemeron scalar value has reference tag");
+        }
+        return;
+    }
     }
     throw std::logic_error("unknown object kind");
 }
@@ -347,6 +380,8 @@ void visit_reference_fields(Object& object, Fn&& fn,
         }
         return;
     }
+    case ObjectKind::Ephemeron:
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -411,6 +446,8 @@ void visit_reference_fields(const Object& object, Fn&& fn,
         }
         return;
     }
+    case ObjectKind::Ephemeron:
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -480,6 +517,8 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn,
         }
         return;
     }
+    case ObjectKind::Ephemeron:
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -583,6 +622,25 @@ Object Object::weak_ref(Value target) {
     object.left = Value::nil();
     object.right = Value::nil();
     object.weak_target_ = target;
+    validate_descriptor_shape(object);
+    return object;
+}
+
+Object Object::ephemeron(Value key, Value value, bool value_is_ref) {
+    require_object_reference_value(key, "ephemeron key");
+    if (value_is_ref) {
+        if (value.tag() != Value::Tag::Object && value.tag() != Value::Tag::Nil) {
+            throw std::logic_error("ephemeron reference value must be object or nil");
+        }
+    } else if (value.tag() != Value::Tag::Int64 && value.tag() != Value::Tag::Bool) {
+        throw std::logic_error("ephemeron scalar value must be i64 or bool");
+    }
+    Object object;
+    object.kind = ObjectKind::Ephemeron;
+    object.length = 2;
+    object.ephemeron_key_ = key;
+    object.ephemeron_value_ = value;
+    object.ephemeron_value_is_ref_ = value_is_ref;
     validate_descriptor_shape(object);
     return object;
 }
@@ -961,6 +1019,23 @@ ObjectId Heap::allocate_weak(Value target) {
     return id;
 }
 
+ObjectId Heap::allocate_ephemeron(Value key, Value value, bool value_is_ref) {
+    (void)checked_slot(key.as_object());
+    if (value_is_ref && value.is_object()) (void)checked_slot(value.as_object());
+    if (stress_config_.collect_before_every_allocation) {
+        std::array<Value*, 2> roots{&key, &value};
+        collect_with_extra_roots(roots);
+    }
+    auto id = allocate_object(Object::ephemeron(key, value, value_is_ref));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> root{&allocated};
+        collect_with_extra_roots(root);
+        id = allocated.as_object();
+    }
+    return id;
+}
+
 ObjectId Heap::allocate_record(std::size_t layout_index,
                                std::vector<Value> fields,
                                std::vector<bool> ref_map) {
@@ -1068,6 +1143,14 @@ ObjectId Heap::allocate_object(Object object) {
                 return slot_from(existing) < slot;
             });
         weak_refs_.insert(position, id);
+    }
+    if (objects_[base_slot]->kind == ObjectKind::Ephemeron) {
+        const auto position = std::lower_bound(
+            ephemerons_.begin(), ephemerons_.end(), base_slot,
+            [](ObjectId existing, std::size_t slot) {
+                return slot_from(existing) < slot;
+            });
+        ephemerons_.insert(position, id);
     }
     ++metrics_.allocations;
     if (objects_.size() > metrics_.heap_peak_slots) {
@@ -1266,6 +1349,24 @@ const Object& Heap::checked_variant(ObjectId id) const {
     const auto& object = *objects_[checked_slot(id)];
     if (object.kind != ObjectKind::Variant) {
         throw std::logic_error("object is not a variant");
+    }
+    validate_descriptor_shape(object, &metrics_);
+    return object;
+}
+
+const Object& Heap::checked_ephemeron(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Ephemeron) {
+        throw std::logic_error("object is not an ephemeron");
+    }
+    validate_descriptor_shape(object, &metrics_);
+    return object;
+}
+
+Object& Heap::checked_ephemeron(ObjectId id) {
+    auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Ephemeron) {
+        throw std::logic_error("object is not an ephemeron");
     }
     validate_descriptor_shape(object, &metrics_);
     return object;
@@ -1494,6 +1595,18 @@ Value Heap::weak_get(ObjectId id) const {
     return checked_weak_ref(id).weak_target();
 }
 
+Value Heap::ephemeron_key(ObjectId id) const {
+    return checked_ephemeron(id).ephemeron_key();
+}
+
+Value Heap::ephemeron_value(ObjectId id) const {
+    return checked_ephemeron(id).ephemeron_value();
+}
+
+void Heap::ephemeron_set_value(ObjectId id, Value value) {
+    store_ephemeron_value(id, value);
+}
+
 std::size_t Heap::record_layout_index(ObjectId id) const {
     return checked_record(id).record_layout_index;
 }
@@ -1610,11 +1723,13 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     rewrite_references(forwarding, relocated_objects, nullptr, growth_roots);
     auto rewritten_weak_refs =
         process_weak_targets(forwarding, relocated_objects, std::nullopt);
+    auto rewritten_ephemerons = process_ephemerons(forwarding, relocated_objects);
 
     objects_ = std::move(relocated_objects);
     generations_ = std::move(relocated_generations);
     remembered_set_ = rewritten_remembered;
     weak_refs_ = std::move(rewritten_weak_refs);
+    ephemerons_ = std::move(rewritten_ephemerons);
     ++metrics_.objects_moved;
     if (objects_.size() > metrics_.heap_peak_slots) {
         metrics_.heap_peak_slots = objects_.size();
@@ -1622,6 +1737,7 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     validate_heap_storage_layout();
     validate_remembered_set();
     validate_weak_targets();
+    validate_ephemerons();
 }
 
 void Heap::store_map_entry(ObjectId id, Value key, Value value) {
@@ -1724,6 +1840,29 @@ void Heap::store_record_field(ObjectId id, std::size_t index, Value value) {
         stress_config_.collect_minor_after_every_write_barrier) {
         std::array<Value*, 2> mutation_roots{&owner, &value};
         collect_impl(CollectionKind::Minor, nullptr, mutation_roots);
+    }
+}
+
+void Heap::store_ephemeron_value(ObjectId id, Value value) {
+    Value owner = Value::object(id);
+    auto& ephemeron = checked_ephemeron(id);
+    if (ephemeron.ephemeron_key().tag() == Value::Tag::Nil) {
+        throw std::logic_error("cannot mutate a cleared ephemeron");
+    }
+    if (ephemeron.ephemeron_value_is_ref()) {
+        if (value.tag() != Value::Tag::Object && value.tag() != Value::Tag::Nil) {
+            throw std::logic_error("ephemeron reference value must be object or nil");
+        }
+        if (value.is_object()) (void)checked_slot(value.as_object());
+    } else if (value.tag() != Value::Tag::Int64 && value.tag() != Value::Tag::Bool) {
+        throw std::logic_error("ephemeron scalar value must be i64 or bool");
+    }
+    const bool barrier = ephemeron.ephemeron_value_is_ref() &&
+                         record_write_barrier_if_needed(id, value);
+    ephemeron.ephemeron_value_ = value;
+    if (barrier && stress_config_.collect_minor_after_every_write_barrier) {
+        std::array<Value*, 2> roots{&owner, &value};
+        collect_impl(CollectionKind::Minor, nullptr, roots);
     }
 }
 
@@ -1891,6 +2030,39 @@ void Heap::drain_mark_worklist(std::vector<ObjectId>& worklist, CollectionKind k
     }
 }
 
+void Heap::process_ephemeron_fixpoint(std::vector<ObjectId>& worklist,
+                                      CollectionKind kind) {
+    for (;;) {
+        ++metrics_.ephemeron_fixpoint_passes;
+        bool progressed = false;
+        for (const auto owner_id : ephemerons_) {
+            const auto owner_slot = checked_slot(owner_id);
+            const auto& owner = *objects_[owner_slot];
+            const bool owner_live = kind == CollectionKind::Minor
+                                        ? is_old_slot(owner_slot) || owner.marked
+                                        : owner.marked;
+            if (!owner_live || owner.ephemeron_key().tag() == Value::Tag::Nil) continue;
+            const auto key_slot = checked_slot(owner.ephemeron_key().as_object());
+            const bool key_live = kind == CollectionKind::Minor
+                                      ? is_old_slot(key_slot) || objects_[key_slot]->marked
+                                      : objects_[key_slot]->marked;
+            if (!key_live || !owner.ephemeron_value_is_ref() ||
+                !owner.ephemeron_value().is_object()) continue;
+            const auto value_slot = checked_slot(owner.ephemeron_value().as_object());
+            const bool already_live = kind == CollectionKind::Minor
+                                          ? is_old_slot(value_slot) || objects_[value_slot]->marked
+                                          : objects_[value_slot]->marked;
+            if (!already_live) {
+                enqueue_mark_value(owner.ephemeron_value(), worklist, kind);
+                ++metrics_.ephemeron_activations;
+                progressed = true;
+            }
+        }
+        drain_mark_worklist(worklist, kind);
+        if (!progressed) break;
+    }
+}
+
 void Heap::collect() {
     collect_impl(CollectionKind::Major, nullptr, {});
 }
@@ -1915,6 +2087,7 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     validate_heap_storage_layout();
     validate_remembered_set();
     validate_weak_targets();
+    validate_ephemerons();
     if (kind == CollectionKind::Major) {
         ++metrics_.major_collections;
     } else {
@@ -1928,6 +2101,7 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
         enqueue_young_references_from_remembered_set(worklist);
     }
     drain_mark_worklist(worklist, kind);
+    process_ephemeron_fixpoint(worklist, kind);
 
     auto compacted = compact_live_objects(kind);
     metrics_.objects_moved += compacted.objects_moved;
@@ -1935,11 +2109,14 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     auto rewritten_remembered_set = rewrite_remembered_set(compacted.forwarding);
     auto rewritten_weak_refs =
         process_weak_targets(compacted.forwarding, compacted.objects, kind);
+    auto rewritten_ephemerons =
+        process_ephemerons(compacted.forwarding, compacted.objects);
 
     objects_ = std::move(compacted.objects);
     generations_ = std::move(compacted.generations);
     remembered_set_ = std::move(rewritten_remembered_set);
     weak_refs_ = std::move(rewritten_weak_refs);
+    ephemerons_ = std::move(rewritten_ephemerons);
     record_promoted_object_edges(compacted.promoted_slots);
     prune_remembered_set();
 
@@ -2024,6 +2201,8 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
         case ObjectKind::Variant:
             // Variant accounting is likewise omitted from the legacy public counter
             // stream while its exact descriptor width still advances the cursor.
+            break;
+        case ObjectKind::Ephemeron:
             break;
         }
         if (next_live_slot + required_slots > result.objects.size()) {
@@ -2136,6 +2315,43 @@ std::vector<ObjectId> Heap::process_weak_targets(
     return rewritten;
 }
 
+std::vector<ObjectId> Heap::process_ephemerons(
+    const ForwardingTable& forwarding,
+    std::vector<std::optional<Object>>& moved_objects) const {
+    std::vector<ObjectId> rewritten;
+    rewritten.reserve(ephemerons_.size());
+    for (const auto old_owner : ephemerons_) {
+        const auto owner_slot = checked_slot(old_owner);
+        if (owner_slot >= forwarding.size() || !forwarding[owner_slot].has_value()) continue;
+        const auto new_owner = *forwarding[owner_slot];
+        auto& object = *moved_objects[slot_from(new_owner)];
+        auto& key = object.ephemeron_key_;
+        auto& value = object.ephemeron_value_;
+        if (!key.is_object()) {
+            if (key.tag() != Value::Tag::Nil || value.tag() != Value::Tag::Nil)
+                throw std::logic_error("invalid cleared ephemeron during movement");
+        } else {
+            const auto key_slot = checked_slot(key.as_object());
+            if (key_slot >= forwarding.size() || !forwarding[key_slot].has_value()) {
+                key = Value::nil();
+                value = Value::nil();
+            } else {
+                key = Value::object(*forwarding[key_slot]);
+                if (object.ephemeron_value_is_ref_ && value.is_object()) {
+                    const auto value_slot = checked_slot(value.as_object());
+                    if (value_slot >= forwarding.size() ||
+                        !forwarding[value_slot].has_value()) {
+                        throw std::logic_error("active ephemeron value missing forwarding entry");
+                    }
+                    value = Value::object(*forwarding[value_slot]);
+                }
+            }
+        }
+        rewritten.push_back(new_owner);
+    }
+    return rewritten;
+}
+
 std::vector<ObjectId> Heap::rewrite_remembered_set(const ForwardingTable& forwarding) const {
     std::vector<ObjectId> rewritten;
     rewritten.reserve(remembered_set_.size());
@@ -2234,6 +2450,7 @@ void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extr
 
     validate_remembered_set();
     validate_weak_targets();
+    validate_ephemerons();
 }
 
 void Heap::validate_remembered_set() const {
@@ -2304,6 +2521,31 @@ void Heap::validate_weak_targets() const {
     }
 }
 
+void Heap::validate_ephemerons() const {
+    std::size_t registry_index = 0;
+    for (std::size_t slot = 0; slot < objects_.size(); ++slot) {
+        if (!objects_[slot].has_value() || objects_[slot]->kind != ObjectKind::Ephemeron)
+            continue;
+        if (registry_index >= ephemerons_.size() ||
+            checked_slot(ephemerons_[registry_index]) != slot) {
+            throw std::logic_error("live Ephemeron is missing from registry");
+        }
+        if (registry_index > 0 &&
+            slot_from(ephemerons_[registry_index - 1]) >=
+                slot_from(ephemerons_[registry_index])) {
+            throw std::logic_error("ephemeron registry is not in strict slot order");
+        }
+        const auto& object = *objects_[slot];
+        validate_descriptor_shape(object, &metrics_);
+        if (object.ephemeron_key().is_object()) validate_value(object.ephemeron_key());
+        if (object.ephemeron_value_is_ref() && object.ephemeron_value().is_object())
+            validate_value(object.ephemeron_value());
+        ++registry_index;
+    }
+    if (registry_index != ephemerons_.size())
+        throw std::logic_error("ephemeron registry contains a dead owner");
+}
+
 void Heap::validate_value(Value value) const {
     if (!value.is_object()) {
         return;
@@ -2359,6 +2601,10 @@ bool Heap::TEST_ONLY_is_record(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_variant(ObjectId id) const {
     return object(id).kind == ObjectKind::Variant;
+}
+
+bool Heap::TEST_ONLY_is_ephemeron(ObjectId id) const {
+    return object(id).kind == ObjectKind::Ephemeron;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {

@@ -1,5 +1,8 @@
 # Language Runtime: Verified Bytecode and Precise Moving GC
 
+Wave 3 now includes records, sum types and match, exceptions, and deterministic GC-level
+ephemerons with key-conditional fixpoint marking. Incremental marking comes next.
+
 This repository is a correctness-first implementation of a small statically typed
 language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
 checker, bytecode compiler, verifier, and stack VM. The runtime uses a precise moving,
@@ -88,6 +91,11 @@ locates every live `WeakRef`; after liveness and forwarding are fixed, the colle
 forwards surviving targets and clears dead targets to canonical `nil`. Weak edges never
 mark, run barriers, or enter the remembered set. See
 [ADR 0005](adr/0005-weak-references.md).
+
+Ephemerons use an exact slot-ordered registry with an immutable weak key and a
+key-conditional value. Source exposes `ephemeron<K, V>`, `ephemeron(key, value)`,
+`.key()`, `.value()`, and `.set_value(value)`. Reference getter results are nil-able and
+use the ordinary `is_nil` refinement. See [ADR 0013](adr/0013-ephemeron-fixpoint.md).
 
 ## Language at a glance
 
@@ -297,7 +305,7 @@ context, and before/after tables are in
   addressing, resize/tombstone policy, and structural hash caching are deferred.
 - Closure captures are immutable snapshots. There are no mutable capture cells or
   recursion through a self-capture.
-- Weak maps, ephemerons, finalizers, resurrection, mutable weak targets, and user-visible
+- Weak-keyed maps, finalizers, resurrection, mutable weak targets, and user-visible
   finalization ordering are not implemented.
 - Loop control is unlabeled. Labeled loops and labeled `break`/`continue` require a label
   namespace and explicit target-resolution rules.

@@ -263,6 +263,19 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             }
             rendered << "])";
             break;
+        case lang::gc::ObjectKind::Ephemeron: {
+            const auto key = heap.ephemeron_key(order[i]);
+            const auto value = heap.ephemeron_value(order[i]);
+            if (key.tag() == lang::Value::Tag::Nil) {
+                rendered << "ephemeron(cleared)";
+            } else {
+                rendered << "ephemeron(key="
+                         << value_token(heap, key, indexes, order)
+                         << ", value="
+                         << value_token(heap, value, indexes, order) << ")";
+            }
+            break;
+        }
         }
         objects.push_back(rendered.str());
     }
