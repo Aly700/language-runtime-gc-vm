@@ -1152,6 +1152,9 @@ ObjectId Heap::allocate_object(Object object) {
             });
         ephemerons_.insert(position, id);
     }
+    if (incremental_marking_active_) {
+        incremental_mark_worklist_.push_back(id);
+    }
     ++metrics_.allocations;
     if (objects_.size() > metrics_.heap_peak_slots) {
         metrics_.heap_peak_slots = objects_.size();
@@ -1724,6 +1727,16 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     auto rewritten_weak_refs =
         process_weak_targets(forwarding, relocated_objects, std::nullopt);
     auto rewritten_ephemerons = process_ephemerons(forwarding, relocated_objects);
+    if (incremental_marking_active_) {
+        for (auto& grey : incremental_mark_worklist_) {
+            const auto grey_slot = checked_slot(grey);
+            if (!forwarding[grey_slot].has_value()) {
+                throw std::logic_error(
+                    "incremental grey object missing map-growth forwarding entry");
+            }
+            grey = *forwarding[grey_slot];
+        }
+    }
 
     objects_ = std::move(relocated_objects);
     generations_ = std::move(relocated_generations);
@@ -1755,6 +1768,8 @@ void Heap::store_map_entry(ObjectId id, Value key, Value value) {
         ensure_map_growth_storage(owner, key, value, required_width);
     }
 
+    incremental_write_barrier_before_publish(owner.as_object(), key);
+    incremental_write_barrier_before_publish(owner.as_object(), value);
     const bool barrier_triggered = record_map_write_barrier_if_needed(
         owner.as_object(), existing.has_value() ? std::nullopt
                                                 : std::optional<Value>(key),
@@ -1783,6 +1798,7 @@ void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     // heap API intentionally exposes only const object inspection plus set_left/set_right,
     // so bytecode cannot publish a field without running this old-to-young barrier.
     auto& obj = checked_pair(id);
+    incremental_write_barrier_before_publish(id, value);
     const bool barrier_triggered = record_write_barrier_if_needed(id, value);
 
     if (field == PairField::Left) {
@@ -1803,6 +1819,7 @@ void Heap::store_ref_array_element(ObjectId id, std::size_t index, Value value) 
         throw std::out_of_range("ref array index out of bounds");
     }
 
+    incremental_write_barrier_before_publish(id, value);
     const bool barrier_triggered = record_write_barrier_if_needed(id, value);
     obj.ref_elements[index] = value;
 
@@ -1831,6 +1848,7 @@ void Heap::store_record_field(ObjectId id, std::size_t index, Value value) {
         throw std::logic_error("record scalar field must carry i64 or bool tag");
     }
 
+    if (is_reference) incremental_write_barrier_before_publish(id, value);
     const bool barrier_triggered =
         is_reference && record_write_barrier_if_needed(id, value);
     record.record_fields[index] = value;
@@ -1856,6 +1874,9 @@ void Heap::store_ephemeron_value(ObjectId id, Value value) {
         if (value.is_object()) (void)checked_slot(value.as_object());
     } else if (value.tag() != Value::Tag::Int64 && value.tag() != Value::Tag::Bool) {
         throw std::logic_error("ephemeron scalar value must be i64 or bool");
+    }
+    if (ephemeron.ephemeron_value_is_ref()) {
+        incremental_write_barrier_before_publish(id, value);
     }
     const bool barrier = ephemeron.ephemeron_value_is_ref() &&
                          record_write_barrier_if_needed(id, value);
@@ -2009,6 +2030,11 @@ void Heap::enqueue_young_references_from_remembered_set(std::vector<ObjectId>& w
 }
 
 void Heap::drain_mark_worklist(std::vector<ObjectId>& worklist, CollectionKind kind) {
+    while (scan_next_mark_object(worklist, kind)) {}
+}
+
+bool Heap::scan_next_mark_object(std::vector<ObjectId>& worklist,
+                                 CollectionKind kind) {
     while (!worklist.empty()) {
         const auto id = worklist.back();
         worklist.pop_back();
@@ -2027,6 +2053,21 @@ void Heap::drain_mark_worklist(std::vector<ObjectId>& worklist, CollectionKind k
         visit_reference_fields_for_lifo_marking(obj, [&](Value value) {
             enqueue_mark_value(value, worklist, kind);
         }, &metrics_);
+        return true;
+    }
+    return false;
+}
+
+void Heap::incremental_write_barrier_before_publish(ObjectId owner, Value value) {
+    if (!incremental_marking_active_ || !value.is_object()) return;
+    if (TEST_ONLY_skip_next_incremental_write_barrier_) {
+        TEST_ONLY_skip_next_incremental_write_barrier_ = false;
+        return;
+    }
+    const auto owner_slot = checked_slot(owner);
+    const auto target_slot = checked_slot(value.as_object());
+    if (objects_[owner_slot]->marked && !objects_[target_slot]->marked) {
+        incremental_mark_worklist_.push_back(value.as_object());
     }
 }
 
@@ -2067,6 +2108,166 @@ void Heap::collect() {
     collect_impl(CollectionKind::Major, nullptr, {});
 }
 
+void Heap::start_incremental_marking() {
+    if (incremental_marking_active_) {
+        throw std::logic_error("incremental marking cycle already active");
+    }
+    validate_heap_storage_layout();
+    validate_remembered_set();
+    validate_weak_targets();
+    validate_ephemerons();
+    incremental_mark_worklist_.clear();
+    MarkingVisitor marker(*this, incremental_mark_worklist_, CollectionKind::Major);
+    trace_collection_roots(marker, nullptr, {});
+    incremental_marking_active_ = true;
+    ++metrics_.major_collections;
+    ++metrics_.incremental_cycles_started;
+}
+
+std::size_t Heap::incremental_mark_step(std::size_t budget) {
+    if (!incremental_marking_active_) {
+        throw std::logic_error("incremental marking step without active cycle");
+    }
+    ++metrics_.incremental_steps;
+    metrics_.incremental_budget_requested += budget;
+    std::size_t consumed = 0;
+    while (consumed < budget &&
+           scan_next_mark_object(incremental_mark_worklist_, CollectionKind::Major)) {
+        ++consumed;
+    }
+    metrics_.incremental_objects_scanned += consumed;
+    TEST_ONLY_validate_incremental_marking();
+    return consumed;
+}
+
+void Heap::TEST_ONLY_validate_incremental_marking() const {
+    if (!incremental_marking_active_) return;
+    const auto is_grey = [&](ObjectId id) {
+        return std::find(incremental_mark_worklist_.begin(),
+                         incremental_mark_worklist_.end(), id) !=
+               incremental_mark_worklist_.end();
+    };
+    for (std::size_t slot = 0; slot < objects_.size(); ++slot) {
+        if (!objects_[slot].has_value() || !objects_[slot]->marked) continue;
+        visit_reference_fields(*objects_[slot], [&](Value value) {
+            if (!value.is_object()) return;
+            const auto target_slot = checked_slot(value.as_object());
+            if (!objects_[target_slot]->marked && !is_grey(value.as_object())) {
+                throw std::logic_error(
+                    "incremental tri-colour invariant violated: black-to-white edge");
+            }
+        });
+    }
+}
+
+void Heap::finish_incremental_marking() {
+    finish_incremental_marking_impl(nullptr, {});
+}
+
+void Heap::finish_incremental_marking_impl(RootProvider* roots,
+                                           std::span<Value*> extra_roots) {
+    if (!incremental_marking_active_) {
+        throw std::logic_error("incremental marking finish without active cycle");
+    }
+    TEST_ONLY_validate_incremental_marking();
+
+    // The final pause is also the differential liveness oracle. Recompute from the
+    // current root graph so floating garbage created by edge deletion cannot make an
+    // incremental schedule differ from an atomic major collection at this boundary.
+    // The bounded phase remains independently checked by the tri-colour validator above.
+    for (auto& slot : objects_) {
+        if (slot.has_value()) slot->marked = false;
+    }
+    incremental_mark_worklist_.clear();
+    MarkingVisitor marker(*this, incremental_mark_worklist_, CollectionKind::Major);
+    trace_collection_roots(marker, roots, extra_roots);
+    drain_mark_worklist(incremental_mark_worklist_, CollectionKind::Major);
+    process_ephemeron_fixpoint(incremental_mark_worklist_, CollectionKind::Major);
+    validate_incremental_result_against_atomic(roots, extra_roots);
+
+    auto compacted = compact_live_objects(CollectionKind::Major);
+    metrics_.objects_moved += compacted.objects_moved;
+    rewrite_references(compacted.forwarding, compacted.objects, roots, extra_roots);
+    auto rewritten_remembered_set = rewrite_remembered_set(compacted.forwarding);
+    auto rewritten_weak_refs = process_weak_targets(
+        compacted.forwarding, compacted.objects, CollectionKind::Major);
+    auto rewritten_ephemerons =
+        process_ephemerons(compacted.forwarding, compacted.objects);
+
+    objects_ = std::move(compacted.objects);
+    generations_ = std::move(compacted.generations);
+    remembered_set_ = std::move(rewritten_remembered_set);
+    weak_refs_ = std::move(rewritten_weak_refs);
+    ephemerons_ = std::move(rewritten_ephemerons);
+    incremental_mark_worklist_.clear();
+    incremental_marking_active_ = false;
+    ++metrics_.incremental_final_pauses;
+    record_promoted_object_edges(compacted.promoted_slots);
+    prune_remembered_set();
+    validate_after_collection(roots, extra_roots);
+}
+
+void Heap::validate_incremental_result_against_atomic(
+    RootProvider* roots, std::span<Value*> extra_roots) const {
+    std::vector<bool> live(objects_.size(), false);
+    std::vector<ObjectId> worklist;
+    class ShadowRootVisitor final : public RootVisitor {
+    public:
+        explicit ShadowRootVisitor(std::vector<ObjectId>& worklist)
+            : worklist_(worklist) {}
+        void visit(Value& value) override {
+            if (value.is_object()) worklist_.push_back(value.as_object());
+        }
+    private:
+        std::vector<ObjectId>& worklist_;
+    } visitor(worklist);
+    trace_collection_roots(visitor, roots, extra_roots);
+
+    const auto drain = [&]() {
+        while (!worklist.empty()) {
+            const auto id = worklist.back();
+            worklist.pop_back();
+            const auto slot = checked_slot(id);
+            if (live[slot]) continue;
+            live[slot] = true;
+            visit_reference_fields_for_lifo_marking(
+                *objects_[slot], [&](Value value) {
+                    if (value.is_object()) worklist.push_back(value.as_object());
+                });
+        }
+    };
+    drain();
+    for (;;) {
+        bool progressed = false;
+        for (const auto owner_id : ephemerons_) {
+            const auto owner_slot = checked_slot(owner_id);
+            if (!live[owner_slot]) continue;
+            const auto& owner = *objects_[owner_slot];
+            if (!owner.ephemeron_key().is_object()) continue;
+            const auto key_slot = checked_slot(owner.ephemeron_key().as_object());
+            if (!live[key_slot] || !owner.ephemeron_value_is_ref() ||
+                !owner.ephemeron_value().is_object()) continue;
+            const auto value_slot = checked_slot(owner.ephemeron_value().as_object());
+            if (!live[value_slot]) {
+                worklist.push_back(owner.ephemeron_value().as_object());
+                progressed = true;
+            }
+        }
+        drain();
+        if (!progressed) break;
+    }
+
+    for (std::size_t slot = 0; slot < objects_.size(); ++slot) {
+        if (!objects_[slot].has_value()) continue;
+        if (objects_[slot]->marked != live[slot]) {
+            throw std::logic_error(
+                "incremental/STW differential liveness mismatch at heap slot " +
+                std::to_string(slot));
+        }
+    }
+    ++metrics_.incremental_differential_validations;
+}
+
 void Heap::collect(RootProvider& roots) {
     collect_impl(CollectionKind::Major, &roots, {});
 }
@@ -2084,6 +2285,9 @@ void Heap::collect_with_extra_roots(std::span<Value*> extra_roots) {
 }
 
 void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots) {
+    if (incremental_marking_active_) {
+        finish_incremental_marking_impl(roots, extra_roots);
+    }
     validate_heap_storage_layout();
     validate_remembered_set();
     validate_weak_targets();

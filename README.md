@@ -1,7 +1,7 @@
 # Language Runtime: Verified Bytecode and Precise Moving GC
 
-Wave 3 now includes records, sum types and match, exceptions, and deterministic GC-level
-ephemerons with key-conditional fixpoint marking. Incremental marking comes next.
+Wave 3 is complete: records, sum types and match, exceptions, ephemerons, and deterministic
+instruction-budgeted incremental marking all run under the same precise moving collector.
 
 This repository is a correctness-first implementation of a small statically typed
 language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
@@ -97,6 +97,14 @@ key-conditional value. Source exposes `ephemeron<K, V>`, `ephemeron(key, value)`
 `.key()`, `.value()`, and `.set_value(value)`. Reference getter results are nil-able and
 use the ordinary `is_nil` refinement. See [ADR 0013](adr/0013-ephemeron-fixpoint.md).
 
+### Incremental marking
+
+Major marking can be split into deterministic object-scan budgets at instruction
+boundaries. The existing barrier-before-publish funnels enforce no-black-to-white with an
+incremental-update barrier; weak clearing, ephemeron fixpoint completion, and movement
+remain atomic. A final current-root remark guarantees stop-the-world-equivalent liveness.
+See [ADR 0014](adr/0014-incremental-marking.md).
+
 ## Language at a glance
 
 ```text
@@ -163,9 +171,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The acceptance gate contains 34 CTest targets. The Iteration 34 correctness target reports
-nine internal variant cases; keeping those two levels distinct avoids inflating the CTest
-tally with executable-local case counts.
+The acceptance gate contains 37 CTest targets.
 
 Run only the executable documentation:
 
@@ -178,9 +184,8 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 15 isolated deterministic positive corpora containing 612 generated
-programs. Each runs under the same 10 schedules, for 6,120 positive executions per full
-CTest run:
+The suite has 17 isolated deterministic positive corpora. Shared source grammars run under
+the same 12 schedules without changing their generated program bytes:
 
 - `no_stress`
 - `before_every_alloc`
@@ -188,6 +193,7 @@ CTest run:
 - `major_every_1`, `major_every_3`, `major_every_7`
 - `minor_every_1`, `minor_every_4`
 - `minor_after_every_barrier`
+- `incremental_1`, `incremental_3_1`
 - `combined`
 
 The two independent observables are the canonical returned value/ID-free deep heap graph

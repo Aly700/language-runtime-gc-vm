@@ -176,11 +176,16 @@ for flag in flags {
   } else { }
 }
 count
-)SRC";
+    )SRC";
     for (const auto& schedule : fuzz::schedules()) {
-        require(execute_i64_source(source, schedule) == 2,
-                std::string("bool array iteration drifted under ") +
-                    schedule.name);
+        try {
+            require(execute_i64_source(source, schedule) == 2,
+                    std::string("bool array iteration drifted under ") +
+                        schedule.name);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(std::string("bool array schedule ") +
+                                     schedule.name + ": " + error.what());
+        }
     }
 }
 
@@ -623,8 +628,8 @@ pair(total, values)
 
 void loop_source_fuzz_corpus_and_mutants() {
     const auto schedules = fuzz::schedules();
-    require(schedules.size() == 10,
-            "loop source fuzz requires exactly ten deterministic schedules");
+    require(schedules.size() == 12,
+            "loop source fuzz requires exactly twelve deterministic schedules");
     for (std::uint64_t seed = 1; seed <= 10; ++seed) {
         for (const auto& schedule : schedules) {
             run_loop_seed_schedule(seed, schedule);

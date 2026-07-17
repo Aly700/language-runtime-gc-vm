@@ -32,6 +32,7 @@ struct StressConfig {
     bool collect_minor_after_every_write_barrier{false};
     std::uint64_t collect_every_n_instructions{0};
     std::uint64_t collect_minor_every_n_instructions{0};
+    std::vector<std::size_t> incremental_mark_step_budgets;
 };
 
 struct HeapMetrics {
@@ -70,6 +71,12 @@ struct HeapMetrics {
     std::uint64_t compaction_weak_ref_bytes{0};
     std::uint64_t ephemeron_fixpoint_passes{0};
     std::uint64_t ephemeron_activations{0};
+    std::uint64_t incremental_cycles_started{0};
+    std::uint64_t incremental_steps{0};
+    std::uint64_t incremental_budget_requested{0};
+    std::uint64_t incremental_objects_scanned{0};
+    std::uint64_t incremental_final_pauses{0};
+    std::uint64_t incremental_differential_validations{0};
 };
 
 enum class ObjectGeneration {
@@ -214,6 +221,15 @@ public:
     void collect(RootProvider& roots);
     void collect_minor();
     void collect_minor(RootProvider& roots);
+    void start_incremental_marking();
+    [[nodiscard]] std::size_t incremental_mark_step(std::size_t budget);
+    void finish_incremental_marking();
+    [[nodiscard]] bool incremental_marking_active() const {
+        return incremental_marking_active_;
+    }
+    [[nodiscard]] bool incremental_marking_quiescent() const {
+        return incremental_marking_active_ && incremental_mark_worklist_.empty();
+    }
     void set_stress_config(StressConfig config) { stress_config_ = config; }
 
     [[nodiscard]] const Object& object(ObjectId id) const;
@@ -283,6 +299,10 @@ public:
     void TEST_ONLY_skip_next_write_barrier_for_barrier_validator();
     void TEST_ONLY_promote_object_through_collector_path(ObjectId id);
     void TEST_ONLY_validate_gc_invariants() const;
+    void TEST_ONLY_skip_next_incremental_write_barrier() {
+        TEST_ONLY_skip_next_incremental_write_barrier_ = true;
+    }
+    void TEST_ONLY_validate_incremental_marking() const;
 
 private:
     friend class Handle;
@@ -329,6 +349,8 @@ private:
     void move_handle_root(Value* from, Value* to) noexcept;
     void trace_handle_roots(RootVisitor& visitor) const;
     void collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots);
+    void finish_incremental_marking_impl(RootProvider* roots,
+                                         std::span<Value*> extra_roots);
     void collect_with_extra_roots(std::span<Value*> extra_roots);
     void trace_collection_roots(RootVisitor& visitor, RootProvider* roots,
                                 std::span<Value*> extra_roots) const;
@@ -356,6 +378,9 @@ private:
     void enqueue_mark_value(Value value, std::vector<ObjectId>& worklist, CollectionKind kind);
     void enqueue_young_references_from_remembered_set(std::vector<ObjectId>& worklist);
     void drain_mark_worklist(std::vector<ObjectId>& worklist, CollectionKind kind);
+    [[nodiscard]] bool scan_next_mark_object(std::vector<ObjectId>& worklist,
+                                             CollectionKind kind);
+    void incremental_write_barrier_before_publish(ObjectId owner, Value value);
     void process_ephemeron_fixpoint(std::vector<ObjectId>& worklist, CollectionKind kind);
     [[nodiscard]] CompactionResult compact_live_objects(CollectionKind kind) const;
     void rewrite_references(const ForwardingTable& forwarding,
@@ -374,6 +399,8 @@ private:
     void prune_remembered_set();
     void validate_heap_storage_layout() const;
     void validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const;
+    void validate_incremental_result_against_atomic(
+        RootProvider* roots, std::span<Value*> extra_roots) const;
     void validate_remembered_set() const;
     void validate_weak_targets() const;
     void validate_ephemerons() const;
@@ -392,6 +419,9 @@ private:
     // validation and lookup work. No metric participates in runtime control flow.
     mutable HeapMetrics metrics_{};
     bool TEST_ONLY_skip_next_write_barrier_{false};
+    bool incremental_marking_active_{false};
+    std::vector<ObjectId> incremental_mark_worklist_;
+    bool TEST_ONLY_skip_next_incremental_write_barrier_{false};
     mutable std::uint64_t TEST_ONLY_validation_count_{0};
 };
 

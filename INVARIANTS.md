@@ -59,6 +59,21 @@
 
 ## GC
 
+- Incremental major marking consumes deterministic integer budgets measured in complete
+  descriptor object scans. No marking trigger or budget depends on wall-clock time,
+  threads, host addresses, payload bytes, or field count.
+- During an incremental cycle, no black object may have a descriptor-declared edge to a
+  white object. Every mutable reference-publishing funnel shades a white target before a
+  black owner publishes it; newly allocated objects enter the grey worklist. The same
+  descriptor visitor is the sole strong-edge authority for stepping and validation.
+- Final incremental completion re-traces current precise roots and derives the same live
+  set as atomic stop-the-world major marking at that boundary. Ephemeron fixpoint,
+  weak/ephemeron clearing, compaction, forwarding, installation, and validation remain one
+  stop-the-world phase, so no intermediate step boundary observes a death or movement.
+- Every collector-owned object ID must participate in movement. Map-growth relocation
+  forwards an active incremental grey worklist together with roots, descriptor edges,
+  remembered entries, and weak/ephemeron registries.
+
 - Every live object is reachable from an explicit root or another live object at collection start.
 - The collector must never treat non-reference values as references.
 - Every object-payload reference belongs to exactly one of two exhaustive categories.

@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("unknown mutant");
         }
         const auto schedules = fuzz::schedules();
-        if (schedules.size() != 10) throw std::runtime_error("expected ten schedules");
+        if (schedules.size() != 12) throw std::runtime_error("expected twelve schedules");
         if (argc == 5 && std::string(argv[1]) == "--seed" &&
             std::string(argv[3]) == "--schedule") {
             const auto seed = static_cast<std::uint64_t>(std::stoull(argv[2]));

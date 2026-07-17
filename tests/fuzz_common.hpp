@@ -77,12 +77,21 @@ inline std::vector<Schedule> schedules() {
     after_barrier.collect_minor_after_every_write_barrier = true;
     result.push_back({"minor_after_every_barrier", after_barrier});
 
+    lang::gc::StressConfig incremental_one;
+    incremental_one.incremental_mark_step_budgets = {1};
+    result.push_back({"incremental_1", incremental_one});
+
+    lang::gc::StressConfig incremental_mixed;
+    incremental_mixed.incremental_mark_step_budgets = {3, 1};
+    result.push_back({"incremental_3_1", incremental_mixed});
+
     lang::gc::StressConfig combined;
     combined.collect_before_every_allocation = true;
     combined.collect_after_every_allocation = true;
     combined.collect_every_n_instructions = 7;
     combined.collect_minor_every_n_instructions = 4;
     combined.collect_minor_after_every_write_barrier = true;
+    combined.incremental_mark_step_budgets = {2, 1};
     result.push_back({"combined", combined});
 
     return result;

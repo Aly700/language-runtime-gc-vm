@@ -83,6 +83,12 @@ VM::VM() {
 }
 
 void VM::set_gc_stress(gc::StressConfig config) {
+    for (const auto budget : config.incremental_mark_step_budgets) {
+        if (budget == 0) {
+            throw std::invalid_argument(
+                "incremental marking stress budgets must be positive");
+        }
+    }
     gc_stress_ = config;
     heap_.set_stress_config(config);
 }
@@ -156,6 +162,22 @@ void VM::collect_at_instruction_boundary_if_needed(const ModuleVerificationResul
         instructions_executed_ % minor_interval == 0) {
         assert_stack_matches_map(verification, frame);
         heap_.collect_minor();
+        assert_stack_matches_map(verification, frame);
+    }
+
+    if (!gc_stress_.incremental_mark_step_budgets.empty()) {
+        assert_stack_matches_map(verification, frame);
+        if (!heap_.incremental_marking_active()) {
+            heap_.start_incremental_marking();
+        }
+        const auto budget = gc_stress_.incremental_mark_step_budgets[
+            incremental_budget_cursor_ %
+            gc_stress_.incremental_mark_step_budgets.size()];
+        ++incremental_budget_cursor_;
+        (void)heap_.incremental_mark_step(budget);
+        if (heap_.incremental_marking_quiescent()) {
+            heap_.finish_incremental_marking();
+        }
         assert_stack_matches_map(verification, frame);
     }
 }
@@ -250,9 +272,13 @@ Value VM::execute(const VerifiedModule& module) {
 
 Value VM::execute_verified(const Module& module,
                            const ModuleVerificationResult& verification) {
+    if (heap_.incremental_marking_active()) {
+        heap_.finish_incremental_marking();
+    }
     frames_.clear();
     pending_exception_.reset();
     instructions_executed_ = 0;
+    incremental_budget_cursor_ = 0;
     push_frame(module, module.entry_function, {});
 
     while (!frames_.empty()) {
@@ -1074,6 +1100,9 @@ Value VM::execute_verified(const Module& module,
             break;
         }
         case OpCode::Return: {
+            if (heap_.incremental_marking_active()) {
+                heap_.finish_incremental_marking();
+            }
             const auto result = pop(frame);
             frames_.pop_back();
             ++instructions_executed_;
