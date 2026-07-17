@@ -40,6 +40,13 @@ public:
                 continue;
             }
             if (c == '=' && offset_ + 1 < source_.size() &&
+                source_[offset_ + 1] == '>') {
+                advance();
+                advance();
+                tokens.push_back(simple(TokenKind::FatArrow, start, "=>"));
+                continue;
+            }
+            if (c == '=' && offset_ + 1 < source_.size() &&
                 source_[offset_ + 1] == '=') {
                 advance();
                 advance();
@@ -203,6 +210,10 @@ private:
             kind = TokenKind::Type;
         } else if (text == "record") {
             kind = TokenKind::Record;
+        } else if (text == "variant") {
+            kind = TokenKind::Variant;
+        } else if (text == "match") {
+            kind = TokenKind::Match;
         } else if (text == "fn") {
             kind = TokenKind::Fn;
         } else if (text == "if") {

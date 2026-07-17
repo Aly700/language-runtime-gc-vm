@@ -35,6 +35,7 @@ struct LocalState {
     TypedValue value;
     SourcePosition declaration_position;
     bool immutable_loop_variable{false};
+    bool immutable_match_binding{false};
 };
 
 struct FlowState {
@@ -59,7 +60,8 @@ bool operator==(const LocalState& lhs, const LocalState& rhs) {
     return lhs.name == rhs.name && lhs.declared_type == rhs.declared_type &&
            lhs.index == rhs.index && lhs.initialized == rhs.initialized &&
            lhs.value == rhs.value &&
-           lhs.immutable_loop_variable == rhs.immutable_loop_variable;
+           lhs.immutable_loop_variable == rhs.immutable_loop_variable &&
+           lhs.immutable_match_binding == rhs.immutable_match_binding;
 }
 
 bool operator==(const FlowState& lhs, const FlowState& rhs) {
@@ -93,6 +95,7 @@ bool is_scalar_array_element_type(const TypeSpec& type) {
 bool is_reference_array_element_type(const TypeSpec& type) {
     return type.kind == TypeSpec::Kind::Pair || type.kind == TypeSpec::Kind::Named ||
            type.kind == TypeSpec::Kind::Record ||
+           type.kind == TypeSpec::Kind::Variant ||
            type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str ||
            type.kind == TypeSpec::Kind::Function || type.kind == TypeSpec::Kind::Map ||
            type.kind == TypeSpec::Kind::Weak;
@@ -106,6 +109,7 @@ bool is_weak_target_type(const TypeSpec& type) {
     return type.kind == TypeSpec::Kind::Pair ||
            type.kind == TypeSpec::Kind::Named ||
            type.kind == TypeSpec::Kind::Record ||
+           type.kind == TypeSpec::Kind::Variant ||
            type.kind == TypeSpec::Kind::Array ||
            type.kind == TypeSpec::Kind::Str ||
            type.kind == TypeSpec::Kind::Function ||
@@ -131,7 +135,8 @@ TypedValue value_from_type(TypeSpec type) {
         return array_value(std::move(type), std::move(element));
     }
     const bool includes_nil = type.kind == TypeSpec::Kind::Named ||
-                              type.kind == TypeSpec::Kind::Record;
+                              type.kind == TypeSpec::Kind::Record ||
+                              type.kind == TypeSpec::Kind::Variant;
     return TypedValue{std::move(type), {}, includes_nil, nullptr};
 }
 
@@ -242,6 +247,13 @@ struct RecordSymbol {
     RecordDecl* declaration{nullptr};
 };
 
+struct VariantSymbol {
+    std::string name;
+    SourcePosition position;
+    std::size_t index{0};
+    VariantDecl* declaration{nullptr};
+};
+
 class TypeChecker {
 public:
     explicit TypeChecker(std::size_t pair_site_count) : pair_site_count_(pair_site_count) {
@@ -272,7 +284,8 @@ public:
                      "nil literal requires a named object type context");
         } else if (result.includes_nil &&
                    result.type.kind != TypeSpec::Kind::Named &&
-                   result.type.kind != TypeSpec::Kind::Record) {
+                   result.type.kind != TypeSpec::Kind::Record &&
+                   result.type.kind != TypeSpec::Kind::Variant) {
             diagnose(program.result->position,
                      "program result requires non-nil value of type " +
                          type_name(result.type));
@@ -317,6 +330,10 @@ private:
         return std::string("\x1f") + "for$" + std::to_string(index);
     }
 
+    static std::string hidden_match_local_name(std::uint32_t index) {
+        return std::string("\x1f") + "match$" + std::to_string(index);
+    }
+
     void sync_locals(FlowState& state) const {
         assert(local_context_ != nullptr);
         while (state.locals.size() < local_context_->prototypes.size()) {
@@ -334,7 +351,7 @@ private:
             local_context_->prototypes.size());
         LocalState local{std::move(name), std::move(type), index, true,
                          std::move(value), position,
-                         immutable_loop_variable};
+                         immutable_loop_variable, false};
         local_context_->prototypes.push_back(local);
         sync_locals(state);
         state.locals[index] = std::move(local);
@@ -352,13 +369,14 @@ private:
                "loop-local indexes must be allocated in source order");
         local_context_->prototypes.push_back(LocalState{
             hidden_loop_local_name(index), type, index, false,
-            value_from_type(type), position, false});
+            value_from_type(type), position, false, false});
     }
 
     void collect_type_symbols(Program& program) {
+        std::set<std::string> nominal_names;
         for (std::size_t i = 0; i < program.types.size(); ++i) {
             auto& declaration = program.types[i];
-            if (find_type(declaration.name) != nullptr) {
+            if (!nominal_names.insert(declaration.name).second) {
                 diagnose(declaration.position,
                          "type '" + declaration.name + "' is already defined");
                 continue;
@@ -373,8 +391,7 @@ private:
         }
 
         for (auto& declaration : program.records) {
-            if (find_type(declaration.name) != nullptr ||
-                find_record(declaration.name) != nullptr) {
+            if (!nominal_names.insert(declaration.name).second) {
                 diagnose(declaration.position,
                          "type '" + declaration.name + "' is already defined");
                 continue;
@@ -386,6 +403,21 @@ private:
             symbol.declaration = &declaration;
             declaration.layout_index = symbol.index;
             records_.push_back(std::move(symbol));
+        }
+
+        for (auto& declaration : program.variants) {
+            if (!nominal_names.insert(declaration.name).second) {
+                diagnose(declaration.position,
+                         "type '" + declaration.name + "' is already defined");
+                continue;
+            }
+            VariantSymbol symbol;
+            symbol.name = declaration.name;
+            symbol.position = declaration.position;
+            symbol.index = variants_.size();
+            symbol.declaration = &declaration;
+            declaration.layout_index = symbol.index;
+            variants_.push_back(std::move(symbol));
         }
 
         for (auto& declaration : program.types) {
@@ -416,11 +448,30 @@ private:
             }
         }
 
+
+        for (auto& declaration : program.variants) {
+            std::set<std::string> case_names;
+            for (auto& variant_case : declaration.cases) {
+                if (!case_names.insert(variant_case.name).second) {
+                    diagnose(variant_case.position,
+                             "variant case '" + variant_case.name +
+                                 "' is already defined in '" +
+                                 declaration.name + "'");
+                }
+                for (auto& field : variant_case.fields) {
+                    resolve_type(field);
+                }
+            }
+        }
+
         for (auto& function : program.functions) {
             for (auto& parameter : function.parameters) {
                 resolve_type(parameter.type);
             }
             resolve_type(function.return_type);
+            for (auto& statement : function.statements) {
+                resolve_statement_types(statement);
+            }
         }
         for (auto& statement : program.statements) {
             resolve_statement_types(statement);
@@ -535,6 +586,24 @@ private:
         return &records_[*type.record_layout_index];
     }
 
+    VariantSymbol* find_variant(const std::string& name) {
+        for (auto& variant : variants_) {
+            if (variant.name == name) {
+                return &variant;
+            }
+        }
+        return nullptr;
+    }
+
+    const VariantSymbol* find_variant(const TypeSpec& type) const {
+        if (type.kind != TypeSpec::Kind::Variant ||
+            !type.variant_layout_index.has_value() ||
+            *type.variant_layout_index >= variants_.size()) {
+            return nullptr;
+        }
+        return &variants_[*type.variant_layout_index];
+    }
+
     const TypeSymbol* find_type(const TypeSpec& type) const {
         if (type.kind != TypeSpec::Kind::Named || !type.named_type_index.has_value() ||
             *type.named_type_index >= types_.size()) {
@@ -582,7 +651,8 @@ private:
             }
             return;
         }
-        if (type.kind == TypeSpec::Kind::Record) {
+        if (type.kind == TypeSpec::Kind::Record ||
+            type.kind == TypeSpec::Kind::Variant) {
             return;
         }
         if (type.kind != TypeSpec::Kind::Named) {
@@ -593,13 +663,17 @@ private:
             type.named_type_index = symbol->index;
             return;
         }
-        auto* record = find_record(type.name);
-        if (record == nullptr) {
+        if (auto* record = find_record(type.name); record != nullptr) {
+            type = record_type(record->name, record->index, type.position);
+            return;
+        }
+        auto* variant = find_variant(type.name);
+        if (variant == nullptr) {
             diagnose(type.position, "unknown type '" + type.name + "'");
             type = invalid_type();
             return;
         }
-        type = record_type(record->name, record->index, type.position);
+        type = variant_type(variant->name, variant->index, type.position);
     }
 
     void resolve_statement_types(Statement& statement) {
@@ -614,6 +688,11 @@ private:
         }
         for (auto& inner : statement.body) {
             resolve_statement_types(inner);
+        }
+        for (auto& arm : statement.match_arms) {
+            for (auto& inner : arm.body) {
+                resolve_statement_types(inner);
+            }
         }
     }
 
@@ -643,6 +722,16 @@ private:
             }
         }
         return std::nullopt;
+    }
+
+    bool capture_name_is_visible(const CaptureContext& context,
+                                 const std::string& name) const {
+        if (find_capture_index(*context.lambda, name).has_value() ||
+            find_local(*context.outer_state, name) != nullptr) {
+            return true;
+        }
+        return context.parent != nullptr &&
+               capture_name_is_visible(*context.parent, name);
     }
 
     std::optional<TypedValue> try_ensure_capture(
@@ -810,6 +899,12 @@ private:
             }
             return value.type == target;
         }
+        if (target.kind == TypeSpec::Kind::Variant) {
+            if (value.type.kind == TypeSpec::Kind::Nil) {
+                return true;
+            }
+            return value.type == target;
+        }
         if (target.kind == TypeSpec::Kind::Named) {
             if (value.type.kind == TypeSpec::Kind::Nil) {
                 return true;
@@ -875,6 +970,8 @@ private:
         case Statement::Kind::ForIn:
             check_for_in(statement, state);
             return true;
+        case Statement::Kind::Match:
+            return check_match(statement, state);
         case Statement::Kind::Break:
         case Statement::Kind::Continue:
             return check_loop_control(statement, state);
@@ -979,6 +1076,12 @@ private:
             if (local->immutable_loop_variable) {
                 diagnose(statement.target.base_position,
                          "cannot assign to immutable loop variable '" +
+                             local->name + "'");
+                return;
+            }
+            if (local->immutable_match_binding) {
+                diagnose(statement.target.base_position,
+                         "cannot assign to immutable match binding '" +
                              local->name + "'");
                 return;
             }
@@ -1100,6 +1203,184 @@ private:
         }
 
         store_field(receiver, field.name, assigned, state);
+    }
+
+    void deactivate_match_bindings(const MatchArm& arm, FlowState& state) {
+        sync_locals(state);
+        for (const auto& binding : arm.bindings) {
+            assert(binding.local_index < state.locals.size());
+            auto& local = state.locals[binding.local_index];
+            local.name = hidden_match_local_name(binding.local_index);
+            local.initialized = false;
+            local.immutable_match_binding = false;
+        }
+    }
+
+    bool check_match(Statement& statement, FlowState& state) {
+        const auto subject = check_expr(*statement.condition, state);
+        const auto* variant = find_variant(subject.type);
+        if (variant == nullptr) {
+            if (!is_invalid(subject.type)) {
+                diagnose(statement.condition->position,
+                         "match subject must have variant type");
+            }
+            return true;
+        }
+        if (subject.includes_nil) {
+            diagnose(statement.condition->position,
+                     "match subject requires a proven non-nil variant");
+        }
+        statement.match_variant_layout_index = variant->index;
+
+        std::set<std::string> seen_cases;
+        std::vector<bool> covered(variant->declaration->cases.size(), false);
+        bool valid = !subject.includes_nil;
+        for (auto& arm : statement.match_arms) {
+            std::optional<std::size_t> case_index;
+            for (std::size_t i = 0; i < variant->declaration->cases.size(); ++i) {
+                if (variant->declaration->cases[i].name == arm.case_name) {
+                    case_index = i;
+                    break;
+                }
+            }
+            if (!case_index.has_value()) {
+                diagnose(arm.position, "unknown variant case '" + arm.case_name + "'");
+                valid = false;
+                continue;
+            }
+            arm.case_index = *case_index;
+            if (!seen_cases.insert(arm.case_name).second) {
+                diagnose(arm.position, "duplicate match arm for case '" +
+                                           arm.case_name + "'");
+                valid = false;
+            } else {
+                covered[*case_index] = true;
+            }
+            const auto& fields = variant->declaration->cases[*case_index].fields;
+            if (arm.bindings.size() != fields.size()) {
+                diagnose(arm.position, "match arm '" + arm.case_name +
+                                           "' expects " +
+                                           std::to_string(fields.size()) +
+                                           " bindings but got " +
+                                           std::to_string(arm.bindings.size()));
+                valid = false;
+            }
+        }
+        std::string missing;
+        for (std::size_t i = 0; i < covered.size(); ++i) {
+            if (!covered[i]) {
+                if (!missing.empty()) {
+                    missing += ", ";
+                }
+                missing += variant->declaration->cases[i].name;
+            }
+        }
+        if (!missing.empty()) {
+            diagnose(statement.position,
+                     "non-exhaustive match; missing cases: " + missing);
+            valid = false;
+        }
+
+        if (!statement.match_locals_allocated) {
+            for (auto& arm : statement.match_arms) {
+                if (arm.case_index >= variant->declaration->cases.size()) {
+                    continue;
+                }
+                const auto& fields = variant->declaration->cases[arm.case_index].fields;
+                const auto count = std::min(fields.size(), arm.bindings.size());
+                std::set<std::string> arm_names;
+                for (std::size_t i = 0; i < count; ++i) {
+                    auto& binding = arm.bindings[i];
+                    bool conflict = false;
+                    if (!arm_names.insert(binding.name).second) {
+                        diagnose(binding.position, "duplicate match binding '" +
+                                                       binding.name + "'");
+                        conflict = true;
+                    }
+                    if (find_local(state, binding.name) != nullptr) {
+                        diagnose(binding.position, "match binding '" + binding.name +
+                                                       "' conflicts with an existing local");
+                        conflict = true;
+                    }
+                    if (capture_context_ != nullptr &&
+                        capture_name_is_visible(*capture_context_, binding.name)) {
+                        diagnose(binding.position, "match binding '" + binding.name +
+                                                       "' conflicts with an existing capture");
+                        conflict = true;
+                    }
+                    (void)conflict;
+                    binding.local_index = static_cast<std::uint32_t>(
+                        local_context_->prototypes.size());
+                    auto value = value_from_type(fields[i]);
+                    local_context_->prototypes.push_back(LocalState{
+                        hidden_match_local_name(binding.local_index), fields[i],
+                        binding.local_index, false, std::move(value), binding.position,
+                        false, false});
+                    sync_locals(state);
+                }
+            }
+            statement.match_locals_allocated = true;
+        } else {
+            sync_locals(state);
+        }
+
+        std::optional<FlowState> joined;
+        bool any_falls = false;
+        for (auto& arm : statement.match_arms) {
+            if (arm.case_index >= variant->declaration->cases.size()) {
+                continue;
+            }
+            sync_locals(state);
+            auto arm_state = state;
+            const auto& fields = variant->declaration->cases[arm.case_index].fields;
+            const auto count = std::min(fields.size(), arm.bindings.size());
+            for (std::size_t i = 0; i < count; ++i) {
+                auto& local = arm_state.locals[arm.bindings[i].local_index];
+                local.name = arm.bindings[i].name;
+                local.declared_type = fields[i];
+                local.initialized = true;
+                local.value = value_from_type(fields[i]);
+                local.declaration_position = arm.bindings[i].position;
+                local.immutable_match_binding = true;
+            }
+            std::vector<std::pair<std::size_t, std::size_t>> loop_sizes;
+            loop_sizes.reserve(loop_contexts_.size());
+            for (auto* context : loop_contexts_) {
+                loop_sizes.push_back({context->break_states.size(),
+                                      context->continue_states.size()});
+            }
+            const bool falls = check_block(arm.body, arm_state, false);
+            deactivate_match_bindings(arm, arm_state);
+            for (std::size_t i = 0; i < loop_contexts_.size(); ++i) {
+                auto& context = *loop_contexts_[i];
+                for (auto& broken : context.break_states) {
+                    sync_locals(broken);
+                }
+                for (auto& continued : context.continue_states) {
+                    sync_locals(continued);
+                }
+                for (std::size_t j = loop_sizes[i].first;
+                     j < context.break_states.size(); ++j) {
+                    deactivate_match_bindings(arm, context.break_states[j]);
+                }
+                for (std::size_t j = loop_sizes[i].second;
+                     j < context.continue_states.size(); ++j) {
+                    deactivate_match_bindings(arm, context.continue_states[j]);
+                }
+            }
+            if (falls) {
+                if (joined.has_value()) {
+                    sync_locals(*joined);
+                }
+                joined = joined.has_value() ? join_states(*joined, arm_state)
+                                            : std::optional<FlowState>(arm_state);
+                any_falls = true;
+            }
+        }
+        if (any_falls) {
+            state = std::move(*joined);
+        }
+        return valid && any_falls;
     }
 
     bool check_if(Statement& statement, FlowState& state) {
@@ -1426,6 +1707,8 @@ private:
             return check_pair_literal(expression, state);
         case Expr::Kind::RecordLiteral:
             return check_record_literal(expression, state);
+        case Expr::Kind::VariantLiteral:
+            return check_variant_literal(expression, state);
         case Expr::Kind::ArrayLiteral:
             return check_array_literal(expression, state);
         case Expr::Kind::ArraySized:
@@ -1678,6 +1961,54 @@ private:
             record_type(record->name, record->index, expression.position));
         value.includes_nil = false;
         return annotate(expression, std::move(value));
+    }
+
+    TypedValue check_variant_literal(Expr& expression, FlowState& state) {
+        std::vector<TypedValue> arguments;
+        arguments.reserve(expression.arguments.size());
+        for (auto& argument : expression.arguments) {
+            arguments.push_back(check_expr(*argument, state));
+        }
+        if (expression.variant_layout_index >= variants_.size()) {
+            return annotate(expression, invalid_value());
+        }
+        const auto& variant = variants_[expression.variant_layout_index];
+        if (variant.declaration == nullptr ||
+            expression.variant_case_index >= variant.declaration->cases.size()) {
+            return annotate(expression, invalid_value());
+        }
+        const auto& variant_case =
+            variant.declaration->cases[expression.variant_case_index];
+        bool valid = true;
+        if (arguments.size() != variant_case.fields.size()) {
+            diagnose(expression.position,
+                     "variant case '" + variant.name + "." +
+                         variant_case.name + "' expects " +
+                         std::to_string(variant_case.fields.size()) +
+                         " payload values but got " +
+                         std::to_string(arguments.size()));
+            valid = false;
+        }
+        const auto checked_count =
+            std::min(arguments.size(), variant_case.fields.size());
+        for (std::size_t i = 0; i < checked_count; ++i) {
+            if (!is_invalid(arguments[i].type) &&
+                !value_conforms_to_type(arguments[i], variant_case.fields[i],
+                                        state)) {
+                diagnose(expression.arguments[i]->position,
+                         "variant payload " + std::to_string(i) + " expects " +
+                             type_name(variant_case.fields[i]) + " but got " +
+                             type_name(arguments[i].type));
+                valid = false;
+            }
+        }
+        if (!valid) {
+            return annotate(expression, invalid_value());
+        }
+        auto result = value_from_type(variant_type(
+            variant.name, variant.index, expression.position));
+        result.includes_nil = false;
+        return annotate(expression, std::move(result));
     }
 
     bool require_nonnil_ref_array_element(const TypedValue& value,
@@ -2054,6 +2385,7 @@ private:
         const auto value = check_expr(*expression.receiver, state);
         if (!is_invalid(value.type) && !is_pair(value.type) &&
             value.type.kind != TypeSpec::Kind::Record &&
+            value.type.kind != TypeSpec::Kind::Variant &&
             !value.includes_nil && value.type.kind != TypeSpec::Kind::Nil) {
             diagnose(expression.position,
                      "is_nil requires record, pair, nil, or nil-able object operand");
@@ -2093,6 +2425,35 @@ private:
     }
 
     TypedValue check_call(Expr& expression, FlowState& state) {
+        if (expression.receiver != nullptr &&
+            expression.receiver->kind == Expr::Kind::Field &&
+            expression.receiver->receiver != nullptr &&
+            expression.receiver->receiver->kind == Expr::Kind::Variable) {
+            const auto& variant_name = expression.receiver->receiver->name;
+            if (auto* variant = find_variant(variant_name); variant != nullptr &&
+                variant->declaration != nullptr) {
+                const auto& case_name = expression.receiver->name;
+                const auto& cases = variant->declaration->cases;
+                const auto found = std::find_if(
+                    cases.begin(), cases.end(), [&](const VariantCaseDecl& item) {
+                        return item.name == case_name;
+                    });
+                if (found == cases.end()) {
+                    for (auto& argument : expression.arguments) {
+                        (void)check_expr(*argument, state);
+                    }
+                    diagnose(expression.receiver->position,
+                             "unknown variant case '" + case_name + "'");
+                    return annotate(expression, invalid_value());
+                }
+                const auto case_index = static_cast<std::size_t>(
+                    std::distance(cases.begin(), found));
+                expression.variant_layout_index = variant->index;
+                expression.variant_case_index = case_index;
+                expression.kind = Expr::Kind::VariantLiteral;
+                return check_variant_literal(expression, state);
+            }
+        }
         std::vector<TypedValue> arguments;
         arguments.reserve(expression.arguments.size());
         for (auto& argument : expression.arguments) {
@@ -2318,6 +2679,7 @@ private:
     FlowState state_;
     std::vector<TypeSymbol> types_;
     std::vector<RecordSymbol> records_;
+    std::vector<VariantSymbol> variants_;
     std::vector<FunctionSymbol> functions_;
     CaptureContext* capture_context_{nullptr};
     LocalContext* local_context_{nullptr};

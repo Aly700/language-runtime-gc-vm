@@ -61,12 +61,16 @@ enum class OpCode {
     AllocRecord,
     RecordGet,
     RecordSet,
+    AllocVariant,
+    VariantTag,
+    VariantGet,
 };
 
 struct Instruction {
     OpCode op{OpCode::Return};
     std::int64_t operand{0};
     std::int64_t operand2{0};
+    std::int64_t operand3{0};
 };
 
 enum class ValueKind {
@@ -80,6 +84,7 @@ enum class ValueKind {
     Map,
     Weak,
     Record,
+    Variant,
 };
 
 struct SignatureValue {
@@ -94,31 +99,34 @@ struct SignatureValue {
     std::shared_ptr<SignatureValue> function_return;
     std::optional<std::size_t> named_type;
     std::optional<std::size_t> record_layout;
+    std::optional<std::size_t> variant_layout;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == ValueKind::Object && !named_type.has_value() &&
                left != nullptr && right != nullptr && element == nullptr &&
                key == nullptr && value == nullptr && weak_target == nullptr &&
-               !record_layout.has_value();
+               !record_layout.has_value() && !variant_layout.has_value();
     }
 
     [[nodiscard]] bool has_array_element() const {
         return kind == ValueKind::Array && element != nullptr &&
                left == nullptr && right == nullptr && key == nullptr &&
                value == nullptr && weak_target == nullptr &&
-               !named_type.has_value() && !record_layout.has_value();
+               !named_type.has_value() && !record_layout.has_value() &&
+               !variant_layout.has_value();
     }
 
     [[nodiscard]] bool is_named_type_reference() const {
         return kind == ValueKind::Object && named_type.has_value() &&
-               !record_layout.has_value();
+               !record_layout.has_value() && !variant_layout.has_value();
     }
 
     [[nodiscard]] bool has_function_signature() const {
         return kind == ValueKind::Function && function_return != nullptr &&
                left == nullptr && right == nullptr && element == nullptr &&
                key == nullptr && value == nullptr && weak_target == nullptr &&
-               !named_type.has_value() && !record_layout.has_value();
+               !named_type.has_value() && !record_layout.has_value() &&
+               !variant_layout.has_value();
     }
 
     [[nodiscard]] bool has_map_entries() const {
@@ -126,7 +134,7 @@ struct SignatureValue {
                left == nullptr && right == nullptr && element == nullptr &&
                function_return == nullptr && function_parameters.empty() &&
                weak_target == nullptr && !named_type.has_value() &&
-               !record_layout.has_value();
+               !record_layout.has_value() && !variant_layout.has_value();
     }
 
     [[nodiscard]] bool has_weak_target() const {
@@ -134,7 +142,8 @@ struct SignatureValue {
                left == nullptr && right == nullptr && element == nullptr &&
                key == nullptr && value == nullptr &&
                function_return == nullptr && function_parameters.empty() &&
-               !named_type.has_value() && !record_layout.has_value();
+               !named_type.has_value() && !record_layout.has_value() &&
+               !variant_layout.has_value();
     }
 
     [[nodiscard]] bool is_record_layout_reference() const {
@@ -142,7 +151,15 @@ struct SignatureValue {
                left == nullptr && right == nullptr && element == nullptr &&
                key == nullptr && value == nullptr && weak_target == nullptr &&
                function_return == nullptr && function_parameters.empty() &&
-               !named_type.has_value();
+               !named_type.has_value() && !variant_layout.has_value();
+    }
+
+    [[nodiscard]] bool is_variant_layout_reference() const {
+        return kind == ValueKind::Variant && variant_layout.has_value() &&
+               left == nullptr && right == nullptr && element == nullptr &&
+               key == nullptr && value == nullptr && weak_target == nullptr &&
+               function_return == nullptr && function_parameters.empty() &&
+               !named_type.has_value() && !record_layout.has_value();
     }
 };
 
@@ -207,11 +224,18 @@ inline SignatureValue record_signature(std::size_t layout_index) {
     return signature;
 }
 
+inline SignatureValue variant_signature(std::size_t layout_index) {
+    SignatureValue signature;
+    signature.kind = ValueKind::Variant;
+    signature.variant_layout = layout_index;
+    return signature;
+}
+
 inline bool signature_value_is_reference(const SignatureValue& value) {
     return value.kind == ValueKind::Object || value.kind == ValueKind::Array ||
            value.kind == ValueKind::Str || value.kind == ValueKind::Function ||
            value.kind == ValueKind::Map || value.kind == ValueKind::Weak ||
-           value.kind == ValueKind::Record;
+           value.kind == ValueKind::Record || value.kind == ValueKind::Variant;
 }
 
 struct NamedTypeSignature {
@@ -246,6 +270,17 @@ struct RecordLayout {
     std::vector<bool> reference_map;
 };
 
+struct VariantCaseLayout {
+    std::string name;
+    std::vector<SignatureValue> field_types;
+    std::vector<bool> reference_map;
+};
+
+struct VariantLayout {
+    std::string name;
+    std::vector<VariantCaseLayout> cases;
+};
+
 struct StackMap {
     // Stack maps describe the abstract stack before executing the instruction at the same pc.
     // Bit i is true only when stack slot i is proven to contain an object reference.
@@ -271,6 +306,7 @@ struct Module {
     std::vector<ClosureLayout> closure_layouts;
     std::vector<MapLayout> map_layouts;
     std::vector<RecordLayout> record_layouts;
+    std::vector<VariantLayout> variant_layouts;
 };
 
 struct VerificationResult {
@@ -366,6 +402,15 @@ enum class VerifierReason {
     RecordLayoutMismatch,     // Record receiver nominal layout differs from opcode.
     RecordReceiverMayBeNil,   // Record access/store receiver lacks nil refinement.
     RecordFieldTypeMismatch,  // RecordSet value violates its declared field type.
+    BadVariantLayoutShape,    // Variant layouts/cases/fields/bitmaps are malformed.
+    BadVariantLayoutIndex,    // Variant opcode layout operand is out of range.
+    BadVariantCaseIndex,      // Variant opcode case operand is out of range.
+    BadVariantFieldIndex,     // VariantGet field operand is out of range.
+    BadVariantInitializerArity, // AllocVariant stack lacks all case fields.
+    BadVariantInitializerType, // AllocVariant initializer violates its field type.
+    VariantOperationOnNonVariant, // VariantTag/Get receiver is not a variant.
+    VariantLayoutMismatch,    // Variant receiver nominal layout differs from opcode.
+    VariantReceiverMayBeNil,  // VariantTag/Get receiver lacks nil refinement.
 };
 
 struct VerifierDiagnostic {

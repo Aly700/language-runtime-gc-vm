@@ -47,12 +47,21 @@ only mapped fields, so interleaved scalar payload bits remain opaque. All field 
 uses one pre-publication barrier funnel. See
 [ADR 0010](adr/0010-record-layouts.md).
 
+### Variant layouts
+
+Top-level variants are nominal immutable tagged objects. Every case has its own exact
+payload width and reference bitmap; the retained raw tag selects the sole bitmap scanned
+by the shared descriptor. Exhaustive matches introduce immutable bindings, and guarded
+payload reads preserve exact stack maps across movement. See
+[ADR 0011](adr/0011-variant-layouts.md).
+
 ### Descriptor-driven precision
 
 One object descriptor visitor defines every strong heap edge. It visits pair fields,
 reference-array elements, mapped closure captures, statically reference-typed map slots,
-and bitmap-selected record fields; scalar arrays, scalar record fields, and immutable
-string bytes expose no edges. Marking, forwarding, remembered-set validation, and
+bitmap-selected record fields, and active-case bitmap-selected variant payloads; scalar
+arrays, scalar record/variant fields, inactive cases, and immutable string bytes expose no
+edges. Marking, forwarding, remembered-set validation, and
 post-collection validation use that same authority. See [INVARIANTS.md](INVARIANTS.md#gc) and
 [ADR 0002](adr/0002-immutable-string-representation.md).
 
@@ -61,8 +70,8 @@ post-collection validation use that same authority. See [INVARIANTS.md](INVARIAN
 All reference-publishing mutations pass through heap-owned funnels for pair fields,
 reference-array elements, record fields, and map entries. An old-to-young store records
 its owner before publication. Immutable strings and closures have no mutator barrier path;
-promotion records descriptor-declared closure or record edges created by the collector
-itself. See
+promotion records descriptor-declared closure, record, or variant edges created by the
+collector itself. See
 [ARCHITECTURE.md](ARCHITECTURE.md#generational-collection) and
 [ADR 0004](adr/0004-deterministic-insertion-order-maps.md).
 
@@ -108,7 +117,8 @@ counts["gc"]
 The language includes:
 
 - `i64`, `bool`, immutable byte `str`, typed and opaque pairs, nullable named recursive
-  pair types, nominal recursive records with ordered mutable fields, scalar/reference
+  pair types, nominal recursive records with ordered mutable fields, nominal recursive
+  variants with immutable tagged cases and exhaustive matching, scalar/reference
   arrays, insertion-order maps, weak references, and structural function types;
 - named functions, recursion, first-class function values, returned lambdas, and
   immutable capture snapshots;
@@ -119,9 +129,10 @@ The language includes:
 - deterministic bounded `print(str)` output captured by the VM rather than written to a
   host stream.
 
-Six executable programs live in [examples](examples): a named recursive linked list,
+Seven executable programs live in [examples](examples): a named recursive linked list,
 a capture-snapshot accumulator factory, insertion-order word frequencies, a higher-order
-array pipeline, string/conversion tools, and a recursive record showcase. Each `.lang` file
+array pipeline, string/conversion tools, a recursive record showcase, and a recursive
+variant showcase. Each `.lang` file
 has a byte-pinned `.expected` output. `lang_examples` compiles every file and runs it under
 both no stress and maximum combined major/minor/allocation/barrier stress.
 
@@ -138,6 +149,10 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+The acceptance gate contains 32 CTest targets. The Iteration 34 correctness target reports
+nine internal variant cases; keeping those two levels distinct avoids inflating the CTest
+tally with executable-local case counts.
+
 Run only the executable documentation:
 
 ```bash
@@ -149,8 +164,8 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 14 isolated deterministic positive corpora containing 580 generated
-programs. Each runs under the same 10 schedules, for 5,800 positive executions per full
+The suite has 15 isolated deterministic positive corpora containing 612 generated
+programs. Each runs under the same 10 schedules, for 6,120 positive executions per full
 CTest run:
 
 - `no_stress`
@@ -185,6 +200,7 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration29_output
 ./build/lang_iteration31_strings2
 ./build/lang_iteration33_records_fuzz
+./build/lang_iteration34_variants_fuzz
 ```
 
 ### Replay by grammar
@@ -207,6 +223,7 @@ Use one of the schedule names above.
 | source `output` | 32 | `./build/lang_iteration29_output --grammar output --seed N --schedule NAME` | `./build/lang_iteration29_output --grammar output --seed N --mutant 0..3` |
 | source `strings2` | 32 | `./build/lang_iteration31_strings2 --grammar strings2 --seed N --schedule NAME` | `./build/lang_iteration31_strings2 --grammar strings2 --seed N --mutant 0..3` |
 | source `records` | 32 | `./build/lang_iteration33_records_fuzz --grammar records --seed N --schedule NAME` | `./build/lang_iteration33_records_fuzz --grammar records --seed N --mutant 0..6` |
+| source `variants` | 32 | `./build/lang_iteration34_variants_fuzz --grammar variants --seed N --schedule NAME` | `./build/lang_iteration34_variants_fuzz --grammar variants --seed N --mutant 0..8` |
 
 For example:
 
@@ -232,6 +249,7 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration29_output --dump-corpus output
 ./build/lang_iteration31_strings2 --dump-corpus strings2
 ./build/lang_iteration33_records_fuzz --dump-corpus records
+./build/lang_iteration34_variants_fuzz --dump-corpus variants
 ```
 
 The generator design, oracle, schedules, and replay behavior are detailed in

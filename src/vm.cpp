@@ -553,6 +553,89 @@ Value VM::execute_verified(const Module& module,
             ++frame.pc;
             break;
         }
+        case OpCode::AllocVariant: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.variant_layouts.size() &&
+                   "verifier invariant violated: AllocVariant layout must be in range");
+            const auto layout_index = static_cast<std::size_t>(ins.operand);
+            const auto& layout = module.variant_layouts[layout_index];
+            assert(ins.operand2 >= 0 &&
+                   static_cast<std::size_t>(ins.operand2) <
+                       layout.cases.size() &&
+                   "verifier invariant violated: AllocVariant case must be in range");
+            const auto case_index = static_cast<std::size_t>(ins.operand2);
+            const auto& case_layout = layout.cases[case_index];
+            std::vector<Value> fields(case_layout.field_types.size(),
+                                      Value::nil());
+            for (std::size_t i = fields.size(); i > 0; --i) {
+                fields[i - 1] = pop(frame);
+            }
+            std::vector<std::vector<bool>> case_reference_maps;
+            case_reference_maps.reserve(layout.cases.size());
+            for (const auto& variant_case : layout.cases) {
+                case_reference_maps.push_back(variant_case.reference_map);
+            }
+            push(frame, Value::object(heap_.allocate_variant(
+                            layout_index, case_index, std::move(fields),
+                            std::move(case_reference_maps))));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::VariantTag: {
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: VariantTag receiver must be object");
+            const auto object = receiver.as_object();
+            assert(heap_.TEST_ONLY_is_variant(object) &&
+                   "verifier invariant violated: VariantTag receiver must be variant");
+            const auto layout_index = heap_.variant_layout_index(object);
+            assert(layout_index < module.variant_layouts.size() &&
+                   "verifier invariant violated: VariantTag layout must be in range");
+            const auto tag = heap_.variant_tag(object);
+            assert(tag < module.variant_layouts[layout_index].cases.size() &&
+                   "verifier invariant violated: VariantTag tag must be in range");
+            assert(tag <= static_cast<std::size_t>(
+                              std::numeric_limits<std::int64_t>::max()) &&
+                   "validated variant tag must fit in i64");
+            push(frame, Value::int64(static_cast<std::int64_t>(tag)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::VariantGet: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.variant_layouts.size() &&
+                   "verifier invariant violated: VariantGet layout must be in range");
+            const auto layout_index = static_cast<std::size_t>(ins.operand);
+            const auto& layout = module.variant_layouts[layout_index];
+            assert(ins.operand2 >= 0 &&
+                   static_cast<std::size_t>(ins.operand2) <
+                       layout.cases.size() &&
+                   "verifier invariant violated: VariantGet case must be in range");
+            const auto case_index = static_cast<std::size_t>(ins.operand2);
+            const auto& case_layout = layout.cases[case_index];
+            assert(ins.operand3 >= 0 &&
+                   static_cast<std::size_t>(ins.operand3) <
+                       case_layout.field_types.size() &&
+                   "verifier invariant violated: VariantGet field must be in range");
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   "verifier invariant violated: VariantGet receiver must be object");
+            const auto object = receiver.as_object();
+            assert(heap_.TEST_ONLY_is_variant(object) &&
+                   "verifier invariant violated: VariantGet receiver must be variant");
+            assert(heap_.variant_layout_index(object) == layout_index &&
+                   "verifier invariant violated: VariantGet receiver layout mismatch");
+            if (heap_.variant_tag(object) != case_index) {
+                throw std::runtime_error("variant case tag mismatch");
+            }
+            push(frame, heap_.variant_get(
+                            object,
+                            static_cast<std::size_t>(ins.operand3)));
+            ++frame.pc;
+            break;
+        }
         case OpCode::AllocArray: {
             const auto init_value = pop(frame);
             const auto length_value = pop(frame);

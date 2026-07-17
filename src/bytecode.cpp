@@ -30,6 +30,7 @@ enum class AbstractKind {
     Weak,
     MaybeReference,
     Record,
+    Variant,
     Nil,
     Poison,
 };
@@ -49,6 +50,7 @@ struct AbstractValue {
     std::shared_ptr<const AbstractValue> reference_target;
     std::optional<std::size_t> signature_named_type;
     std::optional<std::size_t> signature_record_layout;
+    std::optional<std::size_t> signature_variant_layout;
     std::optional<std::size_t> source_local;
     std::optional<std::size_t> nil_test_local;
 };
@@ -178,6 +180,12 @@ const char* op_name(OpCode op) {
         return "RecordGet";
     case OpCode::RecordSet:
         return "RecordSet";
+    case OpCode::AllocVariant:
+        return "AllocVariant";
+    case OpCode::VariantTag:
+        return "VariantTag";
+    case OpCode::VariantGet:
+        return "VariantGet";
     }
     return "<invalid>";
 }
@@ -204,6 +212,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Weak";
     case ValueKind::Record:
         return "Record";
+    case ValueKind::Variant:
+        return "Variant";
     }
     return "<invalid>";
 }
@@ -232,6 +242,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "MaybeReference";
     case AbstractKind::Record:
         return "Record";
+    case AbstractKind::Variant:
+        return "Variant";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -292,6 +304,7 @@ bool signature_values_equal(const SignatureValue& lhs,
                             const SignatureValue& rhs) {
     if (lhs.kind != rhs.kind || lhs.named_type != rhs.named_type ||
         lhs.record_layout != rhs.record_layout ||
+        lhs.variant_layout != rhs.variant_layout ||
         lhs.function_parameters.size() != rhs.function_parameters.size() ||
         !signature_value_ptr_equal(lhs.left, rhs.left) ||
         !signature_value_ptr_equal(lhs.right, rhs.right) ||
@@ -356,6 +369,15 @@ AbstractValue record_value(std::size_t layout_index, bool includes_nil = true) {
     return value;
 }
 
+AbstractValue variant_value(std::size_t layout_index,
+                            bool includes_nil = true) {
+    AbstractValue value;
+    value.kind = AbstractKind::Variant;
+    value.includes_nil = includes_nil;
+    value.signature_variant_layout = layout_index;
+    return value;
+}
+
 AbstractValue without_provenance(AbstractValue value) {
     value.source_local.reset();
     value.nil_test_local.reset();
@@ -411,6 +433,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Weak;
     case ValueKind::Record:
         return AbstractKind::Record;
+    case ValueKind::Variant:
+        return AbstractKind::Variant;
     }
     return AbstractKind::Poison;
 }
@@ -430,6 +454,9 @@ bool signature_array_uses_ref_payload(const SignatureValue& signature) {
 AbstractValue value_from_signature(const SignatureValue& signature) {
     if (signature.is_record_layout_reference()) {
         return record_value(*signature.record_layout);
+    }
+    if (signature.is_variant_layout_reference()) {
+        return variant_value(*signature.variant_layout);
     }
     if (signature.has_weak_target()) {
         return weak_value(value_from_signature(*signature.weak_target));
@@ -463,7 +490,8 @@ AbstractValue value_from_signature(const SignatureValue& signature) {
         auto value = ref_array_value();
         auto element = value_from_signature(*signature.element);
         if (element.kind == AbstractKind::Object ||
-            element.kind == AbstractKind::Record) {
+            element.kind == AbstractKind::Record ||
+            element.kind == AbstractKind::Variant) {
             element.includes_nil = false;
         }
         value.signature_array_element = abstract_value_ptr(std::move(element));
@@ -477,7 +505,7 @@ bool is_reference_kind(AbstractKind kind) {
            kind == AbstractKind::RefArray || kind == AbstractKind::Str ||
            kind == AbstractKind::Function || kind == AbstractKind::Map ||
            kind == AbstractKind::Weak || kind == AbstractKind::MaybeReference ||
-           kind == AbstractKind::Record;
+           kind == AbstractKind::Record || kind == AbstractKind::Variant;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -512,6 +540,9 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
     if (signature.is_record_layout_reference()) {
         return *signature.record_layout < module.record_layouts.size();
     }
+    if (signature.is_variant_layout_reference()) {
+        return *signature.variant_layout < module.variant_layouts.size();
+    }
     if (signature.is_named_type_reference()) {
         return signature.kind == ValueKind::Object &&
                *signature.named_type < module.named_types.size() &&
@@ -520,7 +551,8 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature.value == nullptr && signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty() &&
-               !signature.record_layout.has_value();
+               !signature.record_layout.has_value() &&
+               !signature.variant_layout.has_value();
     }
     if (signature.has_pair_fields()) {
         return signature_shape_matches_kind(*signature.left, signature.left->kind,
@@ -532,7 +564,8 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty() &&
-               !signature.record_layout.has_value();
+               !signature.record_layout.has_value() &&
+               !signature.variant_layout.has_value();
     }
     if (signature.has_array_element()) {
         return signature.kind == ValueKind::Array &&
@@ -543,7 +576,8 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
                signature.weak_target == nullptr &&
                signature.function_return == nullptr &&
                signature.function_parameters.empty() &&
-               !signature.record_layout.has_value();
+               !signature.record_layout.has_value() &&
+               !signature.variant_layout.has_value();
     }
     if (signature.has_function_signature()) {
         if (!signature_shape_matches_kind(*signature.function_return,
@@ -582,12 +616,16 @@ bool signature_shape_matches_kind(const SignatureValue& signature, ValueKind kin
     if (signature.kind == ValueKind::Record) {
         return false;
     }
+    if (signature.kind == ValueKind::Variant) {
+        return false;
+    }
     return signature.left == nullptr && signature.right == nullptr &&
            signature.element == nullptr && signature.function_return == nullptr &&
            signature.key == nullptr && signature.value == nullptr &&
            signature.weak_target == nullptr &&
            signature.function_parameters.empty() && !signature.named_type.has_value() &&
-           !signature.record_layout.has_value();
+           !signature.record_layout.has_value() &&
+           !signature.variant_layout.has_value();
 }
 
 bool is_valid_map_key_type(const SignatureValue& key) {
@@ -718,6 +756,17 @@ bool module_weak_target_types_are_valid(
             }
         }
     }
+    for (const auto& layout : module.variant_layouts) {
+        for (const auto& case_layout : layout.cases) {
+            for (const auto& field : case_layout.field_types) {
+                if (reject_invalid(
+                        0, field,
+                        "variant field contains a non-object weak target")) {
+                    return false;
+                }
+            }
+        }
+    }
     return true;
 }
 
@@ -777,6 +826,18 @@ bool module_map_key_types_are_valid(
             }
         }
     }
+    for (const auto& layout : module.variant_layouts) {
+        for (const auto& case_layout : layout.cases) {
+            for (const auto& field : case_layout.field_types) {
+                if (signature_has_invalid_map_key(field)) {
+                    return reject(
+                        diagnostics, 0, std::nullopt,
+                        VerifierReason::InvalidMapKeyType,
+                        "variant field contains a map key other than i64, bool, or str");
+                }
+            }
+        }
+    }
     return true;
 }
 
@@ -805,6 +866,62 @@ bool record_layouts_are_well_formed(
                 return reject(diagnostics, 0, std::nullopt,
                               VerifierReason::BadRecordLayoutShape,
                               message.str());
+            }
+        }
+    }
+    return true;
+}
+
+bool variant_layouts_are_well_formed(
+    const Module& module, std::vector<VerifierDiagnostic>& diagnostics) {
+    std::set<std::string> layout_names;
+    for (std::size_t layout_index = 0;
+         layout_index < module.variant_layouts.size(); ++layout_index) {
+        const auto& layout = module.variant_layouts[layout_index];
+        if (layout.name.empty() ||
+            !layout_names.insert(layout.name).second ||
+            layout.cases.empty()) {
+            std::ostringstream message;
+            message << "variant layout " << layout_index
+                    << " has an empty/duplicate name or no cases";
+            return reject(diagnostics, 0, std::nullopt,
+                          VerifierReason::BadVariantLayoutShape,
+                          message.str());
+        }
+
+        std::set<std::string> case_names;
+        for (std::size_t case_index = 0;
+             case_index < layout.cases.size(); ++case_index) {
+            const auto& case_layout = layout.cases[case_index];
+            if (case_layout.name.empty() ||
+                !case_names.insert(case_layout.name).second ||
+                case_layout.field_types.size() !=
+                    case_layout.reference_map.size()) {
+                std::ostringstream message;
+                message << "variant layout " << layout_index << " case "
+                        << case_index
+                        << " has an empty/duplicate name or mismatched field bitmap";
+                return reject(diagnostics, 0, std::nullopt,
+                              VerifierReason::BadVariantLayoutShape,
+                              message.str());
+            }
+
+            for (std::size_t field_index = 0;
+                 field_index < case_layout.field_types.size(); ++field_index) {
+                const auto& type = case_layout.field_types[field_index];
+                if (!signature_shape_matches_kind(type, type.kind, module) ||
+                    signature_has_invalid_map_key(type) ||
+                    signature_has_invalid_weak_target(type) ||
+                    case_layout.reference_map[field_index] !=
+                        signature_value_is_reference(type)) {
+                    std::ostringstream message;
+                    message << "variant layout " << layout_index << " case "
+                            << case_index << " field " << field_index
+                            << " disagrees with its signature or derived reference bitmap";
+                    return reject(diagnostics, 0, std::nullopt,
+                                  VerifierReason::BadVariantLayoutShape,
+                                  message.str());
+                }
             }
         }
     }
@@ -864,6 +981,11 @@ bool signature_is_well_formed(const FunctionSignature& signature,
              !signature.parameter_types[i].is_record_layout_reference())) {
             return false;
         }
+        if (signature.parameters[i] == ValueKind::Variant &&
+            (signature.parameter_types.empty() ||
+             !signature.parameter_types[i].is_variant_layout_reference())) {
+            return false;
+        }
     }
     for (std::size_t i = 0; i < signature.parameter_types.size(); ++i) {
         if (!signature_shape_matches_kind(signature.parameter_types[i],
@@ -874,6 +996,11 @@ bool signature_is_well_formed(const FunctionSignature& signature,
     if (signature.return_type == ValueKind::Record &&
         (!signature.return_type_detail.has_value() ||
          !signature.return_type_detail->is_record_layout_reference())) {
+        return false;
+    }
+    if (signature.return_type == ValueKind::Variant &&
+        (!signature.return_type_detail.has_value() ||
+         !signature.return_type_detail->is_variant_layout_reference())) {
         return false;
     }
     if (signature.return_type_detail.has_value() &&
@@ -973,6 +1100,7 @@ bool operator==(const AbstractValue& lhs, const AbstractValue& rhs) {
                                     rhs.reference_target) &&
            lhs.signature_named_type == rhs.signature_named_type &&
            lhs.signature_record_layout == rhs.signature_record_layout &&
+           lhs.signature_variant_layout == rhs.signature_variant_layout &&
            lhs.source_local == rhs.source_local &&
            lhs.nil_test_local == rhs.nil_test_local;
 }
@@ -1017,7 +1145,8 @@ bool is_canonical_nil_object(const AbstractValue& value) {
            value.signature_function == nullptr && value.signature_map == nullptr &&
            value.reference_target == nullptr &&
            !value.signature_named_type.has_value() &&
-           !value.signature_record_layout.has_value();
+           !value.signature_record_layout.has_value() &&
+           !value.signature_variant_layout.has_value();
 }
 
 AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
@@ -1041,23 +1170,29 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
     if (auto joined = join_maybe_with_target(rhs, lhs); joined.has_value()) {
         return *joined;
     }
-    const auto join_record_with_nil = [](const AbstractValue& record,
-                                         const AbstractValue& nil) {
-        auto joined = record;
+    const auto join_nominal_with_nil = [](const AbstractValue& nominal,
+                                          const AbstractValue& nil) {
+        auto joined = nominal;
         joined.includes_nil = true;
-        if (record.source_local != nil.source_local) {
+        if (nominal.source_local != nil.source_local) {
             joined.source_local.reset();
         }
-        if (record.nil_test_local != nil.nil_test_local) {
+        if (nominal.nil_test_local != nil.nil_test_local) {
             joined.nil_test_local.reset();
         }
         return joined;
     };
     if (lhs.kind == AbstractKind::Record && is_canonical_nil_object(rhs)) {
-        return join_record_with_nil(lhs, rhs);
+        return join_nominal_with_nil(lhs, rhs);
     }
     if (rhs.kind == AbstractKind::Record && is_canonical_nil_object(lhs)) {
-        return join_record_with_nil(rhs, lhs);
+        return join_nominal_with_nil(rhs, lhs);
+    }
+    if (lhs.kind == AbstractKind::Variant && is_canonical_nil_object(rhs)) {
+        return join_nominal_with_nil(lhs, rhs);
+    }
+    if (rhs.kind == AbstractKind::Variant && is_canonical_nil_object(lhs)) {
+        return join_nominal_with_nil(rhs, lhs);
     }
     if (lhs.kind != rhs.kind || is_poison(lhs) || is_poison(rhs)) {
         return poison_value();
@@ -1119,6 +1254,12 @@ AbstractValue join_values(const AbstractValue& lhs, const AbstractValue& rhs) {
     } else if (joined.kind == AbstractKind::Record) {
         if (!lhs.signature_record_layout.has_value() ||
             lhs.signature_record_layout != rhs.signature_record_layout) {
+            return poison_value();
+        }
+        joined.includes_nil = lhs.includes_nil || rhs.includes_nil;
+    } else if (joined.kind == AbstractKind::Variant) {
+        if (!lhs.signature_variant_layout.has_value() ||
+            lhs.signature_variant_layout != rhs.signature_variant_layout) {
             return poison_value();
         }
         joined.includes_nil = lhs.includes_nil || rhs.includes_nil;
@@ -1547,6 +1688,10 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
         is_canonical_nil_object(value)) {
         return expected.includes_nil;
     }
+    if (expected.kind == AbstractKind::Variant &&
+        is_canonical_nil_object(value)) {
+        return expected.includes_nil;
+    }
     if (value.kind == AbstractKind::MaybeReference &&
         value.reference_target != nullptr &&
         expected.kind == AbstractKind::Object &&
@@ -1609,6 +1754,13 @@ bool value_conforms_to_expected(const Module& module, const AbstractState& state
                expected.signature_record_layout.has_value() &&
                value.signature_record_layout ==
                    expected.signature_record_layout &&
+               (!value.includes_nil || expected.includes_nil);
+    }
+    if (expected.kind == AbstractKind::Variant) {
+        return value.signature_variant_layout.has_value() &&
+               expected.signature_variant_layout.has_value() &&
+               value.signature_variant_layout ==
+                   expected.signature_variant_layout &&
                (!value.includes_nil || expected.includes_nil);
     }
     if (expected.kind != AbstractKind::Object) {
@@ -2140,6 +2292,167 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
             state.stack.push_back(
                 value_from_signature(layout.field_types[field_index]));
         }
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
+    }
+    case OpCode::AllocVariant: {
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                module.variant_layouts.size()) {
+            std::ostringstream message;
+            message << "variant layout " << ins.operand
+                    << " is outside layout count "
+                    << module.variant_layouts.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadVariantLayoutIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto layout_index = static_cast<std::size_t>(ins.operand);
+        const auto& layout = module.variant_layouts[layout_index];
+        if (ins.operand2 < 0 ||
+            static_cast<std::uint64_t>(ins.operand2) >=
+                layout.cases.size()) {
+            std::ostringstream message;
+            message << "variant case " << ins.operand2
+                    << " is outside case count " << layout.cases.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadVariantCaseIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto case_index = static_cast<std::size_t>(ins.operand2);
+        const auto& case_layout = layout.cases[case_index];
+        if (state.stack.size() < case_layout.field_types.size()) {
+            std::ostringstream message;
+            message << "variant initializer requires "
+                    << case_layout.field_types.size()
+                    << " fields but stack has " << state.stack.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadVariantInitializerArity,
+                          instruction_message(function, pc, message.str()));
+        }
+        for (std::size_t i = case_layout.field_types.size(); i > 0; --i) {
+            const auto field_index = i - 1;
+            AbstractValue initializer;
+            std::ostringstream context;
+            context << "variant initializer field " << field_index;
+            if (!pop_any_or_report(
+                    state, diagnostics, function, function_index, pc,
+                    VerifierReason::BadVariantInitializerArity,
+                    context.str(), &initializer)) {
+                return false;
+            }
+            if (!value_conforms_to_signature(
+                    module, state, initializer,
+                    case_layout.field_types[field_index])) {
+                std::ostringstream message;
+                message << "variant initializer field " << field_index
+                        << " does not conform to its declared type";
+                return reject(diagnostics, function_index, pc,
+                              VerifierReason::BadVariantInitializerType,
+                              instruction_message(function, pc,
+                                                  message.str()));
+            }
+        }
+        state.stack.push_back(variant_value(layout_index, false));
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
+    }
+    case OpCode::VariantTag: {
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index,
+                               pc, VerifierReason::StackUnderflow,
+                               "variant receiver", &receiver)) {
+            return false;
+        }
+        if (receiver.kind != AbstractKind::Variant) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::VariantOperationOnNonVariant,
+                          instruction_message(
+                              function, pc,
+                              "receiver is not a typed variant reference"));
+        }
+        if (receiver.includes_nil) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::VariantReceiverMayBeNil,
+                          instruction_message(
+                              function, pc,
+                              "variant receiver may be nil without refinement"));
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
+    }
+    case OpCode::VariantGet: {
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                module.variant_layouts.size()) {
+            std::ostringstream message;
+            message << "variant layout " << ins.operand
+                    << " is outside layout count "
+                    << module.variant_layouts.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadVariantLayoutIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto layout_index = static_cast<std::size_t>(ins.operand);
+        const auto& layout = module.variant_layouts[layout_index];
+        if (ins.operand2 < 0 ||
+            static_cast<std::uint64_t>(ins.operand2) >=
+                layout.cases.size()) {
+            std::ostringstream message;
+            message << "variant case " << ins.operand2
+                    << " is outside case count " << layout.cases.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadVariantCaseIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto case_index = static_cast<std::size_t>(ins.operand2);
+        const auto& case_layout = layout.cases[case_index];
+        if (ins.operand3 < 0 ||
+            static_cast<std::uint64_t>(ins.operand3) >=
+                case_layout.field_types.size()) {
+            std::ostringstream message;
+            message << "variant field " << ins.operand3
+                    << " is outside field count "
+                    << case_layout.field_types.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadVariantFieldIndex,
+                          instruction_message(function, pc, message.str()));
+        }
+        AbstractValue receiver;
+        if (!pop_any_or_report(state, diagnostics, function, function_index,
+                               pc, VerifierReason::StackUnderflow,
+                               "variant receiver", &receiver)) {
+            return false;
+        }
+        if (receiver.kind != AbstractKind::Variant) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::VariantOperationOnNonVariant,
+                          instruction_message(
+                              function, pc,
+                              "receiver is not a typed variant reference"));
+        }
+        if (receiver.includes_nil) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::VariantReceiverMayBeNil,
+                          instruction_message(
+                              function, pc,
+                              "variant receiver may be nil without refinement"));
+        }
+        if (!receiver.signature_variant_layout.has_value() ||
+            *receiver.signature_variant_layout != layout_index) {
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::VariantLayoutMismatch,
+                          instruction_message(
+                              function, pc,
+                              "receiver nominal layout differs from opcode layout"));
+        }
+        const auto field_index = static_cast<std::size_t>(ins.operand3);
+        state.stack.push_back(
+            value_from_signature(case_layout.field_types[field_index]));
         return push_fallthrough_or_report(
             pc, function, function_index, std::move(state), successors,
             diagnostics);
@@ -3001,6 +3314,24 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "RecordReceiverMayBeNil";
     case VerifierReason::RecordFieldTypeMismatch:
         return "RecordFieldTypeMismatch";
+    case VerifierReason::BadVariantLayoutShape:
+        return "BadVariantLayoutShape";
+    case VerifierReason::BadVariantLayoutIndex:
+        return "BadVariantLayoutIndex";
+    case VerifierReason::BadVariantCaseIndex:
+        return "BadVariantCaseIndex";
+    case VerifierReason::BadVariantFieldIndex:
+        return "BadVariantFieldIndex";
+    case VerifierReason::BadVariantInitializerArity:
+        return "BadVariantInitializerArity";
+    case VerifierReason::BadVariantInitializerType:
+        return "BadVariantInitializerType";
+    case VerifierReason::VariantOperationOnNonVariant:
+        return "VariantOperationOnNonVariant";
+    case VerifierReason::VariantLayoutMismatch:
+        return "VariantLayoutMismatch";
+    case VerifierReason::VariantReceiverMayBeNil:
+        return "VariantReceiverMayBeNil";
     }
     return "<unknown>";
 }
@@ -3051,6 +3382,9 @@ ModuleVerifierReport verify_with_diagnostics(const Module& module) {
         return report;
     }
     if (!record_layouts_are_well_formed(module, report.diagnostics)) {
+        return report;
+    }
+    if (!variant_layouts_are_well_formed(module, report.diagnostics)) {
         return report;
     }
     if (!module_weak_target_types_are_valid(module, report.diagnostics)) {

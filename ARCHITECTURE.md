@@ -28,10 +28,14 @@ The source language is intentionally small:
 - Types are `i64`, `bool`, `str`, opaque `pair`, finite parametric `pair<T, U>`, array
   types `[T]`, deterministic maps `map<K, V>`, weak references `weak<T>`, structural
   function types `fn(T1, ..., Tn) -> R`, named pair declarations such as
-  `type List = pair<i64, List>;`, and nominal record names declared at the top level.
+  `type List = pair<i64, List>;`, and nominal record and variant names declared at the
+  top level.
 - `record Name { field1: T1, field2: T2, ... }` declares an ordered fixed set of fields.
   `Name { field1: e1, field2: e2, ... }` constructs one record and must provide every
   field in declaration order.
+- `variant Name { Empty(), Case(T1, T2), ... }` declares ordered immutable tagged cases.
+  `Name.Case(e1, e2)` constructs one case, and exhaustive `match` statements introduce
+  immutable payload bindings.
 - Top-level `let name: type = expression;` declarations introduce initialized locals.
 - Assignment supports locals, `pair` fields (`left` and `right`), named record fields, and
   array elements (`a[i] = v`).
@@ -55,8 +59,9 @@ The source language is intentionally small:
   enclosing locals by value in deterministic first-use order. Function values can be
   called, passed, returned, placed in pairs, and stored in `RefArray`s; referencing a named
   top-level function constructs its zero-capture closure value.
-- `nil` is a literal for terminating named pair and record types, and `is_nil(local)` is a
-  bool expression that refines the checked local to non-nil in the `else` branch of an
+- `nil` is a literal for terminating named pair, record, and variant types, and
+  `is_nil(local)` is a bool expression that refines the checked local to non-nil in the
+  `else` branch of an
   `if is_nil(local) { ... } else { ... }` statement.
 - `weak(x)` constructs an immutable WeakRef to a proven non-nil object. `w.get()` returns
   nil-able `T`; callers bind it and use the same `is_nil(local)` false-branch refinement
@@ -91,6 +96,14 @@ fields are nullable and require the same local `is_nil` refinement as named pair
 field access. Reads recover the selected declaration's exact field type, and writes must
 preserve it. Record types can appear anywhere another object type can appear, including
 RefArray elements, map values, closure captures, weak targets, and for-in bodies.
+
+Variants are nominal nullable object types with immutable, differently sized cases. All
+variant names share the deterministic declaration namespace and are registered before
+record fields or variant payloads are resolved, permitting self and forward recursion.
+Construction is known non-nil; other values use the same local `is_nil` refinement before
+`match`. A match must name every declared case exactly once. Payload bindings are immutable
+and arm-local, and constructor arguments and bindings preserve declared order and exact
+nominal identity through functions, containers, captures, weak targets, and recursion.
 
 Source arrays are a typed surface over the two heap array descriptors. `[i64]` and
 `[bool]` are scalar arrays backed by `ObjectKind::ScalarArray`; bool elements are encoded
@@ -164,8 +177,11 @@ control remains deferred.
   coarse parameter/return kinds, optional detailed `SignatureValue` pair-field types,
   array element types, record-layout identities, or named-type back-references, bytecode,
   local count, and optional stack maps. The module also owns deterministic closure-layout,
-  map-layout, and record-layout tables. Each record layout stores its nominal name,
+  map-layout, record-layout, and variant-layout tables. Each record layout stores its
+  nominal name,
   complete ordered field signatures, and exactly-derived per-field reference bitmap. Each
+  variant layout stores its nominal name and an ordered case table; every case carries
+  complete ordered payload signatures and its exactly-derived reference bitmap. Each
   map layout records complete structural key/value types plus the exactly-derived
   key-reference and value-reference flags. Each closure layout names
   its function body, repeats the body's structural function type, lists capture types in
@@ -244,6 +260,9 @@ control remains deferred.
 - `Record` is fixed-width mutable storage with a retained verified layout identity and one
   tagged slot per declared field. Its logical width is permanently one header plus the
   layout's field count; replacing a field never changes that width.
+- `Variant` is immutable case-dependent storage with retained verified layout identity, a
+  raw tag, active payload slots, and a complete copied per-case bitmap table. Its logical
+  width is exactly `2 + active_field_count`; only the selected case occupies payload space.
 - `WeakRef` is fixed-width storage with one private collector-owned target. Its descriptor
   scans zero strong fields. Construction accepts one non-nil object, and the heap exposes
   only a const read; post-construction writes are confined to weak processing.
@@ -257,6 +276,9 @@ control remains deferred.
   bitmap, and tag agreement, then visits exactly the bitmap-selected fields in declaration
   order. Interleaved `i64`/bool fields remain opaque even when their payload bits resemble
   a current or stale `ObjectId`.
+- The same descriptor visitor handles variants. It validates retained layout, raw-tag
+  range, selected bitmap width, and selected slot tags, then visits only true bits of the
+  active case in payload order. Inactive case maps and scalar active slots remain opaque.
 - Weak edges are the one explicit non-descriptor reference category. A heap-owned
   `std::vector<ObjectId>` contains every live WeakRef owner exactly once in ascending slot
   order. It is not a root and is never consulted by marking; it only locates weak targets
@@ -266,10 +288,10 @@ control remains deferred.
   corresponding reference flag is set. String keys and reference values are therefore
   traced and forwarded; scalar slots stay opaque even when their payload bits resemble an
   `ObjectId`.
-- Pair field types, array element types, named recursive types, and record nominal field
-  types are verification-time metadata. Records retain only their validated layout
-  identity and exact bitmap at runtime; none of these types changes `Value` or the
-  stack-map format.
+- Pair field types, array element types, named recursive types, and record/variant nominal
+  types are verification-time metadata. Records and variants retain only their validated
+  layout identities and exact bitmaps at runtime; none of these types changes `Value` or
+  the stack-map format.
 - Pair field mutation is routed through `Heap::store_pair_field`, and RefArray element
   mutation is routed through `Heap::store_ref_array_element`. Record field mutation is
   routed through `Heap::store_record_field`. Those methods are the only fixed-width
@@ -280,8 +302,9 @@ control remains deferred.
   because no post-construction payload mutation exists.
   Closures likewise expose only construction and const capture access. Their only possible
   old-to-young edge is collector-created during promotion. The generic descriptor-driven
-  promotion path records those closure edges and any promotion-created record edges rather
-  than counting them as mutator barriers; ordinary record writes still use their funnel.
+  promotion path records those closure edges and any promotion-created record or variant
+  edges rather than counting them as mutator barriers; ordinary record writes still use
+  their funnel.
 - Map insertion and update are routed through `Heap::store_map_entry`, the only map payload
   mutation funnel. It records an old owner before publishing an inserted young string key
   or young reference value; updates keep the original key and barrier the replacement
@@ -309,6 +332,10 @@ control remains deferred.
   heap graphs and output bytes while exercising mixed field layouts, mutation, recursive
   records, containers, captures, weak targets, and for-in use. No legacy generator stream
   or pinned corpus changes.
+- Iteration 34 adds a separate pinned `variants` grammar. Its 32 seeds compare canonical
+  heap graphs and output bytes across ten schedules while exercising nominal construction,
+  exhaustive matches, recursion, exact arm bindings, and mixed scalar/reference cases.
+  Every legacy generator stream and pinned dump remains byte-identical.
 
 ## Performance measurement
 
@@ -416,6 +443,13 @@ Compiler accommodations for verifier strictness:
   every boundary. The compiler asserts that each emitted bitmap bit equals the type
   checker's classification (`i64`/`bool` scalar, everything else reference) before asking
   the verifier to accept the module.
+- Variants: the compiler emits the complete deterministic variant-layout table before
+  signatures and bodies. Constructors evaluate payloads left-to-right and emit
+  `AllocVariant(layout, case)`. Exhaustive matches dispatch in declared-case order through
+  `VariantTag`; every immutable binding is read with `VariantGet(layout, case, field)`
+  under its guard. `SignatureValue` preserves exact nominal identity and nullable state,
+  and compiler assertions require every emitted per-case bitmap to agree with the same
+  scalar/reference classification used by the type checker and verifier.
 - Arrays: the type checker classifies each `[T]` by element type. `[i64]` and `[bool]`
   compile to `AllocArray`/`ArrayGet`/`ArraySet`; `[pair<...>]`, `[[...]]`, and named-pair
   arrays compile to `AllocRefArray`/`RefArrayGet`/`RefArraySet`. `compile_checked_program`
@@ -586,8 +620,8 @@ remembered-set entries.
 - Root precision: `verify_with_stack_maps` emits per-function per-pc operand and local
   reference maps from the verifier's abstract states. A true bit means the slot may
   contain an object
-  reference, including pair objects, records, scalar arrays, RefArrays, strings, and
-  closures; nullable named-pair and record slots may contain `nil` in the same
+  reference, including pair objects, records, variants, scalar arrays, RefArrays, strings,
+  and closures; nullable named-pair, record, and variant slots may contain `nil` in the same
   reference-capable slot. Hand-written maps, when present, must match the verifier state,
   and VM-controlled collection points assert that the active frame's runtime operand and
   local tags agree with the generated map for the current function and pc. Local bits
@@ -614,8 +648,8 @@ remembered-set entries.
   young objects from mutator roots plus remembered old objects, remembered-set entries are
   rewritten/pruned after movement, and validation traps any valid old-to-young
   descriptor-declared pair field, RefArray element, record field, map key/value slot, or
-  mapped closure capture absent from the remembered set. Promotion-created edges are
-  inserted by the collector itself.
+  mapped closure capture, or selected variant payload absent from the remembered set.
+  Promotion-created edges are inserted by the collector itself.
 - Capture-map precision: verification requires every closure layout bitmap to equal the
   ordered capture types. Every heap phase uses the descriptor visitor, which sees mapped
   reference captures and never sees scalar captures, even when adjacent scalar bits equal
@@ -630,6 +664,11 @@ remembered-set entries.
   field equal to the static field classification. Every heap phase uses the descriptor
   visitor, which sees only mapped fields. The fixed `1 + N` width and retained layout
   identity cannot change after allocation.
+- Variant-layout precision: verification requires a unique non-empty nominal name,
+  non-empty uniquely named cases, well-formed ordered payload signatures, and each case's
+  bitmap to equal its static classification. Every heap phase selects only the raw-tagged
+  case through the descriptor; exact width is `2 + active_field_count`, and payloads are
+  immutable.
 - Weak-edge precision: verification preserves complete `weak<T>` structure, `AllocWeak`
   consumes only a non-nil reference, and `WeakGet` produces a maybe-reference carrying
   exact target facts. Only `IsNil` refines that local to non-nil `T`. At runtime the
@@ -638,7 +677,8 @@ remembered-set entries.
 - Signature safety: call sites are checked against the callee signature only; returns are
   checked against the current function signature. This keeps bytecode verification
   modular and rejects out-of-range calls, wrong arity, wrong argument kind, wrong
-  pair-field kind, record layout or field mismatch, malformed named-type references,
+  pair-field kind, record or variant layout/case/field mismatch, malformed named-type
+  references,
   infinite-unfolding misuse, and wrong return kind.
 - GC neutrality: pair-field types and named recursive types never participate in heap
   layout. Record types contribute only validated nominal layout identity and the exact
@@ -663,13 +703,13 @@ remembered-set entries.
 - Stack height is invariant at a merge; different heights reject immediately to protect
   stack-depth safety.
 - Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `RefArray`, `Str`, `Function`,
-  `Map`, `Record`, `Nil`, and `Poison`; recursive named values use `Object` with an
-  explicit nullable bit, while records use `Record` with exact nominal layout identity and
-  nullable state.
+  `Map`, `Record`, `Variant`, `Nil`, and `Poison`; recursive named values use `Object` with an
+  explicit nullable bit, while records and variants use distinct kinds with exact nominal
+  layout identity and nullable state.
 - Equal scalar/string kinds join to themselves; structural function values join only when
   their complete parameter/return types are equal; array kinds join only to array;
   map values join only when their complete key/value signatures are equal;
-  record values join only when their layout indices are equal;
+  record and variant values join only with the same kind and equal layout indices;
   object kinds join to object with the union of possible allocation sites, an opaque-object
   bit, an optional nil bit, optional signature-derived pair fields, and optional
   named-type references.
