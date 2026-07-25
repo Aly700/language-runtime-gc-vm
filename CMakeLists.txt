@@ -142,6 +142,10 @@ add_executable(lang_iteration39_tail_calls_fuzz
 target_link_libraries(
     lang_iteration39_tail_calls_fuzz PRIVATE lang_runtime)
 
+add_executable(lang_iteration40_map_lookup
+    tests/iteration40_map_lookup.cpp)
+target_link_libraries(lang_iteration40_map_lookup PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -194,5 +198,7 @@ add_test(NAME lang_iteration39_tail_calls
     COMMAND lang_iteration39_tail_calls)
 add_test(NAME lang_iteration39_tail_calls_fuzz
     COMMAND lang_iteration39_tail_calls_fuzz)
+add_test(NAME lang_iteration40_map_lookup
+    COMMAND lang_iteration40_map_lookup)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

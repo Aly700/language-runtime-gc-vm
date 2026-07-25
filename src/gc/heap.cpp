@@ -25,6 +25,12 @@ constexpr unsigned kGenerationShift = 32;
 constexpr std::uint32_t kFirstGeneration = 1;
 constexpr std::uint32_t kMaxGeneration = 0x7FFF'FFFFu;
 constexpr std::size_t kStorageSlotBytes = sizeof(std::int64_t);
+constexpr std::uint64_t kMapHashOffsetBasis = 14'695'981'039'346'656'037ull;
+constexpr std::uint64_t kMapHashPrime = 1'099'511'628'211ull;
+constexpr std::uint8_t kMapHashI64Domain = 1;
+constexpr std::uint8_t kMapHashBoolDomain = 2;
+constexpr std::uint8_t kMapHashStringDomain = 3;
+constexpr std::size_t kMapIndexMinimumCapacity = 8;
 
 ObjectId make_object_id(std::uint32_t slot, std::uint32_t generation) {
     return (static_cast<ObjectId>(generation) << kGenerationShift) | slot;
@@ -50,6 +56,48 @@ std::uint32_t generation_for_new_base(std::uint32_t generation) {
         return kFirstGeneration;
     }
     return next_generation(generation);
+}
+
+void append_map_hash_byte(std::uint64_t& hash, std::uint8_t byte) {
+    hash ^= byte;
+    hash *= kMapHashPrime;
+}
+
+std::size_t map_lookup_index_capacity(std::size_t entry_count) {
+    if (entry_count == 0) {
+        return 0;
+    }
+    std::size_t capacity = kMapIndexMinimumCapacity;
+    while (entry_count > capacity / 2) {
+        if (capacity > std::numeric_limits<std::size_t>::max() / 2) {
+            throw std::length_error("map lookup index capacity overflow");
+        }
+        capacity *= 2;
+    }
+    return capacity;
+}
+
+std::size_t encoded_map_entry_index(std::size_t entry_index) {
+    if (entry_index == std::numeric_limits<std::size_t>::max()) {
+        throw std::length_error("map lookup entry index overflow");
+    }
+    return entry_index + 1;
+}
+
+std::size_t find_open_map_bucket(const std::vector<std::size_t>& index,
+                                 std::uint64_t hash) {
+    if (index.empty() || (index.size() & (index.size() - 1)) != 0) {
+        throw std::logic_error("map lookup index capacity is not a power of two");
+    }
+    const auto mask = index.size() - 1;
+    auto bucket = static_cast<std::size_t>(hash) & mask;
+    for (std::size_t examined = 0; examined < index.size(); ++examined) {
+        if (index[bucket] == 0) {
+            return bucket;
+        }
+        bucket = (bucket + 1) & mask;
+    }
+    throw std::logic_error("map lookup index has no empty bucket");
 }
 
 std::size_t storage_slot_count(const Object& object) {
@@ -81,6 +129,11 @@ std::size_t storage_slot_count(const Object& object) {
 }
 
 void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = nullptr) {
+    if (object.kind != ObjectKind::Map &&
+        !object.map_lookup_index.empty()) {
+        throw std::logic_error(
+            "non-map descriptor contains map lookup index metadata");
+    }
     if (object.kind != ObjectKind::Ephemeron &&
         (object.ephemeron_key().tag() != Value::Tag::Nil ||
          object.ephemeron_value().tag() != Value::Tag::Nil)) {
@@ -585,6 +638,7 @@ bool objects_equal(const Object& left, const Object& right) {
            left.map_key_is_ref == right.map_key_is_ref &&
            left.map_value_is_ref == right.map_value_is_ref &&
            map_entries_equal(left.map_entries, right.map_entries) &&
+           left.map_lookup_index == right.map_lookup_index &&
            left.record_layout_index == right.record_layout_index &&
            value_vectors_equal(left.record_fields, right.record_fields) &&
            left.record_ref_map == right.record_ref_map &&
@@ -1684,27 +1738,170 @@ void Heap::validate_map_value(const Object& map, Value value) const {
     }
 }
 
+std::uint64_t Heap::map_key_hash(Value key) const {
+    std::uint64_t hash = kMapHashOffsetBasis;
+    switch (key.tag()) {
+    case Value::Tag::Int64: {
+        append_map_hash_byte(hash, kMapHashI64Domain);
+        auto bits = static_cast<std::uint64_t>(key.as_i64());
+        for (std::size_t byte = 0; byte < sizeof(bits); ++byte) {
+            append_map_hash_byte(
+                hash, static_cast<std::uint8_t>(bits & 0xFFu));
+            bits >>= 8;
+        }
+        return hash;
+    }
+    case Value::Tag::Bool:
+        append_map_hash_byte(hash, kMapHashBoolDomain);
+        append_map_hash_byte(hash, key.as_bool() ? 1 : 0);
+        return hash;
+    case Value::Tag::Object: {
+        append_map_hash_byte(hash, kMapHashStringDomain);
+        for (const auto byte : string_bytes(key.as_object())) {
+            append_map_hash_byte(hash, byte);
+        }
+        return hash;
+    }
+    case Value::Tag::Nil:
+        break;
+    }
+    throw std::logic_error("map key hash requires i64, bool, or str");
+}
+
+bool Heap::map_keys_equal(const Object& map, Value stored,
+                          Value query) const {
+    if (map.map_key_is_ref) {
+        return string_equal(stored.as_object(), query.as_object());
+    }
+    if (stored.tag() != query.tag()) {
+        return false;
+    }
+    if (stored.tag() == Value::Tag::Int64) {
+        return stored.as_i64() == query.as_i64();
+    }
+    if (stored.tag() == Value::Tag::Bool) {
+        return stored.as_bool() == query.as_bool();
+    }
+    return false;
+}
+
+std::vector<std::size_t> Heap::build_map_lookup_index(
+    const Object& map, std::size_t capacity) const {
+    if (capacity == 0) {
+        if (!map.map_entries.empty()) {
+            throw std::logic_error(
+                "non-empty map requires a lookup index");
+        }
+        return {};
+    }
+    if (capacity < kMapIndexMinimumCapacity ||
+        (capacity & (capacity - 1)) != 0 ||
+        map.map_entries.size() > capacity / 2) {
+        throw std::logic_error(
+            "map lookup index rebuild capacity cannot hold entries");
+    }
+    std::vector<std::size_t> index(capacity, 0);
+    for (std::size_t entry = 0; entry < map.map_entries.size(); ++entry) {
+        const auto bucket =
+            find_open_map_bucket(index, map_key_hash(map.map_entries[entry].key));
+        index[bucket] = encoded_map_entry_index(entry);
+    }
+    return index;
+}
+
+void Heap::validate_map_lookup_index(const Object& map) const {
+    if (map.kind != ObjectKind::Map) {
+        throw std::logic_error("map lookup index validator received non-map");
+    }
+    const auto expected_capacity =
+        map_lookup_index_capacity(map.map_entries.size());
+    if (map.map_lookup_index.size() != expected_capacity) {
+        throw std::logic_error(
+            "map lookup index capacity does not match entry count");
+    }
+    std::vector<std::size_t> entry_buckets(
+        map.map_entries.size(), std::numeric_limits<std::size_t>::max());
+    for (std::size_t bucket = 0; bucket < map.map_lookup_index.size();
+         ++bucket) {
+        const auto encoded = map.map_lookup_index[bucket];
+        if (encoded == 0) {
+            continue;
+        }
+        const auto entry = encoded - 1;
+        if (entry >= map.map_entries.size()) {
+            throw std::logic_error(
+                "map lookup index bucket names an out-of-range entry");
+        }
+        if (entry_buckets[entry] !=
+            std::numeric_limits<std::size_t>::max()) {
+            throw std::logic_error(
+                "map lookup index contains a duplicate entry");
+        }
+        entry_buckets[entry] = bucket;
+    }
+    for (const auto bucket : entry_buckets) {
+        if (bucket == std::numeric_limits<std::size_t>::max()) {
+            throw std::logic_error(
+                "map lookup index is missing an ordered entry");
+        }
+    }
+
+    std::vector<std::uint64_t> entry_hashes(map.map_entries.size(), 0);
+    std::vector<std::size_t> expected(expected_capacity, 0);
+    for (std::size_t entry = 0; entry < map.map_entries.size(); ++entry) {
+        ++metrics_.map_index_validation_entries;
+        const auto hash = map_key_hash(map.map_entries[entry].key);
+        entry_hashes[entry] = hash;
+        const auto bucket = find_open_map_bucket(expected, hash);
+        expected[bucket] = encoded_map_entry_index(entry);
+    }
+    if (!map.map_lookup_index.empty()) {
+        const auto mask = map.map_lookup_index.size() - 1;
+        for (std::size_t entry = 0; entry < map.map_entries.size(); ++entry) {
+            auto bucket =
+                static_cast<std::size_t>(entry_hashes[entry]) & mask;
+            while (bucket != entry_buckets[entry]) {
+                if (map.map_lookup_index[bucket] == 0) {
+                    throw std::logic_error(
+                        "map lookup index entry is unreachable from its hash");
+                }
+                bucket = (bucket + 1) & mask;
+            }
+        }
+    }
+    if (expected != map.map_lookup_index) {
+        throw std::logic_error(
+            "map lookup index bucket does not match ordered entries");
+    }
+}
+
 std::optional<std::size_t> Heap::find_map_entry(ObjectId id, Value key) const {
     const auto& map = checked_map(id);
     validate_map_key(map, key);
-    for (std::size_t i = 0; i < map.map_entries.size(); ++i) {
-        ++metrics_.map_lookup_entries_examined;
-        const auto stored = map.map_entries[i].key;
-        bool equal = false;
-        if (map.map_key_is_ref) {
-            equal = string_equal(stored.as_object(), key.as_object());
-        } else if (stored.tag() == key.tag() &&
-                   stored.tag() == Value::Tag::Int64) {
-            equal = stored.as_i64() == key.as_i64();
-        } else if (stored.tag() == key.tag() &&
-                   stored.tag() == Value::Tag::Bool) {
-            equal = stored.as_bool() == key.as_bool();
-        }
-        if (equal) {
-            return i;
-        }
+    if (map.map_lookup_index.empty()) {
+        return std::nullopt;
     }
-    return std::nullopt;
+    const auto mask = map.map_lookup_index.size() - 1;
+    auto bucket = static_cast<std::size_t>(map_key_hash(key)) & mask;
+    for (std::size_t examined = 0;
+         examined < map.map_lookup_index.size(); ++examined) {
+        ++metrics_.map_hash_probes;
+        const auto encoded = map.map_lookup_index[bucket];
+        if (encoded == 0) {
+            return std::nullopt;
+        }
+        const auto entry = encoded - 1;
+        if (entry >= map.map_entries.size()) {
+            throw std::logic_error(
+                "map lookup index bucket names an out-of-range entry");
+        }
+        ++metrics_.map_lookup_entries_examined;
+        if (map_keys_equal(map, map.map_entries[entry].key, key)) {
+            return entry;
+        }
+        bucket = (bucket + 1) & mask;
+    }
+    throw std::logic_error("map lookup index probe did not reach an empty bucket");
 }
 
 bool Heap::map_has(ObjectId id, Value key) const {
@@ -1965,10 +2162,33 @@ void Heap::store_map_entry(ObjectId id, Value key, Value value) {
     if (existing.has_value()) {
         map.map_entries[*existing].value = value;
     } else {
+        const auto entry_index = map.map_entries.size();
+        const auto desired_capacity =
+            map_lookup_index_capacity(entry_index + 1);
+        const auto key_hash = map_key_hash(key);
+        std::vector<std::size_t> resized_index;
+        std::size_t insertion_bucket = 0;
+        if (map.map_lookup_index.size() != desired_capacity) {
+            resized_index = build_map_lookup_index(map, desired_capacity);
+            insertion_bucket =
+                find_open_map_bucket(resized_index, key_hash);
+            resized_index[insertion_bucket] =
+                encoded_map_entry_index(entry_index);
+        } else {
+            insertion_bucket =
+                find_open_map_bucket(map.map_lookup_index, key_hash);
+        }
         map.map_entries.push_back(MapEntry{key, value});
         map.length = static_cast<std::uint32_t>(map.map_entries.size());
+        if (!resized_index.empty()) {
+            map.map_lookup_index = std::move(resized_index);
+        } else {
+            map.map_lookup_index[insertion_bucket] =
+                encoded_map_entry_index(entry_index);
+        }
     }
     validate_descriptor_shape(map, &metrics_);
+    validate_map_lookup_index(map);
     if (incremental_compaction_active_) {
         if (!existing.has_value()) {
             throw std::logic_error(
@@ -3481,6 +3701,9 @@ void Heap::validate_heap_storage_layout() const {
             throw std::logic_error("heap object header overlaps another object's storage run");
         }
         validate_descriptor_shape(*objects_[base], &metrics_);
+        if (objects_[base]->kind == ObjectKind::Map) {
+            validate_map_lookup_index(*objects_[base]);
+        }
         const auto width = storage_slot_count(*objects_[base]);
         if (width == 0 || base + width > objects_.size()) {
             throw std::logic_error("heap object descriptor extends past heap storage");
@@ -3694,6 +3917,23 @@ void Heap::TEST_ONLY_promote_object_through_collector_path(ObjectId id) {
 
 void Heap::TEST_ONLY_validate_gc_invariants() const {
     validate_after_collection(nullptr, {});
+}
+
+std::vector<std::size_t> Heap::TEST_ONLY_map_lookup_index(
+    ObjectId id) const {
+    return checked_map(id).map_lookup_index;
+}
+
+void Heap::TEST_ONLY_corrupt_map_lookup_index(ObjectId id) {
+    auto& index = checked_map(id).map_lookup_index;
+    for (auto& bucket : index) {
+        if (bucket != 0) {
+            bucket = 0;
+            return;
+        }
+    }
+    throw std::logic_error(
+        "test-only map lookup index corruption requires an occupied bucket");
 }
 
 } // namespace lang::gc

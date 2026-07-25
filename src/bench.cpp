@@ -60,6 +60,8 @@ struct CounterSnapshot {
     std::uint64_t stack_map_entries{0};
     std::uint64_t map_lookup_entries_examined{0};
     std::uint64_t map_descriptor_entries_scanned{0};
+    std::uint64_t map_hash_probes{0};
+    std::uint64_t map_index_validation_entries{0};
     std::uint64_t closure_capture_slots_scanned{0};
     std::uint64_t weak_targets_processed{0};
     std::uint64_t weak_targets_forwarded{0};
@@ -102,7 +104,11 @@ bool operator==(const CounterSnapshot& lhs, const CounterSnapshot& rhs) {
            lhs.bytecode_instructions == rhs.bytecode_instructions &&
            lhs.stack_map_entries == rhs.stack_map_entries &&
            lhs.map_lookup_entries_examined == rhs.map_lookup_entries_examined &&
-           lhs.map_descriptor_entries_scanned == rhs.map_descriptor_entries_scanned &&
+           lhs.map_descriptor_entries_scanned ==
+               rhs.map_descriptor_entries_scanned &&
+           lhs.map_hash_probes == rhs.map_hash_probes &&
+           lhs.map_index_validation_entries ==
+               rhs.map_index_validation_entries &&
            lhs.closure_capture_slots_scanned == rhs.closure_capture_slots_scanned &&
            lhs.weak_targets_processed == rhs.weak_targets_processed &&
            lhs.weak_targets_forwarded == rhs.weak_targets_forwarded &&
@@ -243,7 +249,11 @@ CounterSnapshot run_module(const lang::VerifiedModule& module, lang::gc::StressC
     base.heap_live_objects = vm.heap().live_count();
     base.heap_capacity_slots = vm.heap().capacity_slots();
     base.map_lookup_entries_examined = metrics.heap.map_lookup_entries_examined;
-    base.map_descriptor_entries_scanned = metrics.heap.map_descriptor_entries_scanned;
+    base.map_descriptor_entries_scanned =
+        metrics.heap.map_descriptor_entries_scanned;
+    base.map_hash_probes = metrics.heap.map_hash_probes;
+    base.map_index_validation_entries =
+        metrics.heap.map_index_validation_entries;
     base.closure_capture_slots_scanned = metrics.heap.closure_capture_slots_scanned;
     base.weak_targets_processed = metrics.heap.weak_targets_processed;
     base.weak_targets_forwarded = metrics.heap.weak_targets_forwarded;
@@ -460,6 +470,59 @@ std::string map_heavy_source(std::size_t entries, std::size_t update_rounds,
     }
     out << "m[\"bench-key-" << key_base << "\"] = pair(score, m.len);\n";
     out << "m\n";
+    return out.str();
+}
+
+std::string map_lookup_heavy_source(std::size_t entries,
+                                    std::size_t lookup_rounds,
+                                    std::uint64_t seed) {
+    if (entries < 4) {
+        throw std::logic_error(
+            "map lookup benchmark requires at least four entries");
+    }
+
+    SplitMix64 rng(seed);
+    const auto key_base = rng.bounded(100'000);
+    const std::string common_prefix =
+        "map-lookup-content-hash-common-prefix-" + std::string(96, 'x') + "-";
+    const auto key_text = [&](std::size_t offset) {
+        std::ostringstream key;
+        key << common_prefix << std::setw(6) << std::setfill('0')
+            << key_base + offset;
+        return key.str();
+    };
+    const auto fresh_key_expression = [&](std::size_t offset) {
+        const auto key = key_text(offset);
+        const auto split = key.size() / 2;
+        return "\"" + key.substr(0, split) + "\" + \"" +
+               key.substr(split) + "\"";
+    };
+
+    const auto middle = entries / 2;
+    const auto last = entries - 1;
+    std::ostringstream out;
+    out << "let m: map<str, i64> = map<str, i64>();\n";
+    for (std::size_t i = 0; i < entries; ++i) {
+        out << "m[\"" << key_text(i) << "\"] = " << i << ";\n";
+    }
+    out << "let first: str = " << fresh_key_expression(0) << ";\n";
+    out << "let middle: str = " << fresh_key_expression(middle) << ";\n";
+    out << "let last: str = " << fresh_key_expression(last) << ";\n";
+    out << "let missing: str = " << fresh_key_expression(entries) << ";\n";
+    out << "let round: i64 = 0;\n";
+    out << "let score: i64 = 0;\n";
+    out << "while round < " << lookup_rounds << " {\n";
+    out << "  score = score + m[first];\n";
+    out << "  score = score + m[middle];\n";
+    out << "  score = score + m[last];\n";
+    out << "  if m.has(missing) {\n";
+    out << "    score = score + -1000000;\n";
+    out << "  } else {\n";
+    out << "    score = score + 1;\n";
+    out << "  }\n";
+    out << "  round = round + 1;\n";
+    out << "}\n";
+    out << "score\n";
     return out.str();
 }
 
@@ -695,6 +758,8 @@ std::vector<Workload> build_workloads(bool smoke) {
     const auto closure_depth = smoke ? 5 : 48;
     const auto map_entries = smoke ? 8 : 96;
     const auto map_update_rounds = smoke ? 1 : 4;
+    const auto map_lookup_entries = smoke ? 8 : 192;
+    const auto map_lookup_rounds = smoke ? 5 : 2000;
     const auto weak_major_rounds = smoke ? 1 : 8;
     const auto weak_minor_rounds = smoke ? 1 : 16;
     const std::size_t weak_minor_interval = 128;
@@ -764,6 +829,12 @@ std::vector<Workload> build_workloads(bool smoke) {
         "map_heavy", 0x6A70'BEEFull,
         map_heavy_source(map_entries, map_update_rounds, 0x6A70'BEEFull), map_stress,
         "insert growth, structural string lookup, relocation, and update-in-place churn"));
+    workloads.push_back(source_runtime_workload(
+        "map_lookup_heavy", 0x100A'B1E5ull,
+        map_lookup_heavy_source(map_lookup_entries, map_lookup_rounds,
+                                0x100A'B1E5ull),
+        {},
+        "fixed string-key map with allocation-free first/middle/last/miss lookup rounds"));
     workloads.push_back(weak_runtime_workload(
         0x7EA4'BEEFull,
         weak_heavy_module(weak_major_rounds, weak_minor_rounds,
@@ -795,7 +866,11 @@ std::vector<std::pair<const char*, std::uint64_t>> counter_items(
         {"bytecode_instructions", counters.bytecode_instructions},
         {"stack_map_entries", counters.stack_map_entries},
         {"map_lookup_entries_examined", counters.map_lookup_entries_examined},
-        {"map_descriptor_entries_scanned", counters.map_descriptor_entries_scanned},
+        {"map_descriptor_entries_scanned",
+         counters.map_descriptor_entries_scanned},
+        {"map_hash_probes", counters.map_hash_probes},
+        {"map_index_validation_entries",
+         counters.map_index_validation_entries},
         {"closure_capture_slots_scanned", counters.closure_capture_slots_scanned},
         {"weak_targets_processed", counters.weak_targets_processed},
         {"weak_targets_forwarded", counters.weak_targets_forwarded},
