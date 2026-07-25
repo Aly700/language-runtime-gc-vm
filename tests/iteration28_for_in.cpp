@@ -628,8 +628,8 @@ pair(total, values)
 
 void loop_source_fuzz_corpus_and_mutants() {
     const auto schedules = fuzz::schedules();
-    require(schedules.size() == 12,
-            "loop source fuzz requires exactly twelve deterministic schedules");
+    require(schedules.size() == 15,
+            "loop source fuzz requires exactly fifteen deterministic schedules");
     for (std::uint64_t seed = 1; seed <= 10; ++seed) {
         for (const auto& schedule : schedules) {
             run_loop_seed_schedule(seed, schedule);

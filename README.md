@@ -1,7 +1,8 @@
 # Language Runtime: Verified Bytecode and Precise Moving GC
 
-Wave 3 is complete: records, sum types and match, exceptions, ephemerons, and deterministic
-instruction-budgeted incremental marking all run under the same precise moving collector.
+Wave 3 is complete: records, sum types and match, exceptions, ephemerons, deterministic
+incremental marking, and deterministic incremental compaction all run under the same
+precise moving collector.
 
 This repository is a correctness-first implementation of a small statically typed
 language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
@@ -101,9 +102,19 @@ use the ordinary `is_nil` refinement. See [ADR 0013](adr/0013-ephemeron-fixpoint
 
 Major marking can be split into deterministic object-scan budgets at instruction
 boundaries. The existing barrier-before-publish funnels enforce no-black-to-white with an
-incremental-update barrier; weak clearing, ephemeron fixpoint completion, and movement
-remain atomic. A final current-root remark guarantees stop-the-world-equivalent liveness.
+incremental-update barrier; weak clearing and ephemeron fixpoint completion remain at the
+final liveness boundary. A final current-root remark guarantees
+stop-the-world-equivalent liveness.
 See [ADR 0014](adr/0014-incremental-marking.md).
+
+### Incremental compaction
+
+Major survivors slide in deterministic source order under integer object budgets at VM
+instruction boundaries. An exact full-ID read barrier resolves moved source identities
+without weakening stale-generation traps; precise roots are rewritten after every move.
+All ordinary validators remain live at every boundary, and an independent shadow atomic
+slide proves the final heap graph. See
+[ADR 0015](adr/0015-incremental-compaction.md).
 
 ## Language at a glance
 
@@ -184,8 +195,8 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 17 isolated deterministic positive corpora. Shared source grammars run under
-the same 12 schedules without changing their generated program bytes:
+The suite has 18 isolated deterministic positive corpora. Shared source grammars run under
+the same 15 schedules without changing any legacy generated program bytes:
 
 - `no_stress`
 - `before_every_alloc`
@@ -195,6 +206,8 @@ the same 12 schedules without changing their generated program bytes:
 - `minor_after_every_barrier`
 - `incremental_1`, `incremental_3_1`
 - `combined`
+- `incremental_compact_1`, `incremental_compact_3_1`
+- `combined_mark_compact`
 
 The two independent observables are the canonical returned value/ID-free deep heap graph
 and the exact VM output bytes. The weak grammar additionally uses schedule-specific
@@ -202,7 +215,7 @@ liveness expectations because clearing is intentionally observable. Generated so
 bytecode are constructive and deterministic; each grammar has its own corpus dump and an
 embedded pinned representative snapshot.
 
-Negative testing applies 53 positioned mutation operators across fixed seed sets, for 822
+Negative testing applies 57 positioned mutation operators across fixed seed sets, for 950
 frontend rejection checks. The operators cover type errors, undefined values, arity and
 return mismatches, missing nil refinement, invalid container operations, closure misuse,
 map key/value errors, weak-target errors, loop-control errors, conversion errors, and
@@ -222,6 +235,8 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration33_records_fuzz
 ./build/lang_iteration34_variants_fuzz
 ./build/lang_iteration35_exceptions_fuzz
+./build/lang_iteration36_ephemerons_fuzz
+./build/lang_iteration38_incremental_compaction_fuzz
 ```
 
 ### Replay by grammar
@@ -245,7 +260,9 @@ Use one of the schedule names above.
 | source `strings2` | 32 | `./build/lang_iteration31_strings2 --grammar strings2 --seed N --schedule NAME` | `./build/lang_iteration31_strings2 --grammar strings2 --seed N --mutant 0..3` |
 | source `records` | 32 | `./build/lang_iteration33_records_fuzz --grammar records --seed N --schedule NAME` | `./build/lang_iteration33_records_fuzz --grammar records --seed N --mutant 0..6` |
 | source `variants` | 32 | `./build/lang_iteration34_variants_fuzz --grammar variants --seed N --schedule NAME` | `./build/lang_iteration34_variants_fuzz --grammar variants --seed N --mutant 0..8` |
-| source `exceptions` | 32 | deterministic ten-schedule sweep in `lang_iteration35_exceptions_fuzz` | typed rejection cases in `lang_iteration35_exceptions` |
+| source `exceptions` | 32 | deterministic fifteen-schedule sweep in `lang_iteration35_exceptions_fuzz` | typed rejection cases in `lang_iteration35_exceptions` |
+| source `ephemerons` | 32 | `./build/lang_iteration36_ephemerons_fuzz --seed N --schedule INDEX` | six fixed type mutants |
+| source `incremental_compaction` | 32 | `./build/lang_iteration38_incremental_compaction_fuzz --grammar incremental_compaction --seed N --schedule NAME` | `./build/lang_iteration38_incremental_compaction_fuzz --grammar incremental_compaction --seed N --mutant 0..3` |
 
 For example:
 
@@ -273,6 +290,8 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration33_records_fuzz --dump-corpus records
 ./build/lang_iteration34_variants_fuzz --dump-corpus variants
 ./build/lang_iteration35_exceptions_fuzz --dump-corpus exceptions
+./build/lang_iteration36_ephemerons_fuzz --dump-corpus ephemerons
+./build/lang_iteration38_incremental_compaction_fuzz --dump-corpus incremental_compaction
 ```
 
 The generator design, oracle, schedules, and replay behavior are detailed in

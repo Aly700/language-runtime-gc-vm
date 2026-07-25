@@ -89,6 +89,12 @@ void VM::set_gc_stress(gc::StressConfig config) {
                 "incremental marking stress budgets must be positive");
         }
     }
+    for (const auto budget : config.incremental_compact_step_budgets) {
+        if (budget == 0) {
+            throw std::invalid_argument(
+                "incremental compaction stress budgets must be positive");
+        }
+    }
     gc_stress_ = config;
     heap_.set_stress_config(config);
 }
@@ -165,7 +171,12 @@ void VM::collect_at_instruction_boundary_if_needed(const ModuleVerificationResul
         assert_stack_matches_map(verification, frame);
     }
 
-    if (!gc_stress_.incremental_mark_step_budgets.empty()) {
+    const bool marking_stress =
+        !gc_stress_.incremental_mark_step_budgets.empty();
+    const bool compaction_stress =
+        !gc_stress_.incremental_compact_step_budgets.empty();
+    if (marking_stress &&
+        (!compaction_stress || !heap_.incremental_compaction_active())) {
         assert_stack_matches_map(verification, frame);
         if (!heap_.incremental_marking_active()) {
             heap_.start_incremental_marking();
@@ -176,7 +187,25 @@ void VM::collect_at_instruction_boundary_if_needed(const ModuleVerificationResul
         ++incremental_budget_cursor_;
         (void)heap_.incremental_mark_step(budget);
         if (heap_.incremental_marking_quiescent()) {
-            heap_.finish_incremental_marking();
+            if (compaction_stress) {
+                heap_.finish_incremental_marking_to_incremental_compaction();
+            } else {
+                heap_.finish_incremental_marking();
+            }
+        }
+        assert_stack_matches_map(verification, frame);
+    } else if (compaction_stress) {
+        assert_stack_matches_map(verification, frame);
+        if (!heap_.incremental_compaction_active()) {
+            heap_.start_incremental_compaction();
+        }
+        const auto budget = gc_stress_.incremental_compact_step_budgets[
+            incremental_compaction_budget_cursor_ %
+            gc_stress_.incremental_compact_step_budgets.size()];
+        ++incremental_compaction_budget_cursor_;
+        (void)heap_.incremental_compact_step(budget);
+        if (heap_.incremental_compaction_quiescent()) {
+            heap_.finish_incremental_compaction();
         }
         assert_stack_matches_map(verification, frame);
     }
@@ -272,6 +301,9 @@ Value VM::execute(const VerifiedModule& module) {
 
 Value VM::execute_verified(const Module& module,
                            const ModuleVerificationResult& verification) {
+    if (heap_.incremental_compaction_active()) {
+        heap_.finish_incremental_compaction();
+    }
     if (heap_.incremental_marking_active()) {
         heap_.finish_incremental_marking();
     }
@@ -279,9 +311,11 @@ Value VM::execute_verified(const Module& module,
     pending_exception_.reset();
     instructions_executed_ = 0;
     incremental_budget_cursor_ = 0;
+    incremental_compaction_budget_cursor_ = 0;
     push_frame(module, module.entry_function, {});
 
-    while (!frames_.empty()) {
+    try {
+      while (!frames_.empty()) {
         auto& frame = frames_.back();
         const auto& function = module.functions[frame.function_index];
         assert_stack_matches_map(verification, frame);
@@ -1101,7 +1135,14 @@ Value VM::execute_verified(const Module& module,
         }
         case OpCode::Return: {
             if (heap_.incremental_marking_active()) {
-                heap_.finish_incremental_marking();
+                if (!gc_stress_.incremental_compact_step_budgets.empty()) {
+                    heap_.finish_incremental_marking_to_incremental_compaction();
+                } else {
+                    heap_.finish_incremental_marking();
+                }
+            }
+            if (heap_.incremental_compaction_active()) {
+                heap_.finish_incremental_compaction();
             }
             const auto result = pop(frame);
             frames_.pop_back();
@@ -1114,8 +1155,17 @@ Value VM::execute_verified(const Module& module,
         }
         }
         ++instructions_executed_;
+      }
+      return Value::nil();
+    } catch (...) {
+        if (heap_.incremental_marking_active()) {
+            heap_.finish_incremental_marking();
+        }
+        if (heap_.incremental_compaction_active()) {
+            heap_.finish_incremental_compaction();
+        }
+        throw;
     }
-    return Value::nil();
 }
 
 } // namespace lang

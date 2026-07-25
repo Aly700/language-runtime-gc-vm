@@ -124,6 +124,15 @@ target_link_libraries(lang_iteration36_ephemerons_fuzz PRIVATE lang_runtime)
 add_executable(lang_iteration37_incremental_marking tests/iteration37_incremental_marking.cpp)
 target_link_libraries(lang_iteration37_incremental_marking PRIVATE lang_runtime)
 
+add_executable(lang_iteration38_incremental_compaction
+    tests/iteration38_incremental_compaction.cpp)
+target_link_libraries(lang_iteration38_incremental_compaction PRIVATE lang_runtime)
+
+add_executable(lang_iteration38_incremental_compaction_fuzz
+    tests/iteration38_incremental_compaction_fuzz.cpp)
+target_link_libraries(
+    lang_iteration38_incremental_compaction_fuzz PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -168,5 +177,9 @@ add_test(NAME lang_iteration35_exceptions_fuzz COMMAND lang_iteration35_exceptio
 add_test(NAME lang_iteration36_ephemerons COMMAND lang_iteration36_ephemerons)
 add_test(NAME lang_iteration36_ephemerons_fuzz COMMAND lang_iteration36_ephemerons_fuzz)
 add_test(NAME lang_iteration37_incremental_marking COMMAND lang_iteration37_incremental_marking)
+add_test(NAME lang_iteration38_incremental_compaction
+    COMMAND lang_iteration38_incremental_compaction)
+add_test(NAME lang_iteration38_incremental_compaction_fuzz
+    COMMAND lang_iteration38_incremental_compaction_fuzz)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

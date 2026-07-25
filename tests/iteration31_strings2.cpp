@@ -552,10 +552,10 @@ pair(render(), table["s150"])
                 std::to_string(kStrings2SnapshotSeed));
 }
 
-void strings2_grammar_checks_ten_schedules_both_oracles_and_mutants() {
+void strings2_grammar_checks_all_schedules_both_oracles_and_mutants() {
     const auto all_schedules = fuzz::schedules();
-    require(all_schedules.size() == 12,
-            "strings2 grammar requires exactly twelve shared schedules");
+    require(all_schedules.size() == 15,
+            "strings2 grammar requires exactly fifteen shared schedules");
     for (std::uint64_t seed = kStrings2FirstSeed;
          seed < kStrings2FirstSeed + kStrings2CorpusSize; ++seed) {
         for (const auto& schedule : all_schedules) {
@@ -646,8 +646,8 @@ int run(int argc, char** argv) {
          frontend_rejects_mixed_ordering_and_bad_sub_calls_with_positions},
         {"strings2_grammar_pinned_snapshot",
          strings2_grammar_pinned_snapshot},
-        {"strings2_grammar_checks_ten_schedules_both_oracles_and_mutants",
-         strings2_grammar_checks_ten_schedules_both_oracles_and_mutants},
+        {"strings2_grammar_checks_all_schedules_both_oracles_and_mutants",
+         strings2_grammar_checks_all_schedules_both_oracles_and_mutants},
     };
     int failures = 0;
     for (const auto& test : tests) {

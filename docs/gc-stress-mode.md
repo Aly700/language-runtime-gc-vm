@@ -7,6 +7,8 @@ The VM/heap support deterministic collection at these points:
 - after every write barrier
 - every N bytecode instructions as a major collection
 - every N bytecode instructions as a minor collection
+- positive cyclic object budgets for incremental major marking
+- positive cyclic survivor budgets for incremental major compaction
 
 Each mode must be seed/replay friendly and must not depend on wall-clock timing.
 
@@ -23,6 +25,9 @@ Implementation details:
   and before the next instruction starts.
 - For `collect_minor_every_n_instructions = N`, minor collection runs at those same
   deterministic verified bytecode boundaries.
+- Incremental marking and compaction budgets count complete objects, never time, bytes, or
+  fields. Combined scheduling finishes marking's final remark into compaction; the two
+  phases never overlap.
 - VM-controlled collection points assert, in debug builds, that the generated verifier stack
   map for the current pc agrees with the runtime stack's object tags before collecting.
 - Every stress-triggered major or minor collection runs the same root/field/reference and
@@ -76,8 +81,12 @@ CTest runs three corpora, each across these schedules:
 - `major_every_1`, `major_every_3`, `major_every_7`
 - `minor_every_1`, `minor_every_4`
 - `minor_after_every_barrier`
+- `incremental_1`, `incremental_3_1`
 - `combined` (`before_every_alloc`, `after_every_alloc`, `major_every_7`,
-  `minor_every_4`, and `minor_after_every_barrier`)
+  `minor_every_4`, `minor_after_every_barrier`, and incremental marking)
+- `incremental_compact_1`, `incremental_compact_3_1`
+- `combined_mark_compact` (the existing combined configuration plus compaction budgets
+  `{1, 2}`)
 
 The single-function corpus runs seeds `1..64`. The call corpus also runs seeds `1..64`;
 the module size is derived from the seed so those 64 seeds cover 2, 3, 4, and 5-function
@@ -144,8 +153,8 @@ PRNG and a small generator-side type environment while emitting:
 - `if/else` statement blocks, pair construction, pair field writes, opaque bare-pair leaves,
   and cyclic graphs formed by storing a typed anchor back into bare pair fields.
 
-The legacy positive corpus runs seeds `1..48` across the same 10 schedules used by
-`lang_iteration5_fuzz`, for 480 executions per CTest run. Its pinned source snapshot is
+The legacy positive corpus runs seeds `1..48` across the same 15 schedules used by
+`lang_iteration5_fuzz`, for 720 executions per CTest run. Its pinned source snapshot is
 seed `17` and remains byte-for-byte stable. The oracle is exactly the shared fuzzer
 oracle: scalar results compare by tag and value, `nil` results compare as the canonical
 `nil` observable, object results compare the canonical left-before-right graph
@@ -166,8 +175,8 @@ deterministic programs with:
 - mixed programs combining recursive calls, mutation, typed pair reads, object returns,
   scalar returns, and typed nil returns.
 
-The recursive positive corpus also runs seeds `1..48` across all 10 schedules, adding
-480 executions per CTest run. It has its own pinned seed-`17` snapshot; legacy and
+The recursive positive corpus also runs seeds `1..48` across all 15 schedules, adding
+720 executions per CTest run. It has its own pinned seed-`17` snapshot; legacy and
 recursive corpus dumps are deterministic and can be byte-compared independently.
 
 Iteration 22 adds a third source grammar, selected in replay as `array`, for the source
@@ -181,15 +190,15 @@ array surface. It emits deterministic programs with:
   `SignatureValue` array element metadata at call and return boundaries.
 - typed element recovery through `pairs[i].left`, `lists[i].left`, and `grid[i][j]`.
 
-The array positive corpus also runs seeds `1..48` across all 10 schedules, adding another
-480 executions per CTest run. It has its own pinned seed-`17` snapshot; the legacy and
+The array positive corpus also runs seeds `1..48` across all 15 schedules, adding another
+720 executions per CTest run. It has its own pinned seed-`17` snapshot; the legacy and
 recursive snapshots are unchanged.
 
 Iteration 23 adds a fourth source grammar, selected in replay as `strings`. It emits
 deterministic programs with immutable escaped/empty literals, string parameters and
 returns, loop-carried concat allocation, structural `==`/`!=`, byte `.len`, in-bounds byte
 indexing, and string/bool/i64 result variants. The string positive corpus runs seeds
-`1..48` across all 10 schedules for another 480 executions and has its own pinned seed-17
+`1..48` across all 15 schedules for another 720 executions and has its own pinned seed-17
 snapshot.
 
 Iteration 24 adds a fifth isolated source grammar, selected in replay as `closures`. It
@@ -198,7 +207,7 @@ functions used as zero-capture values, lambdas with deterministic interleaved sc
 reference captures, returned closures, post-allocation assignment that tests snapshot
 semantics, and closures stored in typed pairs and RefArrays. Every generated source must
 compile to a verifier-accepted module before execution. Seeds `1..48` run across the same
-10 schedules for another 480 executions, with an independent pinned seed-17 snapshot.
+15 schedules for another 720 executions, with an independent pinned seed-17 snapshot.
 
 The shared id-free object oracle renders closure nodes as their validated layout index plus
 their ordered canonical capture values. Captured object values enter the same deterministic
@@ -319,3 +328,23 @@ Dump any source corpus for byte-identity checks with:
 ./build/lang_iteration10_source_fuzz --dump-corpus strings
 ./build/lang_iteration10_source_fuzz --dump-corpus closures
 ```
+
+## Incremental-compaction corpus
+
+Iteration 38 adds an isolated 32-seed `incremental_compaction` source grammar. Each program
+returns a nonempty mixed-width graph and emits output while exercising pairs, scalar and
+reference arrays, strings, closures, maps, records, variants, weak references,
+ephemerons, holes, and fixed-width mutations. Every seed compares both the ID-free graph
+and exact output bytes across all fifteen schedules.
+
+```bash
+./build/lang_iteration38_incremental_compaction_fuzz \
+  --grammar incremental_compaction --seed 38 --schedule incremental_compact_1
+./build/lang_iteration38_incremental_compaction_fuzz \
+  --grammar incremental_compaction --seed 38 --mutant 0
+./build/lang_iteration38_incremental_compaction_fuzz \
+  --dump-corpus incremental_compaction
+```
+
+The full dump SHA-256 is
+`7992ef70300c905f9f2147e7a1438d3d24a2441a91e6357d14b981b1032175de`.

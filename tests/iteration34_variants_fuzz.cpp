@@ -265,8 +265,8 @@ std::size_t parse_mutant(const std::string& text) {
 
 int run(int argc, char** argv) {
     const auto schedules = fuzz::schedules();
-    require(schedules.size() == 12,
-            "variants fuzz target requires exactly twelve deterministic schedules");
+    require(schedules.size() == 15,
+            "variants fuzz target requires exactly fifteen deterministic schedules");
 
     if (argc == 7 &&
         (std::string(argv[1]) == "--grammar" ||

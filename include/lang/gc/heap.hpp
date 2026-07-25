@@ -33,6 +33,7 @@ struct StressConfig {
     std::uint64_t collect_every_n_instructions{0};
     std::uint64_t collect_minor_every_n_instructions{0};
     std::vector<std::size_t> incremental_mark_step_budgets;
+    std::vector<std::size_t> incremental_compact_step_budgets;
 };
 
 struct HeapMetrics {
@@ -77,6 +78,12 @@ struct HeapMetrics {
     std::uint64_t incremental_objects_scanned{0};
     std::uint64_t incremental_final_pauses{0};
     std::uint64_t incremental_differential_validations{0};
+    std::uint64_t incremental_compaction_cycles_started{0};
+    std::uint64_t incremental_compaction_steps{0};
+    std::uint64_t incremental_compaction_budget_requested{0};
+    std::uint64_t incremental_compaction_objects_relocated{0};
+    std::uint64_t incremental_compaction_final_pauses{0};
+    std::uint64_t incremental_compaction_differential_validations{0};
 };
 
 enum class ObjectGeneration {
@@ -224,11 +231,23 @@ public:
     void start_incremental_marking();
     [[nodiscard]] std::size_t incremental_mark_step(std::size_t budget);
     void finish_incremental_marking();
+    void finish_incremental_marking_to_incremental_compaction();
     [[nodiscard]] bool incremental_marking_active() const {
         return incremental_marking_active_;
     }
     [[nodiscard]] bool incremental_marking_quiescent() const {
         return incremental_marking_active_ && incremental_mark_worklist_.empty();
+    }
+    void start_incremental_compaction();
+    [[nodiscard]] std::size_t incremental_compact_step(std::size_t budget);
+    void finish_incremental_compaction();
+    [[nodiscard]] bool incremental_compaction_active() const {
+        return incremental_compaction_active_;
+    }
+    [[nodiscard]] bool incremental_compaction_quiescent() const {
+        return incremental_compaction_active_ &&
+               incremental_compaction_cursor_ ==
+                   incremental_compaction_plan_.size();
     }
     void set_stress_config(StressConfig config) { stress_config_ = config; }
 
@@ -302,6 +321,9 @@ public:
     void TEST_ONLY_skip_next_incremental_write_barrier() {
         TEST_ONLY_skip_next_incremental_write_barrier_ = true;
     }
+    void TEST_ONLY_corrupt_next_incremental_compaction_copy() {
+        TEST_ONLY_corrupt_next_incremental_compaction_copy_ = true;
+    }
     void TEST_ONLY_validate_incremental_marking() const;
 
 private:
@@ -309,6 +331,7 @@ private:
 
     class MarkingVisitor;
     class ForwardingVisitor;
+    class PartialForwardingVisitor;
     class ValidatingVisitor;
     enum class PairField { Left, Right };
     enum class CollectionKind { Major, Minor };
@@ -320,6 +343,14 @@ private:
         std::vector<std::uint32_t> generations;
         std::vector<std::size_t> promoted_slots;
         std::uint64_t objects_moved{0};
+    };
+
+    struct IncrementalCompactionEntry {
+        ObjectId source_id{0};
+        std::size_t source_slot{0};
+        std::size_t width{0};
+        ObjectId destination_id{0};
+        std::size_t destination_slot{0};
     };
 
     ObjectId allocate_object(Object object);
@@ -351,6 +382,30 @@ private:
     void collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots);
     void finish_incremental_marking_impl(RootProvider* roots,
                                          std::span<Value*> extra_roots);
+    void finish_incremental_marking_liveness(
+        RootProvider* roots, std::span<Value*> extra_roots);
+    void prepare_incremental_compaction();
+    void prepare_incremental_compaction_from_marked();
+    [[nodiscard]] std::size_t incremental_compact_step_impl(
+        std::size_t budget, RootProvider* roots,
+        std::span<Value*> extra_roots);
+    void finish_incremental_compaction_impl(
+        RootProvider* roots, std::span<Value*> extra_roots);
+    void rewrite_incremental_compaction_roots(
+        RootProvider* roots, std::span<Value*> extra_roots);
+    void rewrite_incremental_compaction_value(Value& value,
+                                              bool require_forwarded) const;
+    [[nodiscard]] Value canonicalize_incremental_compaction_read(
+        Value value) const;
+    [[nodiscard]] Value normalize_incremental_compaction_shadow_value(
+        Value value) const;
+    [[nodiscard]] Object& incremental_compaction_shadow_object(ObjectId id);
+    void validate_incremental_compaction_against_atomic(
+        RootProvider* roots, std::span<Value*> extra_roots) const;
+    void forward_incremental_compaction_registries(
+        const IncrementalCompactionEntry& entry);
+    void finalize_incremental_compaction(
+        RootProvider* roots, std::span<Value*> extra_roots);
     void collect_with_extra_roots(std::span<Value*> extra_roots);
     void trace_collection_roots(RootVisitor& visitor, RootProvider* roots,
                                 std::span<Value*> extra_roots) const;
@@ -421,6 +476,17 @@ private:
     bool TEST_ONLY_skip_next_write_barrier_{false};
     bool incremental_marking_active_{false};
     std::vector<ObjectId> incremental_mark_worklist_;
+    bool incremental_compaction_active_{false};
+    std::vector<IncrementalCompactionEntry> incremental_compaction_plan_;
+    std::size_t incremental_compaction_cursor_{0};
+    ForwardingTable incremental_compaction_forwarding_;
+    std::vector<std::optional<ObjectId>> incremental_compaction_source_ids_;
+    std::vector<std::uint32_t> incremental_compaction_destination_generations_;
+    std::vector<std::optional<Object>> incremental_compaction_shadow_objects_;
+    std::vector<std::uint32_t> incremental_compaction_shadow_generations_;
+    std::vector<ObjectId> incremental_compaction_shadow_weak_refs_;
+    std::vector<ObjectId> incremental_compaction_shadow_ephemerons_;
+    bool TEST_ONLY_corrupt_next_incremental_compaction_copy_{false};
     bool TEST_ONLY_skip_next_incremental_write_barrier_{false};
     mutable std::uint64_t TEST_ONLY_validation_count_{0};
 };

@@ -66,13 +66,40 @@
   white object. Every mutable reference-publishing funnel shades a white target before a
   black owner publishes it; newly allocated objects enter the grey worklist. The same
   descriptor visitor is the sole strong-edge authority for stepping and validation.
-- Final incremental completion re-traces current precise roots and derives the same live
-  set as atomic stop-the-world major marking at that boundary. Ephemeron fixpoint,
-  weak/ephemeron clearing, compaction, forwarding, installation, and validation remain one
-  stop-the-world phase, so no intermediate step boundary observes a death or movement.
+- Final incremental-marking completion re-traces current precise roots and derives the
+  same live set as atomic stop-the-world major marking at that boundary. Ephemeron
+  fixpoint and weak/ephemeron death decisions complete before any incremental movement;
+  a combined schedule may then transfer that fixed live set directly into compaction.
 - Every collector-owned object ID must participate in movement. Map-growth relocation
   forwards an active incremental grey worklist together with roots, descriptor edges,
   remembered entries, and weak/ephemeron registries.
+
+- Incremental marking and incremental compaction are mutually exclusive. Compaction
+  starts only after final major liveness, ephemeron activation, dead weak-target clearing,
+  dead-owner pruning, and dead-header sweep have completed deterministically.
+- An incremental compaction budget counts complete survivor relocation units in ascending
+  source-slot order. The saved full source ID, descriptor width, full destination ID, and
+  destination slot are immutable; no clock, thread, random choice, byte count, field count,
+  address, or unordered iteration may influence a step.
+- During incremental compaction, checked dereference accepts a physically current full ID
+  or an exact saved source ID with installed forwarding. Slot-only forwarding is
+  forbidden. A genuinely stale generation must trap before, during, and after the phase,
+  and source IDs must become stale after final canonical rewriting.
+- Each relocation copies the complete object before clearing an overlapping source,
+  installs the predetermined destination generation before publishing forwarding,
+  partially rewrites every precise root and collector owner registry, records
+  promotion-created old-to-young edges, clears no additional liveness, and runs all
+  collection validators before the mutator resumes.
+- Fixed-width mutations during compaction must update the authoritative moved or unmoved
+  owner through checked dereference. Reference values are canonicalized before the
+  barrier-before-publish funnels. Allocations, new map entries, map growth, and explicit
+  collections must finish compaction first with every reference operand temporarily
+  rooted.
+- The final incremental-compaction graph must equal an independently recomputed atomic
+  slide of the post-liveness source snapshot, including generations, descriptor-selected
+  fields, scalar payloads, weak and ephemeron fields/registries, remembered-set pruning,
+  handles, VM roots, and explicit roots. Shadow mutations update source fields directly;
+  they may not copy production destination objects.
 
 - Every live object is reachable from an explicit root or another live object at collection start.
 - The collector must never treat non-reference values as references.
