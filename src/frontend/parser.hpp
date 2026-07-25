@@ -45,6 +45,8 @@ struct TypeSpec {
     std::optional<std::size_t> record_layout_index;
     std::optional<std::size_t> variant_layout_index;
     std::optional<std::size_t> type_parameter_index;
+    std::vector<TypeSpec> generic_arguments;
+    std::optional<std::size_t> generic_declaration_index;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == Kind::Pair && left != nullptr && right != nullptr;
@@ -302,8 +304,10 @@ struct TypeDecl {
     std::string name;
     SourcePosition position;
     SourcePosition body_position;
+    std::vector<TypeParameterDecl> type_parameters;
     TypeSpec body{invalid_type()};
     std::size_t type_index{static_cast<std::size_t>(-1)};
+    std::size_t declaration_order{0};
 };
 
 struct RecordFieldDecl {
@@ -315,8 +319,10 @@ struct RecordFieldDecl {
 struct RecordDecl {
     std::string name;
     SourcePosition position;
+    std::vector<TypeParameterDecl> type_parameters;
     std::vector<RecordFieldDecl> fields;
     std::size_t layout_index{static_cast<std::size_t>(-1)};
+    std::size_t declaration_order{0};
 };
 
 struct VariantCaseDecl {
@@ -328,14 +334,19 @@ struct VariantCaseDecl {
 struct VariantDecl {
     std::string name;
     SourcePosition position;
+    std::vector<TypeParameterDecl> type_parameters;
     std::vector<VariantCaseDecl> cases;
     std::size_t layout_index{static_cast<std::size_t>(-1)};
+    std::size_t declaration_order{0};
 };
 
 struct Program {
     std::vector<TypeDecl> types;
+    std::vector<TypeDecl> generic_types;
     std::vector<RecordDecl> records;
+    std::vector<RecordDecl> generic_records;
     std::vector<VariantDecl> variants;
+    std::vector<VariantDecl> generic_variants;
     std::vector<FunctionDecl> functions;
     std::vector<FunctionDecl> generic_functions;
     std::vector<std::shared_ptr<LambdaExpr>> lambdas;

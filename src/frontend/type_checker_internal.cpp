@@ -275,6 +275,35 @@ struct VariantSymbol {
     VariantDecl* declaration{nullptr};
 };
 
+enum class GenericNominalKind {
+    Named,
+    Record,
+    Variant,
+};
+
+struct GenericNominalSymbol {
+    std::string name;
+    SourcePosition position;
+    std::size_t index{0};
+    GenericNominalKind kind{GenericNominalKind::Named};
+    TypeDecl* type_declaration{nullptr};
+    RecordDecl* record_declaration{nullptr};
+    VariantDecl* variant_declaration{nullptr};
+};
+
+struct GenericNominalInstantiation {
+    std::string key;
+    std::size_t generic_index{0};
+    GenericNominalKind kind{GenericNominalKind::Named};
+    std::vector<TypeSpec> arguments;
+    std::size_t concrete_index{0};
+    std::size_t depth{0};
+    bool complete{false};
+    TypeDecl type_declaration;
+    RecordDecl record_declaration;
+    VariantDecl variant_declaration;
+};
+
 class TypeChecker {
 public:
     explicit TypeChecker(std::size_t pair_site_count) : pair_site_count_(pair_site_count) {
@@ -309,6 +338,7 @@ public:
             static_cast<std::uint32_t>(entry_context.prototypes.size());
         local_context_ = previous_local_context;
 
+        materialize_generic_nominal_instances(program);
         for (auto& instantiation : instantiated_functions_) {
             assert(instantiation.function_index ==
                        program.functions.size() + 1 &&
@@ -404,8 +434,7 @@ private:
 
     void collect_type_symbols(Program& program) {
         std::set<std::string> nominal_names;
-        for (std::size_t i = 0; i < program.types.size(); ++i) {
-            auto& declaration = program.types[i];
+        for (auto& declaration : program.types) {
             if (!nominal_names.insert(declaration.name).second) {
                 diagnose(declaration.position,
                          "type '" + declaration.name + "' is already defined");
@@ -450,6 +479,40 @@ private:
             variants_.push_back(std::move(symbol));
         }
 
+        const auto register_generic =
+            [&](const std::string& name, SourcePosition position,
+                GenericNominalKind kind, TypeDecl* type_declaration,
+                RecordDecl* record_declaration,
+                VariantDecl* variant_declaration) {
+                if (!nominal_names.insert(name).second) {
+                    diagnose(position,
+                             "type '" + name + "' is already defined");
+                    return;
+                }
+                generic_nominals_.push_back(GenericNominalSymbol{
+                    name, position, generic_nominals_.size(), kind,
+                    type_declaration, record_declaration,
+                    variant_declaration});
+            };
+        for (auto& declaration : program.generic_types) {
+            register_generic(
+                declaration.name, declaration.position,
+                GenericNominalKind::Named, &declaration, nullptr,
+                nullptr);
+        }
+        for (auto& declaration : program.generic_records) {
+            register_generic(
+                declaration.name, declaration.position,
+                GenericNominalKind::Record, nullptr, &declaration,
+                nullptr);
+        }
+        for (auto& declaration : program.generic_variants) {
+            register_generic(
+                declaration.name, declaration.position,
+                GenericNominalKind::Variant, nullptr, nullptr,
+                &declaration);
+        }
+
         for (auto& declaration : program.types) {
             resolve_type(declaration.body);
             if (!declaration.body.has_pair_fields()) {
@@ -464,7 +527,6 @@ private:
             }
         }
 
-
         for (auto& declaration : program.records) {
             std::set<std::string> field_names;
             for (auto& field : declaration.fields) {
@@ -478,7 +540,6 @@ private:
             }
         }
 
-
         for (auto& declaration : program.variants) {
             std::set<std::string> case_names;
             for (auto& variant_case : declaration.cases) {
@@ -490,6 +551,65 @@ private:
                 }
                 for (auto& field : variant_case.fields) {
                     resolve_type(field);
+                }
+            }
+        }
+
+        const auto validate_type_parameters =
+            [&](const std::string& declaration_kind,
+                const std::string& declaration_name,
+                const std::vector<TypeParameterDecl>& parameters) {
+                std::set<std::string> names;
+                for (const auto& parameter : parameters) {
+                    if (!names.insert(parameter.name).second) {
+                        diagnose(
+                            parameter.position,
+                            "type parameter '" + parameter.name +
+                                "' is already defined in generic " +
+                                declaration_kind + " '" +
+                                declaration_name + "'");
+                    }
+                }
+            };
+        for (auto& declaration : program.generic_types) {
+            validate_type_parameters(
+                "type", declaration.name, declaration.type_parameters);
+            resolve_type(declaration.body, true);
+            if (!declaration.body.has_pair_fields()) {
+                diagnose(declaration.position,
+                         "type '" + declaration.name +
+                             "' must be declared as pair<...>");
+            }
+        }
+        for (auto& declaration : program.generic_records) {
+            validate_type_parameters(
+                "record", declaration.name,
+                declaration.type_parameters);
+            std::set<std::string> field_names;
+            for (auto& field : declaration.fields) {
+                if (!field_names.insert(field.name).second) {
+                    diagnose(field.position,
+                             "record field '" + field.name +
+                                 "' is already defined in '" +
+                                 declaration.name + "'");
+                }
+                resolve_type(field.type, true);
+            }
+        }
+        for (auto& declaration : program.generic_variants) {
+            validate_type_parameters(
+                "variant", declaration.name,
+                declaration.type_parameters);
+            std::set<std::string> case_names;
+            for (auto& variant_case : declaration.cases) {
+                if (!case_names.insert(variant_case.name).second) {
+                    diagnose(variant_case.position,
+                             "variant case '" + variant_case.name +
+                                 "' is already defined in '" +
+                                 declaration.name + "'");
+                }
+                for (auto& field : variant_case.fields) {
+                    resolve_type(field, true);
                 }
             }
         }
@@ -714,28 +834,251 @@ private:
         return &types_[*type.named_type_index];
     }
 
-    void resolve_type(TypeSpec& type) {
+    GenericNominalSymbol* find_generic_nominal(
+        const std::string& name) {
+        for (auto& nominal : generic_nominals_) {
+            if (nominal.name == name) {
+                return &nominal;
+            }
+        }
+        return nullptr;
+    }
+
+    const GenericNominalSymbol* find_generic_nominal(
+        const std::string& name) const {
+        for (const auto& nominal : generic_nominals_) {
+            if (nominal.name == name) {
+                return &nominal;
+            }
+        }
+        return nullptr;
+    }
+
+    std::size_t generic_nominal_arity(
+        const GenericNominalSymbol& generic) const {
+        switch (generic.kind) {
+        case GenericNominalKind::Named:
+            assert(generic.type_declaration != nullptr);
+            return generic.type_declaration->type_parameters.size();
+        case GenericNominalKind::Record:
+            assert(generic.record_declaration != nullptr);
+            return generic.record_declaration->type_parameters.size();
+        case GenericNominalKind::Variant:
+            assert(generic.variant_declaration != nullptr);
+            return generic.variant_declaration->type_parameters.size();
+        }
+        throw std::logic_error("unknown generic nominal kind");
+    }
+
+    TypeSpec generic_instance_type(
+        const GenericNominalSymbol& generic,
+        const GenericNominalInstantiation& instantiation,
+        SourcePosition position) const {
+        TypeSpec result;
+        switch (generic.kind) {
+        case GenericNominalKind::Named:
+            result = named_type(generic.name, position);
+            result.named_type_index = instantiation.concrete_index;
+            break;
+        case GenericNominalKind::Record:
+            result = record_type(
+                generic.name, instantiation.concrete_index, position);
+            break;
+        case GenericNominalKind::Variant:
+            result = variant_type(
+                generic.name, instantiation.concrete_index, position);
+            break;
+        }
+        result.generic_arguments = instantiation.arguments;
+        result.generic_declaration_index = generic.index;
+        return result;
+    }
+
+    std::optional<TypeSpec> request_generic_nominal_instantiation(
+        const GenericNominalSymbol& generic,
+        const std::vector<TypeSpec>& arguments,
+        SourcePosition use_position) {
+        const auto key =
+            canonical_type_argument_tuple_key(arguments);
+        for (const auto& instantiation :
+             instantiated_nominals_) {
+            if (instantiation.generic_index == generic.index &&
+                instantiation.key == key) {
+                return generic_instance_type(
+                    generic, instantiation, use_position);
+            }
+        }
+
+        constexpr std::size_t kMaxInstantiationDepth = 32;
+        const auto depth = current_instantiation_depth_ + 1;
+        if (depth > kMaxInstantiationDepth) {
+            diagnose(
+                use_position,
+                "generic instantiation depth limit of 32 exceeded while "
+                "instantiating '" +
+                    generic.name +
+                    "'; possible polymorphic recursion");
+            return std::nullopt;
+        }
+
+        GenericNominalInstantiation instantiation;
+        instantiation.key = key;
+        instantiation.generic_index = generic.index;
+        instantiation.kind = generic.kind;
+        instantiation.arguments = arguments;
+        instantiation.depth = depth;
+        switch (generic.kind) {
+        case GenericNominalKind::Named:
+            assert(generic.type_declaration != nullptr);
+            instantiation.concrete_index = types_.size();
+            instantiation.type_declaration =
+                instantiate_generic_type(
+                    *generic.type_declaration, arguments);
+            instantiation.type_declaration.type_index =
+                instantiation.concrete_index;
+            break;
+        case GenericNominalKind::Record:
+            assert(generic.record_declaration != nullptr);
+            instantiation.concrete_index = records_.size();
+            instantiation.record_declaration =
+                instantiate_generic_record(
+                    *generic.record_declaration, arguments);
+            instantiation.record_declaration.layout_index =
+                instantiation.concrete_index;
+            break;
+        case GenericNominalKind::Variant:
+            assert(generic.variant_declaration != nullptr);
+            instantiation.concrete_index = variants_.size();
+            instantiation.variant_declaration =
+                instantiate_generic_variant(
+                    *generic.variant_declaration, arguments);
+            instantiation.variant_declaration.layout_index =
+                instantiation.concrete_index;
+            break;
+        }
+
+        instantiated_nominals_.push_back(
+            std::move(instantiation));
+        auto& stored = instantiated_nominals_.back();
+        switch (generic.kind) {
+        case GenericNominalKind::Named:
+            types_.push_back(TypeSymbol{
+                stored.type_declaration.name,
+                stored.type_declaration.position,
+                stored.concrete_index, invalid_type()});
+            break;
+        case GenericNominalKind::Record:
+            records_.push_back(RecordSymbol{
+                stored.record_declaration.name,
+                stored.record_declaration.position,
+                stored.concrete_index,
+                &stored.record_declaration});
+            break;
+        case GenericNominalKind::Variant:
+            variants_.push_back(VariantSymbol{
+                stored.variant_declaration.name,
+                stored.variant_declaration.position,
+                stored.concrete_index,
+                &stored.variant_declaration});
+            break;
+        }
+
+        const auto previous_depth = current_instantiation_depth_;
+        current_instantiation_depth_ = depth;
+        switch (generic.kind) {
+        case GenericNominalKind::Named:
+            resolve_type(stored.type_declaration.body);
+            if (!stored.type_declaration.body.has_pair_fields()) {
+                diagnose(
+                    stored.type_declaration.position,
+                    "type '" + generic.name +
+                        "' must be declared as pair<...>");
+            }
+            types_[stored.concrete_index].body =
+                stored.type_declaration.body;
+            break;
+        case GenericNominalKind::Record:
+            for (auto& field :
+                 stored.record_declaration.fields) {
+                resolve_type(field.type);
+            }
+            break;
+        case GenericNominalKind::Variant:
+            for (auto& variant_case :
+                 stored.variant_declaration.cases) {
+                for (auto& field : variant_case.fields) {
+                    resolve_type(field);
+                }
+            }
+            break;
+        }
+        current_instantiation_depth_ = previous_depth;
+        stored.complete = true;
+        return generic_instance_type(
+            generic, stored, use_position);
+    }
+
+    void materialize_generic_nominal_instances(
+        Program& program) {
+        for (auto& instantiation : instantiated_nominals_) {
+            if (!instantiation.complete) {
+                continue;
+            }
+            switch (instantiation.kind) {
+            case GenericNominalKind::Named:
+                if (instantiation.concrete_index ==
+                    program.types.size()) {
+                    program.types.push_back(
+                        std::move(
+                            instantiation.type_declaration));
+                }
+                break;
+            case GenericNominalKind::Record:
+                if (instantiation.concrete_index ==
+                    program.records.size()) {
+                    program.records.push_back(
+                        std::move(
+                            instantiation.record_declaration));
+                }
+                break;
+            case GenericNominalKind::Variant:
+                if (instantiation.concrete_index ==
+                    program.variants.size()) {
+                    program.variants.push_back(
+                        std::move(
+                            instantiation.variant_declaration));
+                }
+                break;
+            }
+        }
+    }
+
+    void resolve_type(TypeSpec& type,
+                      bool defer_generic_instantiation = false) {
         if (type.has_pair_fields()) {
-            resolve_type(*type.left);
-            resolve_type(*type.right);
+            resolve_type(*type.left, defer_generic_instantiation);
+            resolve_type(*type.right, defer_generic_instantiation);
             return;
         }
         if (type.kind == TypeSpec::Kind::Array && type.element != nullptr) {
-            resolve_type(*type.element);
+            resolve_type(*type.element, defer_generic_instantiation);
             return;
         }
         if (type.kind == TypeSpec::Kind::Function &&
             type.function_return != nullptr) {
             for (auto& parameter : type.function_parameters) {
-                resolve_type(parameter);
+                resolve_type(
+                    parameter, defer_generic_instantiation);
             }
-            resolve_type(*type.function_return);
+            resolve_type(
+                *type.function_return,
+                defer_generic_instantiation);
             return;
         }
         if (type.kind == TypeSpec::Kind::Map && type.key != nullptr &&
             type.value != nullptr) {
-            resolve_type(*type.key);
-            resolve_type(*type.value);
+            resolve_type(*type.key, defer_generic_instantiation);
+            resolve_type(*type.value, defer_generic_instantiation);
             if (!is_invalid(*type.key) &&
                 type.key->kind != TypeSpec::Kind::TypeParameter &&
                 !is_valid_map_key_type(*type.key)) {
@@ -746,7 +1089,9 @@ private:
         }
         if (type.kind == TypeSpec::Kind::Weak &&
             type.weak_target != nullptr) {
-            resolve_type(*type.weak_target);
+            resolve_type(
+                *type.weak_target,
+                defer_generic_instantiation);
             if (!is_invalid(*type.weak_target) &&
                 type.weak_target->kind !=
                     TypeSpec::Kind::TypeParameter &&
@@ -759,8 +1104,8 @@ private:
         }
         if (type.kind == TypeSpec::Kind::Ephemeron && type.key != nullptr &&
             type.value != nullptr) {
-            resolve_type(*type.key);
-            resolve_type(*type.value);
+            resolve_type(*type.key, defer_generic_instantiation);
+            resolve_type(*type.value, defer_generic_instantiation);
             if (!is_invalid(*type.key) &&
                 type.key->kind != TypeSpec::Kind::TypeParameter &&
                 !is_weak_target_type(*type.key)) {
@@ -776,6 +1121,62 @@ private:
             return;
         }
         if (type.kind != TypeSpec::Kind::Named) {
+            return;
+        }
+        if (auto* generic = find_generic_nominal(type.name);
+            generic != nullptr) {
+            type.generic_declaration_index = generic->index;
+            const auto expected =
+                generic_nominal_arity(*generic);
+            if (type.generic_arguments.size() != expected) {
+                diagnose(
+                    type.position,
+                    "generic type '" + type.name + "' expects " +
+                        std::to_string(expected) +
+                        " type argument(s) but got " +
+                        std::to_string(
+                            type.generic_arguments.size()));
+                type = invalid_type();
+                return;
+            }
+            for (auto& argument : type.generic_arguments) {
+                resolve_type(
+                    argument, defer_generic_instantiation);
+            }
+            for (const auto& argument :
+                 type.generic_arguments) {
+                if (is_invalid(argument)) {
+                    type = invalid_type();
+                    return;
+                }
+            }
+            if (defer_generic_instantiation ||
+                contains_type_parameter(type)) {
+                return;
+            }
+            const auto position = type.position;
+            auto concrete =
+                request_generic_nominal_instantiation(
+                    *generic, type.generic_arguments, position);
+            if (!concrete.has_value()) {
+                type = invalid_type();
+                return;
+            }
+            type = std::move(*concrete);
+            return;
+        }
+        if (!type.generic_arguments.empty()) {
+            if (find_type(type.name) != nullptr ||
+                find_record(type.name) != nullptr ||
+                find_variant(type.name) != nullptr) {
+                diagnose(type.position,
+                         "type '" + type.name +
+                             "' is not generic");
+            } else {
+                diagnose(type.position,
+                         "unknown type '" + type.name + "'");
+            }
+            type = invalid_type();
             return;
         }
         auto* symbol = find_type(type.name);
@@ -796,33 +1197,46 @@ private:
         type = variant_type(variant->name, variant->index, type.position);
     }
 
-    void resolve_statement_types(Statement& statement) {
+    void resolve_statement_types(
+        Statement& statement,
+        bool defer_generic_instantiation = false) {
         if (statement.kind == Statement::Kind::Let) {
-            resolve_type(statement.declared_type);
+            resolve_type(
+                statement.declared_type,
+                defer_generic_instantiation);
         }
         if (statement.kind == Statement::Kind::TryCatch) {
-            resolve_type(statement.catch_type);
+            resolve_type(
+                statement.catch_type,
+                defer_generic_instantiation);
         }
         for (auto& inner : statement.then_branch) {
-            resolve_statement_types(inner);
+            resolve_statement_types(
+                inner, defer_generic_instantiation);
         }
         for (auto& inner : statement.else_branch) {
-            resolve_statement_types(inner);
+            resolve_statement_types(
+                inner, defer_generic_instantiation);
         }
         for (auto& inner : statement.body) {
-            resolve_statement_types(inner);
+            resolve_statement_types(
+                inner, defer_generic_instantiation);
         }
         for (auto& arm : statement.match_arms) {
             for (auto& inner : arm.body) {
-                resolve_statement_types(inner);
+                resolve_statement_types(
+                    inner, defer_generic_instantiation);
             }
         }
         for (auto& inner : statement.catch_body) {
-            resolve_statement_types(inner);
+            resolve_statement_types(
+                inner, defer_generic_instantiation);
         }
     }
 
     void resolve_function_types(FunctionDecl& function) {
+        const bool defer_generic_instantiation =
+            !function.type_parameters.empty();
         std::set<std::string> type_parameter_names;
         for (const auto& parameter : function.type_parameters) {
             if (!type_parameter_names.insert(parameter.name).second) {
@@ -834,11 +1248,16 @@ private:
             }
         }
         for (auto& parameter : function.parameters) {
-            resolve_type(parameter.type);
+            resolve_type(
+                parameter.type,
+                defer_generic_instantiation);
         }
-        resolve_type(function.return_type);
+        resolve_type(
+            function.return_type,
+            defer_generic_instantiation);
         for (auto& statement : function.statements) {
-            resolve_statement_types(statement);
+            resolve_statement_types(
+                statement, defer_generic_instantiation);
         }
     }
 
@@ -2155,16 +2574,37 @@ private:
     }
 
     TypedValue check_record_literal(Expr& expression, FlowState& state) {
+        TypeSpec constructed_type{invalid_type()};
+        const RecordSymbol* record = nullptr;
+        if (find_generic_nominal(expression.name) != nullptr ||
+            !expression.explicit_type_arguments.empty()) {
+            constructed_type =
+                named_type(expression.name, expression.position);
+            constructed_type.generic_arguments =
+                expression.explicit_type_arguments;
+            resolve_type(constructed_type);
+            record = find_record(constructed_type);
+        } else {
+            record = find_record(expression.name);
+            if (record != nullptr) {
+                constructed_type = record_type(
+                    expression.name, record->index,
+                    expression.position);
+            }
+        }
+
         std::vector<TypedValue> initializers;
         initializers.reserve(expression.arguments.size());
         for (auto& argument : expression.arguments) {
             initializers.push_back(check_expr(*argument, state));
         }
 
-        const auto* record = find_record(expression.name);
         if (record == nullptr || record->declaration == nullptr) {
-            diagnose(expression.position,
-                     "unknown record type '" + expression.name + "'");
+            if (!is_invalid(constructed_type)) {
+                diagnose(expression.position,
+                         "unknown record type '" +
+                             expression.name + "'");
+            }
             return annotate(expression, invalid_value());
         }
         expression.record_layout_index = record->index;
@@ -2222,13 +2662,14 @@ private:
             return annotate(expression, invalid_value());
         }
 
-        auto value = value_from_type(
-            record_type(record->name, record->index, expression.position));
+        auto value = value_from_type(constructed_type);
         value.includes_nil = false;
         return annotate(expression, std::move(value));
     }
 
     TypedValue check_variant_literal(Expr& expression, FlowState& state) {
+        const auto constructed_type =
+            expression.inferred_type;
         std::vector<TypedValue> arguments;
         arguments.reserve(expression.arguments.size());
         for (auto& argument : expression.arguments) {
@@ -2270,8 +2711,12 @@ private:
         if (!valid) {
             return annotate(expression, invalid_value());
         }
-        auto result = value_from_type(variant_type(
-            variant.name, variant.index, expression.position));
+        auto result = value_from_type(
+            constructed_type.kind == TypeSpec::Kind::Variant
+                ? constructed_type
+                : variant_type(
+                      variant.name, variant.index,
+                      expression.position));
         result.includes_nil = false;
         return annotate(expression, std::move(result));
     }
@@ -2759,7 +3204,11 @@ private:
         assert(generic.declaration != nullptr);
         auto function = instantiate_generic_function(
             *generic.declaration, arguments);
+        const auto previous_depth =
+            current_instantiation_depth_;
+        current_instantiation_depth_ = depth;
         resolve_function_types(function);
+        current_instantiation_depth_ = previous_depth;
         function.function_index = next_function_index_++;
         function.closure_layout_index =
             function.function_index - 1;
@@ -2805,6 +3254,25 @@ private:
             if (*binding != actual) {
                 conflict = true;
                 return false;
+            }
+            return true;
+        }
+        if (pattern.generic_declaration_index.has_value()) {
+            if (!actual.generic_declaration_index.has_value() ||
+                pattern.generic_declaration_index !=
+                    actual.generic_declaration_index ||
+                pattern.generic_arguments.size() !=
+                    actual.generic_arguments.size()) {
+                return false;
+            }
+            for (std::size_t i = 0;
+                 i < pattern.generic_arguments.size(); ++i) {
+                if (!infer_type_arguments(
+                        pattern.generic_arguments[i],
+                        actual.generic_arguments[i], bindings,
+                        conflict)) {
+                    return false;
+                }
             }
             return true;
         }
@@ -3025,8 +3493,35 @@ private:
             expression.receiver->kind == Expr::Kind::Field &&
             expression.receiver->receiver != nullptr &&
             expression.receiver->receiver->kind == Expr::Kind::Variable) {
-            const auto& variant_name = expression.receiver->receiver->name;
-            if (auto* variant = find_variant(variant_name); variant != nullptr &&
+            auto& variant_base =
+                *expression.receiver->receiver;
+            const auto& variant_name = variant_base.name;
+            TypeSpec constructed_type{invalid_type()};
+            VariantSymbol* variant = nullptr;
+            if (find_generic_nominal(variant_name) != nullptr ||
+                !variant_base.explicit_type_arguments.empty()) {
+                constructed_type =
+                    named_type(variant_name, variant_base.position);
+                constructed_type.generic_arguments =
+                    variant_base.explicit_type_arguments;
+                resolve_type(constructed_type);
+                if (constructed_type.kind ==
+                        TypeSpec::Kind::Variant &&
+                    constructed_type.variant_layout_index.has_value() &&
+                    *constructed_type.variant_layout_index <
+                        variants_.size()) {
+                    variant = &variants_[
+                        *constructed_type.variant_layout_index];
+                }
+            } else {
+                variant = find_variant(variant_name);
+                if (variant != nullptr) {
+                    constructed_type = variant_type(
+                        variant_name, variant->index,
+                        variant_base.position);
+                }
+            }
+            if (variant != nullptr &&
                 variant->declaration != nullptr) {
                 const auto& case_name = expression.receiver->name;
                 const auto& cases = variant->declaration->cases;
@@ -3047,6 +3542,8 @@ private:
                 expression.variant_layout_index = variant->index;
                 expression.variant_case_index = case_index;
                 expression.kind = Expr::Kind::VariantLiteral;
+                expression.inferred_type =
+                    std::move(constructed_type);
                 return check_variant_literal(expression, state);
             }
         }
@@ -3284,6 +3781,9 @@ private:
     std::vector<TypeSymbol> types_;
     std::vector<RecordSymbol> records_;
     std::vector<VariantSymbol> variants_;
+    std::vector<GenericNominalSymbol> generic_nominals_;
+    std::deque<GenericNominalInstantiation>
+        instantiated_nominals_;
     std::vector<FunctionSymbol> functions_;
     std::vector<GenericFunctionSymbol> generic_functions_;
     std::deque<GenericInstantiation> instantiated_functions_;

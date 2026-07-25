@@ -721,7 +721,8 @@ void inference_and_instantiation_rejections_are_stable() {
         "fn plain(value: i64) -> i64 { value }\n"
         "plain<i64>(1)\n");
     require_positioned_rejection(
-        "type Box<T> = pair<T, T>;\n"
+        "type Box<T> = pair<T, Box<T>>;\n"
+        "let value: Box<i64, bool> = nil;\n"
         "0\n");
 }
 

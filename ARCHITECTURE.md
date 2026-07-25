@@ -1,5 +1,11 @@
 # Architecture — Language Runtime
 
+Iteration 42 extends the same frontend-only monomorphization boundary to generic named
+aliases, records, and variants. Demand-instantiated concrete declarations reuse the
+ordinary recursive-type and layout registration paths, so exact record and per-case
+variant bitmaps reach the unchanged module/verifier/VM/heap/collector pipeline. See
+[ADR-0019](adr/0019-generic-named-types-via-monomorphization.md).
+
 Iteration 41 adds source-level generic functions through deterministic frontend
 monomorphization. Every used concrete type tuple becomes an ordinary independently
 type-checked function before lowering, so bytecode, verifier signatures, VM frames, heap
@@ -123,7 +129,7 @@ The source language is intentionally small:
 
 Minimal cuts: there is no string interning/mutation, expression-valued blocks, capture
 mutation, recursion through a self-capture, tail call through a function value, implicit
-tail-call optimization, generic named/record/variant declaration, or block-local `let`
+tail-call optimization, higher-kinded generic declaration, or block-local `let`
 declaration.
 Bare `pair` remains an opaque pair leaf type for
 compatibility: it proves only "object" at function boundaries, so field reads through bare
@@ -155,9 +161,22 @@ diagnostic.
 After the instance graph closes, concrete lambdas are recollected in existing post-order.
 The compiler therefore receives only ordinary functions with concrete `TypeSpec`s and
 uses existing signatures, layout tables, `Call`/`TailCall`, closures, handlers, and array
-opcodes. `TypeParameter` reaching lowering is an internal assertion failure. Generic
-named aliases and generic record/variant layouts are deferred because their finite
-nominal recursion and layout identity require a separate demand-instantiation graph.
+opcodes. `TypeParameter` reaching lowering is an internal assertion failure.
+
+Generic named aliases, records, and variants are likewise stored in template-only
+source-ordered vectors. A type application resolves its concrete arguments, forms the
+same declaration-identity-plus-tuple key, and reserves an ordinary concrete table identity
+before resolving its substituted body, fields, or cases. Lookup therefore closes
+`List<i64> -> List<i64>` and equivalent recursive record/variant edges on the in-progress
+identity. Only an application that would allocate a genuinely new key consumes depth;
+growing chains such as `Grow<T> -> Grow<Grow<T>>` reach the shared depth-32 diagnostic.
+
+Completed instances are appended in deterministic depth-first first-use order. A generic
+alias then follows the ordinary named-pair coinductive rules. A record instance derives
+the ordinary exact field reference bitmap, and a variant instance derives the ordinary
+exact reference bitmap for each tagged case. Concrete record and variant keys remain
+nominally distinct. Construction, match exhaustiveness, field mutation and its barrier,
+module layout validation, and collector tracing all use the existing concrete paths.
 
 Named pair declarations are nullable recursive aliases, not new runtime layouts. A named
 type declaration must be syntactically `pair<...>` at the top level; `type X = X;` and
@@ -457,6 +476,15 @@ control remains deferred.
   boundaries. Its corpus SHA-256 is
   `8885efba70fb5788ae1486efd05453c46bf3a3e782bab73e801279b6778b350e`,
   while all nineteen legacy generators remain byte-identical.
+- Iteration 42 adds a separate pinned `generic-types` grammar. Its 32 seeds exercise
+  recursive generic aliases, scalar/object recursive records and variants, exact
+  per-instantiation and per-tag bitmaps, nested applications, generic functions, and
+  barriered record mutation. Non-empty canonical graph and output oracles agree under all
+  fifteen schedules, every concrete module is reverified, and 12 positioned mutants
+  cover unbound parameters, arity, non-closing recursion, nominal separation, payload
+  typing, and generic-variant exhaustiveness. Its corpus SHA-256 is
+  `ecabdcc1db804f0a9021b8d2a040f6b5fbbf22a9f8d7fcde348a670dc9552ca1`,
+  while all twenty legacy generators remain byte-identical.
 
 ## Performance measurement
 
@@ -870,12 +898,12 @@ remembered-set entries.
   references, infinite-unfolding misuse, and wrong return kind. TailCall additionally
   requires exact complete caller/callee return equality, an argument-only stack, a direct
   target that needs no captures, and no active same-frame try region.
-- Monomorphization safety: a generic template is absent from `Module`, every emitted
-  instance has a canonical resolved tuple and has passed ordinary concrete flow checking,
-  and equal tuples share one deterministic index. Array representation, closure capture
-  bits, pair details, and nominal layout identities are derived from each concrete clone;
-  neither verifier state nor root maps admit a type variable or conservative generic
-  slot.
+- Monomorphization safety: a generic function or type template is absent from `Module`,
+  every emitted instance has a canonical resolved tuple and has passed ordinary concrete
+  checking, and equal tuples share one deterministic identity. Array representation,
+  closure capture bits, pair details, named recursive identities, record field maps, and
+  per-case variant maps are derived from each concrete clone; neither verifier state nor
+  root maps admit a type variable or conservative generic slot.
 - GC neutrality: pair-field types and named recursive types never participate in heap
   layout. Record types contribute only validated nominal layout identity and the exact
   descriptor bitmap. Scalar arrays and RefArrays are bytecode-only reference-capable values, but
