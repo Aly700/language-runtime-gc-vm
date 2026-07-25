@@ -348,3 +348,28 @@ and exact output bytes across all fifteen schedules.
 
 The full dump SHA-256 is
 `7992ef70300c905f9f2147e7a1438d3d24a2441a91e6357d14b981b1032175de`.
+
+## Generic monomorphization corpus
+
+Iteration 41 adds an isolated 32-seed `generics` source grammar without changing any
+legacy generator. Each program mixes explicit and inferred concrete calls, canonical
+instance sharing, multiple/nested type parameters, scalar and reference arrays, generic
+closures, records, exceptions, and generic tail recursion. Compilation reverifies the
+entire concrete function set. Every seed returns a nonempty mixed graph and emits output;
+both observables must match under all fifteen schedules.
+
+Twelve positioned mutants per seed exercise missing/conflicting inference, explicit
+type/argument arity, bare-template misuse, concrete body and container restrictions, and
+four finite-to-diagnose unbounded instantiation patterns.
+
+```bash
+./build/lang_iteration41_generics_fuzz \
+  --grammar generics --seed 41 --schedule combined_mark_compact
+./build/lang_iteration41_generics_fuzz \
+  --grammar generics --seed 41 --mutant 7
+./build/lang_iteration41_generics_fuzz \
+  --dump-corpus generics
+```
+
+The full dump SHA-256 is
+`8885efba70fb5788ae1486efd05453c46bf3a3e782bab73e801279b6778b350e`.

@@ -36,6 +36,10 @@ ValueKind bytecode_kind(const TypeSpec& type) {
         return ValueKind::Weak;
     case TypeSpec::Kind::Ephemeron:
         return ValueKind::Ephemeron;
+    case TypeSpec::Kind::TypeParameter:
+        assert(false &&
+               "type parameter reached concrete bytecode lowering");
+        return ValueKind::Nil;
     case TypeSpec::Kind::Nil:
         return ValueKind::Nil;
     case TypeSpec::Kind::Invalid:

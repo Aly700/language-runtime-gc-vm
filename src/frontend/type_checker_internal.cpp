@@ -1,9 +1,11 @@
 #include "type_checker_internal.hpp"
 
 #include "diagnostics.hpp"
+#include "generics.hpp"
 
 #include <algorithm>
 #include <cassert>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <set>
@@ -236,6 +238,22 @@ struct FunctionSymbol {
     TypeSpec return_type{invalid_type()};
 };
 
+struct GenericFunctionSymbol {
+    std::string name;
+    SourcePosition position;
+    std::size_t index{0};
+    FunctionDecl* declaration{nullptr};
+};
+
+struct GenericInstantiation {
+    std::string key;
+    std::size_t generic_index{0};
+    std::vector<TypeSpec> arguments;
+    std::size_t function_index{0};
+    std::size_t depth{0};
+    FunctionDecl function;
+};
+
 struct TypeSymbol {
     std::string name;
     SourcePosition position;
@@ -266,14 +284,8 @@ public:
     TypeSpec check(Program& program) {
         collect_type_symbols(program);
         collect_function_symbols(program);
-        for (std::size_t i = 0; i < program.lambdas.size(); ++i) {
-            program.lambdas[i]->function_index =
-                1 + program.functions.size() + i;
-            program.lambdas[i]->closure_layout_index =
-                program.functions.size() + i;
-        }
         for (auto& function : program.functions) {
-            check_function(function);
+            check_function(function, 0);
         }
 
         LocalContext entry_context;
@@ -296,6 +308,21 @@ public:
         program.entry_local_count =
             static_cast<std::uint32_t>(entry_context.prototypes.size());
         local_context_ = previous_local_context;
+
+        for (auto& instantiation : instantiated_functions_) {
+            assert(instantiation.function_index ==
+                       program.functions.size() + 1 &&
+                   "generic instances must preserve assigned function order");
+            program.functions.push_back(
+                std::move(instantiation.function));
+        }
+        recollect_concrete_lambdas(program);
+        for (std::size_t i = 0; i < program.lambdas.size(); ++i) {
+            program.lambdas[i]->function_index =
+                1 + program.functions.size() + i;
+            program.lambdas[i]->closure_layout_index =
+                program.functions.size() + i;
+        }
         return result.type;
     }
 
@@ -468,13 +495,10 @@ private:
         }
 
         for (auto& function : program.functions) {
-            for (auto& parameter : function.parameters) {
-                resolve_type(parameter.type);
-            }
-            resolve_type(function.return_type);
-            for (auto& statement : function.statements) {
-                resolve_statement_types(statement);
-            }
+            resolve_function_types(function);
+        }
+        for (auto& function : program.generic_functions) {
+            resolve_function_types(function);
         }
         for (auto& statement : program.statements) {
             resolve_statement_types(statement);
@@ -483,12 +507,49 @@ private:
 
     void collect_function_symbols(Program& program) {
         for (std::size_t i = 0; i < program.functions.size(); ++i) {
-            auto& declaration = program.functions[i];
-            declaration.function_index = i + 1;
-            declaration.closure_layout_index = i;
-            if (find_function(declaration.name) != nullptr) {
+            program.functions[i].function_index = i + 1;
+            program.functions[i].closure_layout_index = i;
+        }
+        next_function_index_ = program.functions.size() + 1;
+
+        struct DeclarationRef {
+            std::size_t order{0};
+            FunctionDecl* declaration{nullptr};
+            bool generic{false};
+        };
+        std::vector<DeclarationRef> declarations;
+        declarations.reserve(program.functions.size() +
+                             program.generic_functions.size());
+        for (auto& declaration : program.functions) {
+            declarations.push_back(DeclarationRef{
+                declaration.declaration_order, &declaration, false});
+        }
+        for (auto& declaration : program.generic_functions) {
+            declarations.push_back(DeclarationRef{
+                declaration.declaration_order, &declaration, true});
+        }
+        std::stable_sort(
+            declarations.begin(), declarations.end(),
+            [](const DeclarationRef& lhs, const DeclarationRef& rhs) {
+                return lhs.order < rhs.order;
+            });
+
+        const auto name_is_defined = [&](const std::string& name) {
+            return find_function(name) != nullptr ||
+                   find_generic_function(name) != nullptr;
+        };
+        for (const auto& item : declarations) {
+            auto& declaration = *item.declaration;
+            if (name_is_defined(declaration.name)) {
                 diagnose(declaration.position,
-                         "function '" + declaration.name + "' is already defined");
+                         "function '" + declaration.name +
+                             "' is already defined");
+                continue;
+            }
+            if (item.generic) {
+                generic_functions_.push_back(GenericFunctionSymbol{
+                    declaration.name, declaration.position,
+                    generic_functions_.size(), &declaration});
                 continue;
             }
 
@@ -505,12 +566,22 @@ private:
         }
     }
 
-    void check_function(FunctionDecl& function) {
+    void check_function(FunctionDecl& function,
+                        std::size_t instantiation_depth) {
         LocalContext context;
         auto* previous_local_context = local_context_;
         const auto* previous_return_type = current_return_type_;
+        auto* previous_capture_context = capture_context_;
+        auto previous_loop_contexts = std::move(loop_contexts_);
+        const auto previous_try_depth = active_try_depth_;
+        const auto previous_instantiation_depth =
+            current_instantiation_depth_;
         local_context_ = &context;
         current_return_type_ = &function.return_type;
+        capture_context_ = nullptr;
+        loop_contexts_.clear();
+        active_try_depth_ = 0;
+        current_instantiation_depth_ = instantiation_depth;
         FlowState state = initial_state();
         for (auto& parameter : function.parameters) {
             if (find_local(state, parameter.name) != nullptr) {
@@ -534,6 +605,11 @@ private:
         }
         function.local_count =
             static_cast<std::uint32_t>(context.prototypes.size());
+        current_instantiation_depth_ =
+            previous_instantiation_depth;
+        active_try_depth_ = previous_try_depth;
+        loop_contexts_ = std::move(previous_loop_contexts);
+        capture_context_ = previous_capture_context;
         current_return_type_ = previous_return_type;
         local_context_ = previous_local_context;
     }
@@ -549,6 +625,26 @@ private:
 
     const FunctionSymbol* find_function(const std::string& name) const {
         for (const auto& function : functions_) {
+            if (function.name == name) {
+                return &function;
+            }
+        }
+        return nullptr;
+    }
+
+    GenericFunctionSymbol* find_generic_function(
+        const std::string& name) {
+        for (auto& function : generic_functions_) {
+            if (function.name == name) {
+                return &function;
+            }
+        }
+        return nullptr;
+    }
+
+    const GenericFunctionSymbol* find_generic_function(
+        const std::string& name) const {
+        for (const auto& function : generic_functions_) {
             if (function.name == name) {
                 return &function;
             }
@@ -640,7 +736,9 @@ private:
             type.value != nullptr) {
             resolve_type(*type.key);
             resolve_type(*type.value);
-            if (!is_invalid(*type.key) && !is_valid_map_key_type(*type.key)) {
+            if (!is_invalid(*type.key) &&
+                type.key->kind != TypeSpec::Kind::TypeParameter &&
+                !is_valid_map_key_type(*type.key)) {
                 diagnose(type.key->position,
                          "map key type must be i64, bool, or str");
             }
@@ -650,6 +748,8 @@ private:
             type.weak_target != nullptr) {
             resolve_type(*type.weak_target);
             if (!is_invalid(*type.weak_target) &&
+                type.weak_target->kind !=
+                    TypeSpec::Kind::TypeParameter &&
                 !is_weak_target_type(*type.weak_target)) {
                 diagnose(type.weak_target->position,
                          "weak target type must be an object type");
@@ -661,7 +761,9 @@ private:
             type.value != nullptr) {
             resolve_type(*type.key);
             resolve_type(*type.value);
-            if (!is_invalid(*type.key) && !is_weak_target_type(*type.key)) {
+            if (!is_invalid(*type.key) &&
+                type.key->kind != TypeSpec::Kind::TypeParameter &&
+                !is_weak_target_type(*type.key)) {
                 diagnose(type.key->position,
                          "ephemeron key type must be an object type");
                 type = invalid_type();
@@ -669,7 +771,8 @@ private:
             return;
         }
         if (type.kind == TypeSpec::Kind::Record ||
-            type.kind == TypeSpec::Kind::Variant) {
+            type.kind == TypeSpec::Kind::Variant ||
+            type.kind == TypeSpec::Kind::TypeParameter) {
             return;
         }
         if (type.kind != TypeSpec::Kind::Named) {
@@ -716,6 +819,26 @@ private:
         }
         for (auto& inner : statement.catch_body) {
             resolve_statement_types(inner);
+        }
+    }
+
+    void resolve_function_types(FunctionDecl& function) {
+        std::set<std::string> type_parameter_names;
+        for (const auto& parameter : function.type_parameters) {
+            if (!type_parameter_names.insert(parameter.name).second) {
+                diagnose(
+                    parameter.position,
+                    "type parameter '" + parameter.name +
+                        "' is already defined in generic function '" +
+                        function.name + "'");
+            }
+        }
+        for (auto& parameter : function.parameters) {
+            resolve_type(parameter.type);
+        }
+        resolve_type(function.return_type);
+        for (auto& statement : function.statements) {
+            resolve_statement_types(statement);
         }
     }
 
@@ -1918,6 +2041,14 @@ private:
                                               function->return_type)));
         }
 
+        if (find_generic_function(expression.name) != nullptr) {
+            diagnose(
+                expression.position,
+                "generic function '" + expression.name +
+                    "' must be called with concrete type arguments");
+            return annotate(expression, invalid_value());
+        }
+
         diagnose(expression.position, "undefined variable '" + expression.name + "'");
         return annotate(expression, invalid_value());
     }
@@ -2594,6 +2725,301 @@ private:
         return annotate(expression, field);
     }
 
+    std::optional<FunctionSymbol> request_generic_instantiation(
+        const GenericFunctionSymbol& generic,
+        const std::vector<TypeSpec>& arguments,
+        SourcePosition call_position) {
+        const auto key =
+            canonical_type_argument_tuple_key(arguments);
+        for (const auto& instantiation : instantiated_functions_) {
+            if (instantiation.generic_index == generic.index &&
+                instantiation.key == key) {
+                for (const auto& function : functions_) {
+                    if (function.index ==
+                        instantiation.function_index) {
+                        return function;
+                    }
+                }
+                throw std::logic_error(
+                    "generic instance omitted concrete function symbol");
+            }
+        }
+
+        constexpr std::size_t kMaxInstantiationDepth = 32;
+        const auto depth = current_instantiation_depth_ + 1;
+        if (depth > kMaxInstantiationDepth) {
+            diagnose(
+                call_position,
+                "generic instantiation depth limit of 32 exceeded while "
+                "instantiating '" +
+                    generic.name +
+                    "'; possible polymorphic recursion");
+            return std::nullopt;
+        }
+        assert(generic.declaration != nullptr);
+        auto function = instantiate_generic_function(
+            *generic.declaration, arguments);
+        resolve_function_types(function);
+        function.function_index = next_function_index_++;
+        function.closure_layout_index =
+            function.function_index - 1;
+
+        FunctionSymbol symbol;
+        symbol.name = function.name;
+        symbol.position = function.position;
+        symbol.index = function.function_index;
+        symbol.closure_layout_index =
+            function.closure_layout_index;
+        symbol.return_type = function.return_type;
+        symbol.parameters.reserve(function.parameters.size());
+        for (const auto& parameter : function.parameters) {
+            symbol.parameters.push_back(parameter.type);
+        }
+
+        instantiated_functions_.push_back(GenericInstantiation{
+            key, generic.index, arguments, function.function_index,
+            depth, std::move(function)});
+        functions_.push_back(symbol);
+        check_function(instantiated_functions_.back().function, depth);
+        return symbol;
+    }
+
+    bool infer_type_arguments(
+        const TypeSpec& pattern, const TypeSpec& actual,
+        std::vector<std::optional<TypeSpec>>& bindings,
+        bool& conflict) const {
+        if (pattern.kind == TypeSpec::Kind::TypeParameter) {
+            if (!pattern.type_parameter_index.has_value() ||
+                *pattern.type_parameter_index >= bindings.size() ||
+                actual.kind == TypeSpec::Kind::Nil ||
+                is_invalid(actual) ||
+                contains_type_parameter(actual)) {
+                return false;
+            }
+            auto& binding =
+                bindings[*pattern.type_parameter_index];
+            if (!binding.has_value()) {
+                binding = actual;
+                return true;
+            }
+            if (*binding != actual) {
+                conflict = true;
+                return false;
+            }
+            return true;
+        }
+        if (pattern.kind != actual.kind) {
+            return false;
+        }
+        switch (pattern.kind) {
+        case TypeSpec::Kind::Pair:
+            if (!pattern.has_pair_fields()) {
+                return true;
+            }
+            return actual.has_pair_fields() &&
+                   infer_type_arguments(
+                       *pattern.left, *actual.left, bindings,
+                       conflict) &&
+                   infer_type_arguments(
+                       *pattern.right, *actual.right, bindings,
+                       conflict);
+        case TypeSpec::Kind::Array:
+            return pattern.element != nullptr &&
+                   actual.element != nullptr &&
+                   infer_type_arguments(
+                       *pattern.element, *actual.element, bindings,
+                       conflict);
+        case TypeSpec::Kind::Function:
+            if (pattern.function_return == nullptr ||
+                actual.function_return == nullptr ||
+                pattern.function_parameters.size() !=
+                    actual.function_parameters.size()) {
+                return false;
+            }
+            for (std::size_t i = 0;
+                 i < pattern.function_parameters.size(); ++i) {
+                if (!infer_type_arguments(
+                        pattern.function_parameters[i],
+                        actual.function_parameters[i], bindings,
+                        conflict)) {
+                    return false;
+                }
+            }
+            return infer_type_arguments(
+                *pattern.function_return, *actual.function_return,
+                bindings, conflict);
+        case TypeSpec::Kind::Map:
+        case TypeSpec::Kind::Ephemeron:
+            return pattern.key != nullptr &&
+                   pattern.value != nullptr &&
+                   actual.key != nullptr &&
+                   actual.value != nullptr &&
+                   infer_type_arguments(
+                       *pattern.key, *actual.key, bindings,
+                       conflict) &&
+                   infer_type_arguments(
+                       *pattern.value, *actual.value, bindings,
+                       conflict);
+        case TypeSpec::Kind::Weak:
+            return pattern.weak_target != nullptr &&
+                   actual.weak_target != nullptr &&
+                   infer_type_arguments(
+                       *pattern.weak_target,
+                       *actual.weak_target, bindings, conflict);
+        case TypeSpec::Kind::Int64:
+        case TypeSpec::Kind::Bool:
+        case TypeSpec::Kind::Str:
+        case TypeSpec::Kind::Named:
+        case TypeSpec::Kind::Record:
+        case TypeSpec::Kind::Variant:
+            return pattern == actual;
+        case TypeSpec::Kind::TypeParameter:
+            break;
+        case TypeSpec::Kind::Nil:
+        case TypeSpec::Kind::Invalid:
+            return false;
+        }
+        return false;
+    }
+
+    std::optional<std::vector<TypeSpec>> infer_generic_arguments(
+        const Expr& expression,
+        const GenericFunctionSymbol& generic,
+        const std::vector<TypedValue>& arguments) {
+        assert(generic.declaration != nullptr);
+        if (arguments.size() !=
+            generic.declaration->parameters.size()) {
+            diagnose(
+                expression.position,
+                "generic function '" + generic.name + "' expects " +
+                    std::to_string(
+                        generic.declaration->parameters.size()) +
+                    " argument(s) but got " +
+                    std::to_string(arguments.size()));
+            return std::nullopt;
+        }
+        std::vector<std::optional<TypeSpec>> bindings(
+            generic.declaration->type_parameters.size());
+        bool conflict = false;
+        bool matched = true;
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            matched =
+                infer_type_arguments(
+                    generic.declaration->parameters[i].type,
+                    arguments[i].type, bindings, conflict) &&
+                matched;
+        }
+        for (std::size_t i = 0; i < bindings.size(); ++i) {
+            if (!bindings[i].has_value()) {
+                diagnose(
+                    expression.position,
+                    "cannot infer type argument '" +
+                        generic.declaration->type_parameters[i].name +
+                        "' for generic function '" + generic.name +
+                        "'; use explicit type arguments");
+                return std::nullopt;
+            }
+        }
+        if (!matched || conflict) {
+            diagnose(
+                expression.position,
+                "cannot infer unambiguous type arguments for generic "
+                "function '" +
+                    generic.name +
+                    "'; use explicit type arguments");
+            return std::nullopt;
+        }
+        std::vector<TypeSpec> result;
+        result.reserve(bindings.size());
+        for (auto& binding : bindings) {
+            result.push_back(std::move(*binding));
+        }
+        return result;
+    }
+
+    TypedValue check_generic_call(
+        Expr& expression, const GenericFunctionSymbol& generic,
+        const std::vector<TypedValue>& arguments, FlowState& state) {
+        assert(generic.declaration != nullptr);
+        std::vector<TypeSpec> concrete_arguments;
+        if (expression.explicit_type_arguments.empty()) {
+            auto inferred = infer_generic_arguments(
+                expression, generic, arguments);
+            if (!inferred.has_value()) {
+                return annotate(expression, invalid_value());
+            }
+            concrete_arguments = std::move(*inferred);
+        } else {
+            for (auto& type : expression.explicit_type_arguments) {
+                resolve_type(type);
+            }
+            if (expression.explicit_type_arguments.size() !=
+                generic.declaration->type_parameters.size()) {
+                diagnose(
+                    expression.type_arguments_position,
+                    "generic function '" + generic.name +
+                        "' expects " +
+                        std::to_string(
+                            generic.declaration->type_parameters.size()) +
+                        " type argument(s) but got " +
+                        std::to_string(
+                            expression.explicit_type_arguments.size()));
+                return annotate(expression, invalid_value());
+            }
+            for (const auto& type :
+                 expression.explicit_type_arguments) {
+                if (is_invalid(type) ||
+                    contains_type_parameter(type)) {
+                    return annotate(expression, invalid_value());
+                }
+            }
+            concrete_arguments =
+                expression.explicit_type_arguments;
+        }
+
+        const auto instantiated = request_generic_instantiation(
+            generic, concrete_arguments, expression.position);
+        if (!instantiated.has_value()) {
+            return annotate(expression, invalid_value());
+        }
+        if (arguments.size() != instantiated->parameters.size()) {
+            diagnose(
+                expression.position,
+                "generic function '" + generic.name + "' expects " +
+                    std::to_string(instantiated->parameters.size()) +
+                    " argument(s) but got " +
+                    std::to_string(arguments.size()));
+            return annotate(expression, invalid_value());
+        }
+
+        bool valid = true;
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            if (is_invalid(arguments[i].type)) {
+                valid = false;
+                continue;
+            }
+            if (!value_conforms_to_type(
+                    arguments[i], instantiated->parameters[i], state)) {
+                diagnose(
+                    expression.arguments[i]->position,
+                    "argument " + std::to_string(i + 1) +
+                        " of generic function '" + generic.name +
+                        "' expects " +
+                        type_name(instantiated->parameters[i]) +
+                        " but got " + type_name(arguments[i].type));
+                valid = false;
+            }
+        }
+        if (!valid) {
+            return annotate(expression, invalid_value());
+        }
+        expression.direct_call = true;
+        expression.callee_index = instantiated->index;
+        return annotate(
+            expression,
+            value_from_type(instantiated->return_type));
+    }
+
     TypedValue check_call(Expr& expression, FlowState& state) {
         if (expression.receiver != nullptr &&
             expression.receiver->kind == Expr::Kind::Field &&
@@ -2631,6 +3057,14 @@ private:
         }
 
         assert(expression.receiver != nullptr && "call expression must retain callee");
+        if (expression.receiver->kind == Expr::Kind::Variable) {
+            if (const auto* generic =
+                    find_generic_function(expression.receiver->name);
+                generic != nullptr) {
+                return check_generic_call(
+                    expression, *generic, arguments, state);
+            }
+        }
         const auto callee = check_expr(*expression.receiver, state);
         if (is_invalid(callee.type)) {
             return annotate(expression, invalid_value());
@@ -2851,6 +3285,10 @@ private:
     std::vector<RecordSymbol> records_;
     std::vector<VariantSymbol> variants_;
     std::vector<FunctionSymbol> functions_;
+    std::vector<GenericFunctionSymbol> generic_functions_;
+    std::deque<GenericInstantiation> instantiated_functions_;
+    std::size_t next_function_index_{1};
+    std::size_t current_instantiation_depth_{0};
     CaptureContext* capture_context_{nullptr};
     LocalContext* local_context_{nullptr};
     const TypeSpec* current_return_type_{nullptr};

@@ -96,6 +96,16 @@ TypeSpec ephemeron_type(TypeSpec key, TypeSpec value) {
     return type;
 }
 
+TypeSpec type_parameter_type(std::string name, std::size_t index,
+                             SourcePosition position) {
+    TypeSpec type;
+    type.kind = TypeSpec::Kind::TypeParameter;
+    type.name = std::move(name);
+    type.position = position;
+    type.type_parameter_index = index;
+    return type;
+}
+
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
     if (lhs.kind != rhs.kind) {
         return false;
@@ -105,6 +115,10 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
             return lhs.named_type_index == rhs.named_type_index;
         }
         return lhs.name == rhs.name;
+    }
+    if (lhs.kind == TypeSpec::Kind::TypeParameter) {
+        return lhs.type_parameter_index == rhs.type_parameter_index &&
+               lhs.name == rhs.name;
     }
     if (lhs.kind == TypeSpec::Kind::Record) {
         if (lhs.record_layout_index.has_value() &&
@@ -198,6 +212,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Weak;
     case TypeSpec::Kind::Ephemeron:
         return Type::Ephemeron;
+    case TypeSpec::Kind::TypeParameter:
+        return Type::Invalid;
     case TypeSpec::Kind::Named:
         return Type::Pair;
     case TypeSpec::Kind::Record:
@@ -259,6 +275,8 @@ std::string type_name(const TypeSpec& type) {
                    ? "ephemeron<invalid, invalid>"
                    : "ephemeron<" + type_name(*type.key) + ", " +
                          type_name(*type.value) + ">";
+    case TypeSpec::Kind::TypeParameter:
+        return type.name;
     case TypeSpec::Kind::Named:
         return type.name;
     case TypeSpec::Kind::Record:
@@ -307,7 +325,22 @@ namespace {
 
 class Parser {
 public:
-    explicit Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {}
+    explicit Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)) {
+        std::size_t brace_depth = 0;
+        for (std::size_t i = 0; i + 2 < tokens_.size(); ++i) {
+            if (brace_depth == 0 && tokens_[i].kind == TokenKind::Fn &&
+                tokens_[i + 1].kind == TokenKind::Identifier &&
+                tokens_[i + 2].kind == TokenKind::Less) {
+                generic_function_names_.insert(tokens_[i + 1].text);
+            }
+            if (tokens_[i].kind == TokenKind::LBrace) {
+                ++brace_depth;
+            } else if (tokens_[i].kind == TokenKind::RBrace &&
+                       brace_depth != 0) {
+                --brace_depth;
+            }
+        }
+    }
 
     std::optional<Program> parse() {
         Program program;
@@ -338,7 +371,12 @@ public:
             } else if (match(TokenKind::Fn)) {
                 auto declaration = parse_function(previous());
                 if (declaration.has_value()) {
-                    program.functions.push_back(std::move(*declaration));
+                    if (declaration->type_parameters.empty()) {
+                        program.functions.push_back(std::move(*declaration));
+                    } else {
+                        program.generic_functions.push_back(
+                            std::move(*declaration));
+                    }
                 } else {
                     synchronize();
                 }
@@ -522,11 +560,34 @@ private:
     std::optional<FunctionDecl> parse_function(const Token& fn_token) {
         FunctionDecl declaration;
         declaration.position = fn_token.position;
+        declaration.declaration_order = next_function_declaration_order_++;
 
         const auto name = expect(TokenKind::Identifier, "expected function name after 'fn'");
         if (name.has_value()) {
             declaration.name = name->text;
         }
+        if (match(TokenKind::Less)) {
+            if (check(TokenKind::Greater)) {
+                add_diagnostic(diagnostics_, peek().position,
+                               "generic function requires at least one type parameter");
+            } else {
+                do {
+                    const auto parameter = expect(
+                        TokenKind::Identifier,
+                        "expected type parameter name");
+                    if (parameter.has_value()) {
+                        declaration.type_parameters.push_back(TypeParameterDecl{
+                            parameter->text, parameter->position,
+                            declaration.type_parameters.size()});
+                    }
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::Greater,
+                   "expected '>' after type parameters");
+        }
+
+        const auto previous_type_parameters = active_type_parameters_;
+        active_type_parameters_ = declaration.type_parameters;
         expect(TokenKind::LParen, "expected '(' after function name");
         if (!check(TokenKind::RParen)) {
             do {
@@ -567,6 +628,7 @@ private:
                            "function body must end with an expression");
         }
         expect(TokenKind::RBrace, "expected '}' after function body");
+        active_type_parameters_ = previous_type_parameters;
         return declaration;
     }
 
@@ -809,6 +871,13 @@ private:
             return type;
         }
         if (match(TokenKind::Identifier)) {
+            for (const auto& parameter : active_type_parameters_) {
+                if (parameter.name == previous().text) {
+                    return type_parameter_type(
+                        parameter.name, parameter.index,
+                        previous().position);
+                }
+            }
             return named_type(previous().text, previous().position);
         }
         add_diagnostic(diagnostics_, peek().position,
@@ -1085,7 +1154,36 @@ private:
         auto expression = parse_primary();
         bool keep_parsing = true;
         while (keep_parsing) {
-            if (match(TokenKind::Dot)) {
+            if (expression->kind == Expr::Kind::Variable &&
+                generic_function_names_.contains(expression->name) &&
+                match(TokenKind::Less)) {
+                auto node = std::make_unique<Expr>();
+                node->kind = Expr::Kind::Call;
+                node->position = expression->position;
+                node->type_arguments_position = previous().position;
+                node->receiver = std::move(expression);
+                if (check(TokenKind::Greater)) {
+                    add_diagnostic(
+                        diagnostics_, peek().position,
+                        "generic call requires at least one type argument");
+                } else {
+                    do {
+                        node->explicit_type_arguments.push_back(parse_type());
+                    } while (match(TokenKind::Comma));
+                }
+                expect(TokenKind::Greater,
+                       "expected '>' after explicit type arguments");
+                expect(TokenKind::LParen,
+                       "expected '(' after explicit type arguments");
+                if (!check(TokenKind::RParen)) {
+                    do {
+                        node->arguments.push_back(parse_expression());
+                    } while (match(TokenKind::Comma));
+                }
+                expect(TokenKind::RParen,
+                       "expected ')' after call arguments");
+                expression = std::move(node);
+            } else if (match(TokenKind::Dot)) {
                 if (match(TokenKind::Left) || match(TokenKind::Right)) {
                     auto node = std::make_unique<Expr>();
                     node->kind = Expr::Kind::Field;
@@ -1427,7 +1525,10 @@ private:
     std::vector<Token> tokens_;
     std::size_t current_{0};
     std::size_t next_pair_site_{0};
+    std::size_t next_function_declaration_order_{0};
     std::set<std::string> record_names_;
+    std::set<std::string> generic_function_names_;
+    std::vector<TypeParameterDecl> active_type_parameters_;
     std::vector<std::shared_ptr<LambdaExpr>> lambdas_;
     bool allow_record_literal_{true};
     std::vector<Diagnostic> diagnostics_;
