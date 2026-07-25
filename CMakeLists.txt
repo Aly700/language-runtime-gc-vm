@@ -171,6 +171,16 @@ add_executable(lang_iteration43_large_object_space
 target_link_libraries(
     lang_iteration43_large_object_space PRIVATE lang_runtime)
 
+add_executable(lang_iteration44_string_interning
+    tests/iteration44_string_interning.cpp)
+target_link_libraries(
+    lang_iteration44_string_interning PRIVATE lang_runtime)
+
+add_executable(lang_iteration44_string_interning_fuzz
+    tests/iteration44_string_interning_fuzz.cpp)
+target_link_libraries(
+    lang_iteration44_string_interning_fuzz PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -235,5 +245,9 @@ add_test(NAME lang_iteration42_generic_types_fuzz
     COMMAND lang_iteration42_generic_types_fuzz)
 add_test(NAME lang_iteration43_large_object_space
     COMMAND lang_iteration43_large_object_space)
+add_test(NAME lang_iteration44_string_interning
+    COMMAND lang_iteration44_string_interning)
+add_test(NAME lang_iteration44_string_interning_fuzz
+    COMMAND lang_iteration44_string_interning_fuzz)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

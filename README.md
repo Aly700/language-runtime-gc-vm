@@ -7,6 +7,10 @@ tail-call frame reuse, records, sum types and match, exceptions, ephemerons, det
 incremental marking, and deterministic incremental compaction all retain the same precise
 moving-collector contract.
 
+Iteration 44 adds explicit `intern(str) -> str`. A collector-owned weak table returns one
+canonical immutable string while that object is live, forwards it across every movement
+path, and evicts it without extending liveness.
+
 This repository is a correctness-first implementation of a small statically typed
 language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
 checker, bytecode compiler, verifier, and stack VM. The runtime uses a precise moving,
@@ -138,6 +142,21 @@ adds no reference edge, and cannot change the ADR-0007 mutation-during-iteration
 Every mutation and collection validates exact index/vector coherence. See
 [ADR 0017](adr/0017-deterministic-content-hashed-map-index.md).
 
+### Explicit weak string interning
+
+`intern(s)` is verifier-checked as `str -> str` and keeps its operand as a precise root
+across a possible canonical-copy allocation. Lookup uses the same fixed string-domain
+FNV-1a content encoding as maps plus structural byte comparison; no identity or address
+bits participate. The slot-ordered table is in the existing weak-edge category, so it is
+ignored by marking, forwarded after liveness, and evicted when its canonical is dead.
+
+This weak policy is schedule-transparent. If another live reference reaches the
+canonical, every schedule preserves and returns it. If none does, a schedule may return
+the still-physical weak-only object or allocate a fresh equal object after collection;
+immutability and the absence of another live incoming edge make those graphs
+structurally indistinguishable. See
+[ADR 0020](adr/0020-weak-string-interning.md).
+
 ### Weak phase
 
 Weak targets are the sole non-descriptor edge category. An exact slot-ordered registry
@@ -214,14 +233,16 @@ The language includes:
 - local, pair-field, record-field, array-element, and map-entry assignment;
 - `if`/`else`, `while`, array/map/range `for-in`, and nearest-loop `break`/`continue`;
 - string concat, equality, byte indexing, byte length, copying `sub`, unsigned byte-wise
-  ordering, and explicit `to_str`/`to_i64` conversions;
+  ordering, explicit `to_str`/`to_i64` conversions, and explicit weak `intern(str)`
+  canonicalization;
 - deterministic bounded `print(str)` output captured by the VM rather than written to a
   host stream.
 
-Nine executable programs live in [examples](examples): a named recursive linked list,
+Ten executable programs live in [examples](examples): a named recursive linked list,
 a capture-snapshot accumulator factory, insertion-order word frequencies, a higher-order
 array pipeline, string/conversion tools, a recursive record showcase, and a recursive
-variant showcase, a generic-function showcase, and a recursive generic-type showcase.
+variant showcase, a generic-function showcase, a recursive generic-type showcase, and
+explicit weak string interning.
 Each `.lang` file has a byte-pinned `.expected` output. `lang_examples` compiles every
 file and runs it under both no stress and maximum combined
 major/minor/allocation/barrier stress.
@@ -239,7 +260,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The acceptance gate contains 46 CTest targets.
+The acceptance gate contains 49 CTest targets.
 
 Run only the executable documentation:
 
@@ -252,8 +273,8 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 21 isolated deterministic positive corpora. The new `generic-types` stream
-is isolated, and all 20 legacy source/bytecode streams remain byte-identical. Shared
+The suite has 22 isolated deterministic positive corpora. The new `interning` stream is
+isolated, and all 21 legacy source/bytecode streams remain byte-identical. Shared
 source grammars run under the same 15 schedules:
 
 - `no_stress`
@@ -273,7 +294,7 @@ liveness expectations because clearing is intentionally observable. Generated so
 bytecode are constructive and deterministic; each grammar has its own corpus dump and an
 embedded pinned representative snapshot.
 
-Negative testing applies 85 positioned mutation forms across fixed seed sets, for 1,846
+Negative testing applies 89 positioned mutation forms across fixed seed sets, for 1,974
 frontend rejection checks. The operators cover type errors, undefined values, arity and
 return mismatches, missing nil refinement, invalid container operations, closure misuse,
 map key/value errors, weak-target errors, loop-control errors, conversion errors, and
@@ -300,6 +321,7 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration39_tail_calls_fuzz
 ./build/lang_iteration41_generics_fuzz
 ./build/lang_iteration42_generic_types_fuzz
+./build/lang_iteration44_string_interning_fuzz
 ```
 
 ### Replay by grammar
@@ -329,6 +351,7 @@ Use one of the schedule names above.
 | source `tailcalls` | 32 | `./build/lang_iteration39_tail_calls_fuzz --grammar tailcalls --seed N --schedule NAME` | `./build/lang_iteration39_tail_calls_fuzz --grammar tailcalls --seed N --mutant 0..3` |
 | source `generics` | 32 | `./build/lang_iteration41_generics_fuzz --grammar generics --seed N --schedule NAME` | `./build/lang_iteration41_generics_fuzz --grammar generics --seed N --mutant 0..11` |
 | source `generic-types` | 32 | `./build/lang_iteration42_generic_types_fuzz --grammar generic-types --seed N --schedule NAME` | `./build/lang_iteration42_generic_types_fuzz --grammar generic-types --seed N --mutant 0..11` |
+| source `interning` | 32 | `./build/lang_iteration44_string_interning_fuzz --grammar interning --seed N --schedule NAME` | `./build/lang_iteration44_string_interning_fuzz --grammar interning --seed N --mutant 0..3` |
 
 For example:
 
@@ -361,12 +384,19 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration39_tail_calls_fuzz --dump-corpus tailcalls
 ./build/lang_iteration41_generics_fuzz --dump-corpus generics
 ./build/lang_iteration42_generic_types_fuzz --dump-corpus generic-types
+./build/lang_iteration44_string_interning_fuzz --dump-corpus interning
 ```
 
 The isolated `tailcalls` dump is pinned at SHA-256
 `72e0af127c314f7bfa4ceb3961170b452fc490e5ea9f31fcfb6643cddebeaf61`.
 It compares non-empty canonical graph and output oracles across all 15 schedules; four
 mutants prove the tail-position, direct-target, and return-signature gates are active.
+
+The isolated `interning` representative source, representative graph/output outcome, and
+full corpus dump are pinned with 64-bit FNV-1a values
+`17523492481946191324`, `385766377391366824`, and
+`2340986442596112348`. Its 32 seeds compare both non-empty oracles across all 15
+schedules, and four mutants prove the exact builtin type gate.
 
 The isolated `generics` dump is pinned at SHA-256
 `8885efba70fb5788ae1486efd05453c46bf3a3e782bab73e801279b6778b350e`.
@@ -419,8 +449,9 @@ Timings remain informational; the exact counters, host context, and corpus proof
 
 ## Limitations and deferred work
 
-- Strings are immutable byte sequences, not Unicode text. There is no mutation,
-  interning, interpolation, rope, or substring-view representation; `sub` copies.
+- Strings are immutable byte sequences, not Unicode text. Interning is explicit and weak;
+  there is no mutation, implicit literal interning, interpolation, rope, cached hash, or
+  substring-view representation; `sub` copies.
 - Maps have deterministic expected-O(1) content-hashed lookup and insertion-order
   iteration, but no deletion. Tombstones, shrink policy, and structural hash caching are
   deferred.
@@ -431,8 +462,9 @@ Timings remain informational; the exact counters, host context, and corpus proof
 - Generic functions are monomorphized and direct-call-only as templates. Generic named
   types are likewise first-order, invariant templates: there are no higher-kinded
   parameters, generic values, runtime type arguments, or first-class generic functions.
-- Weak-keyed maps, finalizers, resurrection, mutable weak targets, and user-visible
-  finalization ordering are not implemented.
+- Weak-keyed maps, finalizers, callback-driven general object resurrection, mutable weak
+  targets, and user-visible finalization ordering are not implemented. ADR-0020's narrow
+  reuse of a still-physical immutable weak-only string is the sole resurrection case.
 - Loop control is unlabeled. Labeled loops and labeled `break`/`continue` require a label
   namespace and explicit target-resolution rules.
 - Blocks are statements rather than expressions, and `let` declarations are limited to a

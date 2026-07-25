@@ -214,6 +214,7 @@ public:
     ObjectId allocate_string_concat(Value left, Value right);
     ObjectId allocate_string_substring(Value source, std::size_t lo,
                                        std::size_t hi);
+    ObjectId intern_string(Value source);
     ObjectId allocate_closure(std::size_t layout_index,
                               std::size_t function_index,
                               std::vector<Value> captures,
@@ -335,6 +336,14 @@ public:
     [[nodiscard]] std::vector<std::size_t>
     TEST_ONLY_map_lookup_index(ObjectId id) const;
     void TEST_ONLY_corrupt_map_lookup_index(ObjectId id);
+    [[nodiscard]] std::size_t TEST_ONLY_intern_table_size() const {
+        return intern_table_.size();
+    }
+    [[nodiscard]] ObjectId
+    TEST_ONLY_intern_table_target(std::size_t index) const;
+    void TEST_ONLY_skip_next_intern_table_weak_processing() {
+        TEST_ONLY_skip_next_intern_table_weak_processing_ = true;
+    }
     void TEST_ONLY_validate_incremental_marking() const;
 
 private:
@@ -362,6 +371,14 @@ private:
         std::size_t width{0};
         ObjectId destination_id{0};
         std::size_t destination_slot{0};
+    };
+
+    struct InternEntry {
+        std::uint64_t content_hash{0};
+        ObjectId canonical{0};
+
+        friend bool operator==(const InternEntry&,
+                               const InternEntry&) = default;
     };
 
     ObjectId allocate_object(Object object);
@@ -468,6 +485,9 @@ private:
     [[nodiscard]] std::vector<ObjectId> process_ephemerons(
         const ForwardingTable& forwarding,
         std::vector<std::optional<Object>>& moved_objects) const;
+    [[nodiscard]] std::vector<InternEntry> process_intern_table(
+        const ForwardingTable& forwarding,
+        bool collection_weak_processing);
     [[nodiscard]] std::vector<ObjectId> rewrite_remembered_set(
         const ForwardingTable& forwarding) const;
     void prune_remembered_set();
@@ -477,6 +497,7 @@ private:
         RootProvider* roots, std::span<Value*> extra_roots) const;
     void validate_remembered_set() const;
     void validate_weak_targets() const;
+    void validate_intern_table() const;
     void validate_ephemerons() const;
     void validate_value(Value value) const;
 
@@ -487,6 +508,7 @@ private:
     std::vector<std::uint32_t> generations_;
     std::vector<ObjectId> remembered_set_;
     std::vector<ObjectId> weak_refs_;
+    std::vector<InternEntry> intern_table_;
     std::vector<ObjectId> ephemerons_;
     std::vector<Value*> handle_roots_;
     // Performance metrics are passive observations, including logically-const
@@ -504,9 +526,11 @@ private:
     std::vector<std::optional<Object>> incremental_compaction_shadow_objects_;
     std::vector<std::uint32_t> incremental_compaction_shadow_generations_;
     std::vector<ObjectId> incremental_compaction_shadow_weak_refs_;
+    std::vector<InternEntry> incremental_compaction_shadow_intern_table_;
     std::vector<ObjectId> incremental_compaction_shadow_ephemerons_;
     bool TEST_ONLY_corrupt_next_incremental_compaction_copy_{false};
     bool TEST_ONLY_skip_next_incremental_write_barrier_{false};
+    bool TEST_ONLY_skip_next_intern_table_weak_processing_{false};
     mutable std::uint64_t TEST_ONLY_validation_count_{0};
 };
 

@@ -415,6 +415,18 @@ Value VM::execute_verified(const Module& module,
             ++frame.pc;
             break;
         }
+        case OpCode::StrIntern: {
+            assert(!frame.stack.empty() &&
+                   "verifier invariant violated: StrIntern requires an operand");
+            const auto source = frame.stack.back();
+            assert(source.is_object() &&
+                   "verifier invariant violated: StrIntern operand must be object");
+            const auto result = heap_.intern_string(source);
+            (void)pop(frame);
+            push(frame, Value::object(result));
+            ++frame.pc;
+            break;
+        }
         case OpCode::StrSub: {
             assert(frame.stack.size() >= 3 &&
                    "verifier invariant violated: StrSub requires three operands");

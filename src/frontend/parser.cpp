@@ -1498,6 +1498,15 @@ private:
             expect(TokenKind::RParen, "expected ')' after ephemeron value");
             return node;
         }
+        if (match(TokenKind::Intern)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::Intern;
+            node->position = previous().position;
+            expect(TokenKind::LParen, "expected '(' after 'intern'");
+            node->receiver = parse_expression();
+            expect(TokenKind::RParen, "expected ')' after intern operand");
+            return node;
+        }
         if (match(TokenKind::ToStr) || match(TokenKind::ToI64)) {
             const auto token = previous();
             auto node = std::make_unique<Expr>();

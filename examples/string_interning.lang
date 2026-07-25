@@ -1,0 +1,17 @@
+record Label { text: str }
+
+fn retain(value: str) -> fn() -> str {
+  fn() -> str { value }
+}
+
+let literal: str = intern("canonical");
+let concatenated: str = intern("cano" + "nical");
+let table: map<str, str> = map<str, str>();
+table[literal] = "map-value";
+let label: Label = Label { text: concatenated };
+let render: fn() -> str = retain(intern("canonical"));
+print(table[label.text]);
+print(label.text);
+print(render());
+print(to_str(label.text == render()));
+pair(label.text, render())

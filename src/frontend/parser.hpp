@@ -127,6 +127,7 @@ struct Expr {
         EphemeronValue,
         ToStr,
         ToI64,
+        Intern,
     };
 
     Kind kind{Kind::IntLiteral};

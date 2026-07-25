@@ -41,6 +41,7 @@ enum class TokenKind {
     Print,
     ToStr,
     ToI64,
+    Intern,
     I64,
     Bool,
     Str,

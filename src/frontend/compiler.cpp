@@ -393,6 +393,7 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::EphemeronValue:
     case Expr::Kind::ToStr:
     case Expr::Kind::ToI64:
+    case Expr::Kind::Intern:
         add_expr_array_counts(*expression.receiver, counts);
         return;
     case Expr::Kind::EphemeronConstruct:
@@ -1127,6 +1128,10 @@ private:
         case Expr::Kind::ToI64:
             compile_expr(*expression.receiver);
             emit(OpCode::StrToI64, 0);
+            break;
+        case Expr::Kind::Intern:
+            compile_expr(*expression.receiver);
+            emit(OpCode::StrIntern, 0);
             break;
         }
     }
