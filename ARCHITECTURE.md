@@ -1,5 +1,12 @@
 # Architecture — Language Runtime
 
+Iteration 44 adds explicit `intern(str) -> str` through append-only `StrIntern` and a
+collector-owned weak intern table. Equal bytes share one canonical object while that
+canonical is live, but table entries never extend liveness. Content-derived FNV lookup,
+slot-ordered weak processing, complete movement forwarding, and a finish-before-lookup
+incremental-compaction rule make the surface schedule-transparent to both runtime
+oracles. See [ADR-0020](adr/0020-weak-string-interning.md).
+
 Iteration 42 extends the same frontend-only monomorphization boundary to generic named
 aliases, records, and variants. Demand-instantiated concrete declarations reuse the
 ordinary recursive-type and layout registration paths, so exact record and per-case
@@ -97,7 +104,8 @@ The source language is intentionally small:
   loop. Arrays use `for value in array`, maps use
   `for key, value in map`, and half-open integer ranges use `for i in lo..hi`.
 - `print(e);` is a statement for `str` expressions. `to_str(x)` converts an `i64` or
-  `bool` to canonical text, and `to_i64(s)` parses a canonical decimal `str` or traps.
+  `bool` to canonical text, `to_i64(s)` parses a canonical decimal `str` or traps, and
+  `intern(s)` returns the weakly held canonical object for equal immutable bytes.
 - Function declarations use `fn name(a: i64, b: pair<i64, pair>) -> pair<i64, bool> { ... }`.
   Function bodies have the same shape as the top level: statements followed by a final
   expression.
@@ -127,10 +135,10 @@ The source language is intentionally small:
   `.set_value(value)` lowers to the single barriered store opcode.
 - A program ends with a final expression, which becomes the VM result.
 
-Minimal cuts: there is no string interning/mutation, expression-valued blocks, capture
-mutation, recursion through a self-capture, tail call through a function value, implicit
-tail-call optimization, higher-kinded generic declaration, or block-local `let`
-declaration.
+Minimal cuts: there is no implicit string interning or string mutation,
+expression-valued blocks, capture mutation, recursion through a self-capture, tail call
+through a function value, implicit tail-call optimization, higher-kinded generic
+declaration, or block-local `let` declaration.
 Bare `pair` remains an opaque pair leaf type for
 compatibility: it proves only "object" at function boundaries, so field reads through bare
 pair parameters/returns are rejected as unknown. Inside a function, the type checker still
@@ -225,6 +233,14 @@ returns the unsigned byte widened to `i64`. `s.sub(lo, hi)` copies the half-open
 trap with `string substring bounds out of range`, while `lo == hi` returns a fresh empty
 string. String indexing traps deterministically when out of bounds; indexed assignment is
 rejected because no string payload-store operation exists.
+
+`intern(s)` is explicit and accepts only a proven non-nil `str`. A table hit returns the
+existing canonical object; a miss allocates a fresh byte-for-byte canonical copy while
+the operand remains a precise root. The table is weak: collection evicts a canonical
+that has no independent strong path. An uncleared weak-only canonical may be returned
+between collections and thereby become ordinarily reachable again. Because strings are
+immutable and structurally compared, no other live edge exists in that case to expose
+whether the returned node was physically reused or freshly allocated.
 
 String ordering is unsigned byte-wise lexicographic order with shorter-prefix-is-less.
 The VM exposes only `StrLt`; the compiler lowers `a < b` directly, `a > b` as `b < a`,
@@ -345,6 +361,10 @@ control remains deferred.
   before-allocation collection. Every result is a new opaque byte object, including empty
   and full-range slices. `StrLt` performs no allocation and compares `uint8_t` payloads so
   bytes such as `0x00` and `0xff` are ordered independently of host signed `char`.
+- `StrIntern` is append-only and verified as `str -> str`. Its pre-instruction stack map
+  marks the operand as the sole precise root, and the VM leaves that slot on the frame
+  until `Heap::intern_string` completes its possible canonical-copy allocation. A hit
+  during incremental marking publishes the weak target onto the ordinary grey worklist.
 - `lang::gc::Heap` implements deterministic major and minor mark-compact collection over
   generation-tagged object IDs. The low bits identify the storage slot and the high bits
   identify that slot's current generation, so a swept or moved ID cannot alias a later
@@ -378,6 +398,11 @@ control remains deferred.
 - `WeakRef` is fixed-width storage with one private collector-owned target. Its descriptor
   scans zero strong fields. Construction accepts one non-nil object, and the heap exposes
   only a const read; post-construction writes are confined to weak processing.
+- The heap-owned intern table stores `(content_hash, canonical ObjectId)` entries in
+  strict canonical base-slot order. It uses Iteration 40's string-domain 64-bit FNV-1a
+  hash followed by byte-for-byte comparison; IDs, slots, generations, addresses, and
+  host-library hashes never influence lookup. Entries are weak-category metadata, not
+  roots, descriptor fields, remembered-set edges, or ephemerons.
 - All strong heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two
   tagged fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
   It also scans zero `Str` payload slots. For `Closure`, it consults the capture map and
@@ -393,8 +418,10 @@ control remains deferred.
   active case in payload order. Inactive case maps and scalar active slots remain opaque.
 - Weak edges are the one explicit non-descriptor reference category. A heap-owned
   `std::vector<ObjectId>` contains every live WeakRef owner exactly once in ascending slot
-  order. It is not a root and is never consulted by marking; it only locates weak targets
-  after liveness is decided, including old WeakRefs during minor collection.
+  order, and the separate slot-ordered intern table contains weak canonical string IDs.
+  Neither is a root or consulted by ordinary marking; both are processed only after
+  liveness is decided, including old WeakRefs and old intern canonicals during minor
+  collection.
 - The same descriptor visitor handles maps. It validates entry-count/slot-tag agreement and
   visits each inserted key before its value in insertion order, but only when the layout's
   corresponding reference flag is set. String keys and reference values are therefore
@@ -485,6 +512,12 @@ control remains deferred.
   typing, and generic-variant exhaustiveness. Its corpus SHA-256 is
   `ecabdcc1db804f0a9021b8d2a040f6b5fbbf22a9f8d7fcde348a670dc9552ca1`,
   while all twenty legacy generators remain byte-identical.
+- Iteration 44 adds the isolated pinned `interning` grammar. Its 32 seeds construct equal
+  bytes through literal, concat, substring, and conversion paths; retain canonicals in
+  map entries, record fields, and closure captures; drop temporary references; and return
+  graphs with observable sharing. Both canonical-graph and output oracles agree for all
+  15 schedules (480 executions), and four positioned mutants reject i64, bool, pair, and
+  nil operands. All 21 legacy corpus generators remain byte-identical.
 
 ## Performance measurement
 
@@ -731,14 +764,16 @@ Collection is mark, forward, rewrite-strong, process-weak, install, validate:
    and scalar record slots are never presented to the forwarding pass. Map lookup-index
    buckets are copied scalar entry positions and are likewise never presented to
    forwarding; forwarded string-key IDs preserve content hashes.
-5. The weak phase walks the exact registry in ascending old owner-slot order. Dead owners
-   are pruned. Nil stays nil, targets with forwarding entries are rewritten, and targets
-   without entries clear to canonical `Nil`. This never marks a target. Map-growth
-   relocation invokes the same forwarding hook, with no clearing because all objects live.
+5. The weak phase walks exact collector-owned weak structures in deterministic slot
+   order. Dead WeakRef owners are pruned; live WeakRef targets forward or clear to
+   canonical `Nil`. Intern canonicals with forwarding entries are rewritten and entries
+   without forwarding are evicted. Neither path marks a target. Map-growth relocation
+   invokes the same forwarding hooks, with no clearing because all objects are live.
 6. After installation, validation walks all roots and all descriptor-declared live-object
    reference slots, checks that every object reference resolves through the current
-   generation table, verifies storage runs, and separately proves weak-registry exactness
-   plus nil-or-current weak targets.
+   generation table, verifies storage runs, and separately proves WeakRef-registry
+   exactness plus nil-or-current targets and intern-table current-string, strict-order,
+   recomputed-hash, and structural-uniqueness invariants.
 
 Rejected alternative: a permanent handle-indirection table where ObjectIds never change.
 That would preserve external numeric handles, but it would not exercise the root and heap
@@ -758,13 +793,16 @@ Incremental marking and compaction never overlap. Combined stress transfers mark
 final-remark live set into compaction without an atomic move. Fixed-width stores mirror
 their exact field update into an independent source-positioned shadow. Allocation,
 new-key map insertion, map growth, and explicit collection are width/phase boundaries
-that first finish compaction with temporary operands rooted. Preparation, each unit, and
-finalization run the ordinary layout, root, remembered-set, weak, and ephemeron validators.
+that first finish compaction with temporary operands rooted. Intern lookup follows the
+same rule even on a possible hit: it finishes compaction with the source rooted before
+reading the table. Preparation prunes dead intern entries; each relocation forwards a
+matching canonical before the mutator boundary. Preparation, each unit, and finalization
+run the ordinary layout, root, remembered-set, weak, intern, and ephemeron validators.
 
 The completion oracle independently repeats an atomic slide from the shadow, including
-generation minting, descriptor rewrites, weak/ephemeron registries, precise roots, and
-payload comparison. It does not copy production destination objects or consult installed
-production forwarding to derive its expected heap.
+generation minting, descriptor rewrites, WeakRef/ephemeron registries, the weak intern
+table, precise roots, and payload comparison. It does not copy production destination
+objects or consult installed production forwarding to derive its expected heap.
 
 ## Generational collection
 
@@ -891,6 +929,10 @@ remembered-set entries.
   exact target facts. Only `IsNil` refines that local to non-nil `T`. At runtime the
   descriptor exposes zero WeakRef targets, the exact slot-ordered registry owns all weak
   processing, and `validate_weak_targets` rejects stale or unforwarded IDs.
+- Intern-edge precision: `StrIntern` consumes and produces only a precise `Str`. The
+  slot-ordered collector table is ignored by marking, dead entries are evicted only after
+  liveness, every movement path forwards live canonicals, and `validate_intern_table`
+  rejects stale/non-string targets, order drift, hash drift, or duplicate bytes.
 - Signature safety: call sites are checked against the callee signature only; returns are
   checked against the current function signature. This keeps bytecode verification
   modular and rejects out-of-range calls, wrong arity, wrong argument kind, wrong

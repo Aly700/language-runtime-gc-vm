@@ -89,7 +89,8 @@
   a combined schedule may then transfer that fixed live set directly into compaction.
 - Every collector-owned object ID must participate in movement. Map-growth relocation
   forwards an active incremental grey worklist together with roots, descriptor edges,
-  remembered entries, and weak/ephemeron registries.
+  remembered entries, WeakRef/ephemeron registries, and weak intern-table
+  canonicals.
 
 - Incremental marking and incremental compaction are mutually exclusive. Compaction
   starts only after final major liveness, ephemeron activation, dead weak-target clearing,
@@ -111,25 +112,28 @@
   owner through checked dereference. Reference values are canonicalized before the
   barrier-before-publish funnels. Allocations, new map entries, map growth, and explicit
   collections must finish compaction first with every reference operand temporarily
-  rooted.
+  rooted. `intern` follows the same rule even on a possible hit: it finishes compaction
+  with the source as an extra root before consulting the table.
 - The final incremental-compaction graph must equal an independently recomputed atomic
   slide of the post-liveness source snapshot, including generations, descriptor-selected
-  fields, scalar payloads, weak and ephemeron fields/registries, remembered-set pruning,
-  handles, VM roots, and explicit roots. Shadow mutations update source fields directly;
-  they may not copy production destination objects.
+  fields, scalar payloads, WeakRef and ephemeron fields/registries, the weak intern table,
+  remembered-set pruning, handles, VM roots, and explicit roots. Shadow mutations update
+  source fields directly; they may not copy production destination objects.
 
 - Every live object is reachable from an explicit root or another live object at collection start.
 - The collector must never treat non-reference values as references.
-- Every object-payload reference belongs to exactly one of two exhaustive categories.
+- Every reference relationship belongs to exactly one of two exhaustive edge categories.
   Descriptor visitors define **all strong edges**: `Pair`, `RefArray`, `Closure`, `Map`,
-  and `Record` expose exactly their statically declared reference slots. The exact
-  heap-owned WeakRef registry defines **all weak edges**. No third payload reference path
-  may mark, retain, forward, clear, or validate an object ID.
+  and `Record` expose exactly their statically declared reference slots. Collector-owned
+  WeakRef targets, ephemeron weak keys, and intern-table canonicals remain in the existing
+  **weak-edge category** and are processed only by their deterministic post-mark rules.
+  No third reference path may mark, retain, forward, clear, or validate an object ID.
 - Reference-bearing variable-length strong payloads must use the same descriptor visitor
   as fixed-size strong payloads. Marking, strong forwarding, remembered-set validation,
   and strong post-collection validation may not add one-off object-kind scans outside
-  that path. Weak targets are the sole extension: they are processed only through the
-  registry-driven post-mark weak phase and never through a descriptor visitor.
+  that path. Weak-category references are the sole extension: they are processed only
+  through their registry/table-driven post-mark phase and never through a descriptor
+  visitor.
 - `WeakRef` is a fixed-width object with one collector-owned target slot. Its descriptor
   visits zero strong fields, so neither the WeakRef object nor its registry entry keeps
   the target alive. The mutator initializes a non-nil object target exactly once through
@@ -144,6 +148,23 @@
   with forwarding entries are rewritten and targets without them are cleared to `Nil`.
   A cleared slot is never matched against later allocation and stays cleared across slot
   reuse.
+- The collector-owned intern table stores only `(FNV-1a content hash, canonical Str ID)`
+  weak entries. It is never traced as a root, descriptor edge, remembered-set edge, or
+  ephemeron value. Entries are unique by immutable bytes and remain in strict canonical
+  base-slot order. Lookup checks the fixed string-domain content hash and then structural
+  bytes; no ID, slot, generation, address, library hash, or process seed influences a
+  match.
+- Intern weak processing runs beside WeakRef processing after liveness is fixed. A
+  canonical with forwarding survives under its forwarded ID; a canonical without
+  forwarding causes the complete entry to be evicted. Major, minor, map-growth, atomic
+  sliding, and incremental sliding must preserve this rule. During incremental marking,
+  a hit publishes a weak canonical as a strong result and therefore enqueues it on the
+  ordinary grey worklist.
+- `validate_intern_table` must run after insertion and at every collection, relocation,
+  incremental-step, and finalization boundary. It proves current generation-valid `Str`
+  targets, strict slot order, recomputed FNV/content agreement, and structural uniqueness.
+  An uncleared entry may return its still-physical weak-only canonical between collections;
+  once returned, that value is an ordinary precise strong root.
 - `ScalarArray` payload elements are raw `i64` values, not tagged `Value`s. Even if a raw
   element's bit pattern equals a valid or stale `ObjectId`, marking, forwarding,
   remembered-set validation, and post-collection validation must not interpret it as a
@@ -327,6 +348,11 @@
   mutable root until the allocating operation completes. `StrLt` is unsigned byte-wise
   lexicographic ordering, and every source string ordering operator lowers only through
   `StrLt` plus deterministic boolean inversion.
+- `intern(e)` accepts exactly a proven non-nil `str` and lowers only to append-only
+  `StrIntern`. The verifier proves `str -> str`; its operand stack slot is a precise root
+  across the possible canonical-copy allocation. While a canonical is strongly live,
+  every equal call must return that exact object. The table itself must never extend
+  liveness.
 - String indexing is read-only and returns an unsigned byte widened to `i64`. The frontend
   must reject indexed string assignment before bytecode generation.
 - `print(e)` accepts exactly `str` and appends its bytes plus one newline to the bounded VM
@@ -388,6 +414,11 @@
   schedules and has its own pinned source/outcome snapshots and corpus dump. Its mutants
   must prove that syntax, direct-target, tail-position, and return-signature gates are
   non-vacuous without changing any legacy corpus stream.
+- The isolated 32-seed `interning` source corpus runs both observables under all 15
+  schedules and pins its representative source, representative outcome, and full dump.
+  Its returned graphs must expose canonical sharing, while positioned i64/bool/pair/nil
+  mutants prove the builtin's exact type gate without changing any of the 21 legacy
+  corpus streams.
 - The isolated 32-seed `generics` source corpus runs both observables under all 15
   schedules, reverifies every concrete function set, and has independent source,
   graph/output, and exact corpus pins. Its 12 mutants cover inference, explicit arity,

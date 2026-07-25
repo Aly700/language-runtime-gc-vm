@@ -260,6 +260,8 @@ private:
             kind = TokenKind::ToStr;
         } else if (text == "to_i64") {
             kind = TokenKind::ToI64;
+        } else if (text == "intern") {
+            kind = TokenKind::Intern;
         } else if (text == "i64") {
             kind = TokenKind::I64;
         } else if (text == "bool") {

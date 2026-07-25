@@ -2410,6 +2410,8 @@ private:
         case Expr::Kind::ToStr:
         case Expr::Kind::ToI64:
             return check_conversion(expression, state);
+        case Expr::Kind::Intern:
+            return check_intern(expression, state);
         }
         return annotate(expression, invalid_value());
     }
@@ -2937,6 +2939,23 @@ private:
             return annotate(expression, invalid_value());
         }
         return annotate(expression, scalar_value(int64_type()));
+    }
+
+    TypedValue check_intern(Expr& expression, FlowState& state) {
+        const auto operand = check_expr(*expression.receiver, state);
+        if (is_invalid(operand.type)) {
+            return annotate(expression, invalid_value());
+        }
+        if (operand.type != str_type()) {
+            diagnose(expression.receiver->position, "intern expects str");
+            return annotate(expression, invalid_value());
+        }
+        if (operand.includes_nil) {
+            diagnose(expression.receiver->position,
+                     "intern requires non-nil str");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, scalar_value(str_type()));
     }
 
     TypedValue load_array_element(const TypedValue& receiver, SourcePosition position) {

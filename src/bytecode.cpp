@@ -203,6 +203,8 @@ const char* op_name(OpCode op) {
         return "EphemeronSetValue";
     case OpCode::TailCall:
         return "TailCall";
+    case OpCode::StrIntern:
+        return "StrIntern";
     }
     return "<invalid>";
 }
@@ -2061,6 +2063,18 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         return push_fallthrough_or_report(pc, function, function_index,
                                           std::move(state), successors,
                                           diagnostics);
+    case OpCode::StrIntern:
+        if (!pop_expect_or_report(state, diagnostics, function,
+                                  function_index, pc, AbstractKind::Str,
+                                  VerifierReason::StackUnderflow,
+                                  VerifierReason::StrInternRequiresStr,
+                                  "string intern operand")) {
+            return false;
+        }
+        state.stack.push_back(str_value());
+        return push_fallthrough_or_report(pc, function, function_index,
+                                          std::move(state), successors,
+                                          diagnostics);
     case OpCode::StrSub:
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64,
@@ -3709,6 +3723,8 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "TailCallStackShapeMismatch";
     case VerifierReason::BadTailCallArgKind:
         return "BadTailCallArgKind";
+    case VerifierReason::StrInternRequiresStr:
+        return "StrInternRequiresStr";
     }
     return "<unknown>";
 }

@@ -63,6 +63,15 @@ void append_map_hash_byte(std::uint64_t& hash, std::uint8_t byte) {
     hash *= kMapHashPrime;
 }
 
+std::uint64_t string_content_hash(std::span<const std::uint8_t> bytes) {
+    std::uint64_t hash = kMapHashOffsetBasis;
+    append_map_hash_byte(hash, kMapHashStringDomain);
+    for (const auto byte : bytes) {
+        append_map_hash_byte(hash, byte);
+    }
+    return hash;
+}
+
 std::size_t map_lookup_index_capacity(std::size_t entry_count) {
     if (entry_count == 0) {
         return 0;
@@ -1098,6 +1107,61 @@ ObjectId Heap::allocate_string_substring(Value source, std::size_t lo,
     return id;
 }
 
+ObjectId Heap::intern_string(Value source) {
+    require_object_reference_value(source, "string intern source operand");
+    (void)checked_string(source.as_object());
+
+    if (incremental_compaction_active_) {
+        std::array<Value*, 1> source_root{&source};
+        finish_incremental_compaction_impl(nullptr, source_root);
+    }
+
+    const auto content_hash =
+        string_content_hash(string_bytes(source.as_object()));
+    const auto lookup = [&]() -> std::optional<ObjectId> {
+        for (const auto& entry : intern_table_) {
+            if (entry.content_hash == content_hash &&
+                string_equal(entry.canonical, source.as_object())) {
+                return entry.canonical;
+            }
+        }
+        return std::nullopt;
+    };
+
+    if (const auto existing = lookup(); existing.has_value()) {
+        if (incremental_marking_active_) {
+            enqueue_mark_value(Value::object(*existing),
+                               incremental_mark_worklist_,
+                               CollectionKind::Major);
+        }
+        return *existing;
+    }
+
+    if (stress_config_.collect_before_every_allocation) {
+        std::array<Value*, 1> source_root{&source};
+        collect_with_extra_roots(source_root);
+    }
+
+    const auto bytes = string_bytes(source.as_object());
+    auto canonical = allocate_object(Object::string(bytes));
+    if (stress_config_.collect_after_every_allocation) {
+        Value canonical_root = Value::object(canonical);
+        std::array<Value*, 1> allocation_root{&canonical_root};
+        collect_with_extra_roots(allocation_root);
+        canonical = canonical_root.as_object();
+    }
+
+    const auto position = std::lower_bound(
+        intern_table_.begin(), intern_table_.end(),
+        static_cast<std::size_t>(slot_from(canonical)),
+        [](const InternEntry& entry, std::size_t slot) {
+            return slot_from(entry.canonical) < slot;
+        });
+    intern_table_.insert(position, InternEntry{content_hash, canonical});
+    validate_intern_table();
+    return canonical;
+}
+
 ObjectId Heap::allocate_closure(std::size_t layout_index,
                                 std::size_t function_index,
                                 std::vector<Value> captures,
@@ -1759,11 +1823,7 @@ std::uint64_t Heap::map_key_hash(Value key) const {
         append_map_hash_byte(hash, key.as_bool() ? 1 : 0);
         return hash;
     case Value::Tag::Object: {
-        append_map_hash_byte(hash, kMapHashStringDomain);
-        for (const auto byte : string_bytes(key.as_object())) {
-            append_map_hash_byte(hash, byte);
-        }
-        return hash;
+        return string_content_hash(string_bytes(key.as_object()));
     }
     case Value::Tag::Nil:
         break;
@@ -2061,6 +2121,7 @@ void Heap::ensure_map_growth_storage(Value& owner, Value& key, Value& value,
 void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
                                    std::size_t required_width) {
     validate_weak_targets();
+    validate_intern_table();
     const auto old_id = owner.as_object();
     const auto old_slot = checked_slot(old_id);
     const auto old_size = objects_.size();
@@ -2100,6 +2161,8 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     rewrite_references(forwarding, relocated_objects, nullptr, growth_roots);
     auto rewritten_weak_refs =
         process_weak_targets(forwarding, relocated_objects, std::nullopt);
+    auto rewritten_intern_table =
+        process_intern_table(forwarding, false);
     auto rewritten_ephemerons = process_ephemerons(forwarding, relocated_objects);
     if (incremental_marking_active_) {
         for (auto& grey : incremental_mark_worklist_) {
@@ -2116,6 +2179,7 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     generations_ = std::move(relocated_generations);
     remembered_set_ = rewritten_remembered;
     weak_refs_ = std::move(rewritten_weak_refs);
+    intern_table_ = std::move(rewritten_intern_table);
     ephemerons_ = std::move(rewritten_ephemerons);
     ++metrics_.objects_moved;
     if (objects_.size() > metrics_.heap_peak_slots) {
@@ -2124,6 +2188,7 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     validate_heap_storage_layout();
     validate_remembered_set();
     validate_weak_targets();
+    validate_intern_table();
     validate_ephemerons();
 }
 
@@ -2602,6 +2667,7 @@ void Heap::start_incremental_marking() {
     validate_heap_storage_layout();
     validate_remembered_set();
     validate_weak_targets();
+    validate_intern_table();
     validate_ephemerons();
     incremental_mark_worklist_.clear();
     MarkingVisitor marker(*this, incremental_mark_worklist_, CollectionKind::Major);
@@ -2671,6 +2737,7 @@ void Heap::start_incremental_compaction() {
     validate_heap_storage_layout();
     validate_remembered_set();
     validate_weak_targets();
+    validate_intern_table();
     validate_ephemerons();
     ++metrics_.major_collections;
     ++metrics_.incremental_compaction_cycles_started;
@@ -2857,6 +2924,20 @@ void Heap::prepare_incremental_compaction_from_marked() {
     }
     weak_refs_ = std::move(live_weak_refs);
 
+    const bool skip_intern_weak_processing =
+        std::exchange(
+            TEST_ONLY_skip_next_intern_table_weak_processing_, false);
+    std::vector<InternEntry> live_intern_entries;
+    live_intern_entries.reserve(intern_table_.size());
+    for (const auto& entry : intern_table_) {
+        const auto target_slot = checked_slot(entry.canonical);
+        if (objects_[target_slot]->marked ||
+            skip_intern_weak_processing) {
+            live_intern_entries.push_back(entry);
+        }
+    }
+    intern_table_ = std::move(live_intern_entries);
+
     std::vector<ObjectId> live_ephemerons;
     live_ephemerons.reserve(ephemerons_.size());
     for (const auto owner_id : ephemerons_) {
@@ -2900,6 +2981,7 @@ void Heap::prepare_incremental_compaction_from_marked() {
     incremental_compaction_shadow_objects_ = objects_;
     incremental_compaction_shadow_generations_ = generations_;
     incremental_compaction_shadow_weak_refs_ = weak_refs_;
+    incremental_compaction_shadow_intern_table_ = intern_table_;
     incremental_compaction_shadow_ephemerons_ = ephemerons_;
     incremental_compaction_active_ = true;
     validate_after_collection(nullptr, {});
@@ -2997,6 +3079,9 @@ void Heap::forward_incremental_compaction_registries(
     }
     for (auto& owner : weak_refs_) {
         forward_owner(owner);
+    }
+    for (auto& intern : intern_table_) {
+        forward_owner(intern.canonical);
     }
     for (auto& owner : ephemerons_) {
         forward_owner(owner);
@@ -3099,6 +3184,13 @@ void Heap::validate_incremental_compaction_against_atomic(
         };
     const auto expected_weak_refs = rewrite_shadow_registry(
         incremental_compaction_shadow_weak_refs_);
+    auto expected_intern_table =
+        incremental_compaction_shadow_intern_table_;
+    for (auto& entry : expected_intern_table) {
+        auto canonical = Value::object(entry.canonical);
+        rewrite_shadow_value(canonical);
+        entry.canonical = canonical.as_object();
+    }
     const auto expected_ephemerons = rewrite_shadow_registry(
         incremental_compaction_shadow_ephemerons_);
 
@@ -3159,6 +3251,10 @@ void Heap::validate_incremental_compaction_against_atomic(
         throw std::logic_error(
             "incremental compaction/STW differential weak registry mismatch");
     }
+    if (expected_intern_table != intern_table_) {
+        throw std::logic_error(
+            "incremental compaction/STW differential intern table mismatch");
+    }
     if (expected_ephemerons != ephemerons_) {
         throw std::logic_error(
             "incremental compaction/STW differential ephemeron registry mismatch");
@@ -3212,6 +3308,7 @@ void Heap::finalize_incremental_compaction(
     incremental_compaction_shadow_objects_.clear();
     incremental_compaction_shadow_generations_.clear();
     incremental_compaction_shadow_weak_refs_.clear();
+    incremental_compaction_shadow_intern_table_.clear();
     incremental_compaction_shadow_ephemerons_.clear();
     ++metrics_.incremental_compaction_final_pauses;
     validate_after_collection(roots, extra_roots);
@@ -3227,6 +3324,8 @@ void Heap::finish_incremental_marking_impl(RootProvider* roots,
     auto rewritten_remembered_set = rewrite_remembered_set(compacted.forwarding);
     auto rewritten_weak_refs = process_weak_targets(
         compacted.forwarding, compacted.objects, CollectionKind::Major);
+    auto rewritten_intern_table =
+        process_intern_table(compacted.forwarding, true);
     auto rewritten_ephemerons =
         process_ephemerons(compacted.forwarding, compacted.objects);
 
@@ -3234,6 +3333,7 @@ void Heap::finish_incremental_marking_impl(RootProvider* roots,
     generations_ = std::move(compacted.generations);
     remembered_set_ = std::move(rewritten_remembered_set);
     weak_refs_ = std::move(rewritten_weak_refs);
+    intern_table_ = std::move(rewritten_intern_table);
     ephemerons_ = std::move(rewritten_ephemerons);
     incremental_mark_worklist_.clear();
     incremental_marking_active_ = false;
@@ -3352,6 +3452,7 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     validate_heap_storage_layout();
     validate_remembered_set();
     validate_weak_targets();
+    validate_intern_table();
     validate_ephemerons();
     if (kind == CollectionKind::Major) {
         ++metrics_.major_collections;
@@ -3374,6 +3475,8 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     auto rewritten_remembered_set = rewrite_remembered_set(compacted.forwarding);
     auto rewritten_weak_refs =
         process_weak_targets(compacted.forwarding, compacted.objects, kind);
+    auto rewritten_intern_table =
+        process_intern_table(compacted.forwarding, true);
     auto rewritten_ephemerons =
         process_ephemerons(compacted.forwarding, compacted.objects);
 
@@ -3381,6 +3484,7 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     generations_ = std::move(compacted.generations);
     remembered_set_ = std::move(rewritten_remembered_set);
     weak_refs_ = std::move(rewritten_weak_refs);
+    intern_table_ = std::move(rewritten_intern_table);
     ephemerons_ = std::move(rewritten_ephemerons);
     record_promoted_object_edges(compacted.promoted_slots);
     prune_remembered_set();
@@ -3598,6 +3702,38 @@ std::vector<ObjectId> Heap::process_weak_targets(
     return rewritten;
 }
 
+std::vector<Heap::InternEntry> Heap::process_intern_table(
+    const ForwardingTable& forwarding,
+    bool collection_weak_processing) {
+    const bool skip_dead_eviction =
+        collection_weak_processing &&
+        std::exchange(
+            TEST_ONLY_skip_next_intern_table_weak_processing_, false);
+
+    std::vector<InternEntry> rewritten;
+    rewritten.reserve(intern_table_.size());
+    for (const auto& entry : intern_table_) {
+        const auto old_slot = checked_slot(entry.canonical);
+        if (old_slot < forwarding.size() &&
+            forwarding[old_slot].has_value()) {
+            rewritten.push_back(
+                InternEntry{entry.content_hash, *forwarding[old_slot]});
+        } else if (skip_dead_eviction) {
+            rewritten.push_back(entry);
+        } else if (!collection_weak_processing) {
+            throw std::logic_error(
+                "all-live movement omitted an intern-table canonical");
+        }
+    }
+
+    std::sort(rewritten.begin(), rewritten.end(),
+              [](const InternEntry& left, const InternEntry& right) {
+                  return slot_from(left.canonical) <
+                         slot_from(right.canonical);
+              });
+    return rewritten;
+}
+
 std::vector<ObjectId> Heap::process_ephemerons(
     const ForwardingTable& forwarding,
     std::vector<std::optional<Object>>& moved_objects) const {
@@ -3736,6 +3872,7 @@ void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extr
 
     validate_remembered_set();
     validate_weak_targets();
+    validate_intern_table();
     validate_ephemerons();
 }
 
@@ -3807,6 +3944,48 @@ void Heap::validate_weak_targets() const {
     }
 }
 
+void Heap::validate_intern_table() const {
+    std::optional<std::uint32_t> previous_slot;
+    for (std::size_t index = 0; index < intern_table_.size(); ++index) {
+        const auto& entry = intern_table_[index];
+        std::size_t target_slot = 0;
+        try {
+            target_slot = checked_slot(entry.canonical);
+        } catch (const std::out_of_range&) {
+            throw std::logic_error(
+                "intern table entry names an invalid or stale canonical string");
+        }
+        if (!objects_[target_slot].has_value() ||
+            objects_[target_slot]->kind != ObjectKind::Str) {
+            throw std::logic_error(
+                "intern table entry names an invalid or stale canonical string");
+        }
+
+        const auto encoded_slot = slot_from(entry.canonical);
+        if (previous_slot.has_value() &&
+            *previous_slot >= encoded_slot) {
+            throw std::logic_error(
+                "intern table is not in strict heap-slot order");
+        }
+        previous_slot = encoded_slot;
+
+        const auto bytes = string_bytes(entry.canonical);
+        if (string_content_hash(bytes) != entry.content_hash) {
+            throw std::logic_error(
+                "intern table content hash disagrees with canonical bytes");
+        }
+        for (std::size_t prior = 0; prior < index; ++prior) {
+            if (intern_table_[prior].content_hash ==
+                    entry.content_hash &&
+                string_equal(intern_table_[prior].canonical,
+                             entry.canonical)) {
+                throw std::logic_error(
+                    "intern table contains duplicate canonical bytes");
+            }
+        }
+    }
+}
+
 void Heap::validate_ephemerons() const {
     std::size_t registry_index = 0;
     for (std::size_t slot = 0; slot < objects_.size(); ++slot) {
@@ -3855,6 +4034,11 @@ bool Heap::TEST_ONLY_is_young_object(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_old_object(ObjectId id) const {
     return is_old_slot(checked_slot(id));
+}
+
+ObjectId Heap::TEST_ONLY_intern_table_target(
+    std::size_t index) const {
+    return intern_table_.at(index).canonical;
 }
 
 bool Heap::TEST_ONLY_is_scalar_array(ObjectId id) const {
