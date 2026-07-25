@@ -508,7 +508,9 @@ private:
     void check_function(FunctionDecl& function) {
         LocalContext context;
         auto* previous_local_context = local_context_;
+        const auto* previous_return_type = current_return_type_;
         local_context_ = &context;
+        current_return_type_ = &function.return_type;
         FlowState state = initial_state();
         for (auto& parameter : function.parameters) {
             if (find_local(state, parameter.name) != nullptr) {
@@ -532,6 +534,7 @@ private:
         }
         function.local_count =
             static_cast<std::uint32_t>(context.prototypes.size());
+        current_return_type_ = previous_return_type;
         local_context_ = previous_local_context;
     }
 
@@ -1005,6 +1008,35 @@ private:
             }
             return false;
         }
+        case Statement::Kind::TailCall: {
+            const auto value = check_expr(*statement.value, state);
+            if (current_return_type_ == nullptr) {
+                diagnose(statement.position,
+                         "'return tail' is only allowed inside a function");
+                return false;
+            }
+            if (statement.value->kind != Expr::Kind::Call ||
+                !statement.value->direct_call) {
+                diagnose(statement.value->position,
+                         "tail call requires a named function");
+                return false;
+            }
+            if (active_try_depth_ != 0) {
+                diagnose(statement.position,
+                         "tail call is not allowed inside an active try region");
+                return false;
+            }
+            if (!is_invalid(value.type) &&
+                (value.type != *current_return_type_ ||
+                 !value_conforms_to_type(value, *current_return_type_, state))) {
+                diagnose(
+                    statement.value->position,
+                    "tail call returns " + type_name(value.type) +
+                        " but current function is declared " +
+                        type_name(*current_return_type_));
+            }
+            return false;
+        }
         case Statement::Kind::TryCatch:
             return check_try_catch(statement, state);
         case Statement::Kind::Break:
@@ -1045,7 +1077,9 @@ private:
                      "catch type must be a nominal variant");
         }
         auto try_state = state;
+        ++active_try_depth_;
         const bool try_falls = check_block(statement.body, try_state, false);
+        --active_try_depth_;
         if (!statement.catch_local_allocated) {
             statement.catch_local_index = static_cast<std::uint32_t>(
                 local_context_->prototypes.size());
@@ -1904,7 +1938,11 @@ private:
 
         LocalContext local_context;
         auto* previous_local_context = local_context_;
+        const auto* previous_return_type = current_return_type_;
+        const auto previous_try_depth = active_try_depth_;
         local_context_ = &local_context;
+        current_return_type_ = &lambda.return_type;
+        active_try_depth_ = 0;
         FlowState state = initial_state();
         for (auto& parameter : lambda.parameters) {
             if (find_local(state, parameter.name) != nullptr) {
@@ -1935,6 +1973,8 @@ private:
         }
         lambda.local_count =
             static_cast<std::uint32_t>(local_context.prototypes.size());
+        active_try_depth_ = previous_try_depth;
+        current_return_type_ = previous_return_type;
         local_context_ = previous_local_context;
         return annotate(
             expression,
@@ -2813,6 +2853,8 @@ private:
     std::vector<FunctionSymbol> functions_;
     CaptureContext* capture_context_{nullptr};
     LocalContext* local_context_{nullptr};
+    const TypeSpec* current_return_type_{nullptr};
+    std::size_t active_try_depth_{0};
     std::vector<LoopFlowContext*> loop_contexts_;
     std::vector<Diagnostic> diagnostics_;
 };

@@ -275,6 +275,33 @@ void VM::push_frame(const Module& module, std::size_t function_index,
     frames_.push_back(std::move(frame));
 }
 
+void VM::reuse_frame_for_tail_call(const Module& module, Frame& frame,
+                                   std::size_t function_index) {
+    assert(function_index < module.functions.size() &&
+           "verifier invariant violated: TailCall target must be in range");
+    const auto& function = module.functions[function_index];
+    assert(frame.stack.size() == function.signature.parameters.size() &&
+           "verifier invariant violated: TailCall stack must contain only arguments");
+
+    std::vector<Value> arguments(function.signature.parameters.size(),
+                                 Value::nil());
+    for (std::size_t i = arguments.size(); i > 0; --i) {
+        arguments[i - 1] = pop(frame);
+    }
+    assert(frame.stack.empty() &&
+           "verifier invariant violated: TailCall left a stack value");
+    assert(function.local_count >= arguments.size() &&
+           "verifier invariant violated: TailCall callee locals cannot hold parameters");
+
+    frame.function_index = function_index;
+    frame.pc = 0;
+    frame.locals.assign(function.local_count, Value::nil());
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        frame.locals[i] = arguments[i];
+    }
+    frame.closure.reset();
+}
+
 Value VM::execute(const Module& module) {
     output_.clear();
     ++raw_module_executions_;
@@ -318,6 +345,14 @@ Value VM::execute_verified(const Module& module,
       while (!frames_.empty()) {
         auto& frame = frames_.back();
         const auto& function = module.functions[frame.function_index];
+        if (function.code[frame.pc].op == OpCode::TailCall) {
+            // TailCall maps describe a dying-frame boundary. The verifier proves that
+            // the operand stack contains exactly the outgoing arguments. Canonicalize
+            // every other frame-owned slot before the first map assertion or any
+            // instruction-boundary collection can observe it.
+            std::fill(frame.locals.begin(), frame.locals.end(), Value::nil());
+            frame.closure.reset();
+        }
         assert_stack_matches_map(verification, frame);
         collect_at_instruction_boundary_if_needed(verification, frame);
         const auto& ins = function.code[frame.pc];
@@ -1131,6 +1166,15 @@ Value VM::execute_verified(const Module& module,
             }
             ++frame.pc;
             push_frame(module, callee_index, std::move(arguments));
+            break;
+        }
+        case OpCode::TailCall: {
+            assert(ins.operand >= 0 &&
+                   static_cast<std::size_t>(ins.operand) <
+                       module.functions.size() &&
+                   "verifier invariant violated: TailCall target must be in range");
+            reuse_frame_for_tail_call(
+                module, frame, static_cast<std::size_t>(ins.operand));
             break;
         }
         case OpCode::Return: {

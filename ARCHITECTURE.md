@@ -1,6 +1,13 @@
 # Architecture — Language Runtime
 
-Iteration 38 completes Wave 3 with deterministic incremental major marking and
+Iteration 39 adds verifier-checked explicit tail calls. A terminal `TailCall` carries only
+its outgoing arguments as roots at the transfer pc, scrubs every dying local and closure
+before boundary GC work, and installs the callee in the same VM frame. Self and mutual
+tail recursion therefore use constant frame depth without changing ordinary call-depth
+traps or any moving-collector root path. See
+[ADR-0016](adr/0016-tail-call-frame-reuse.md).
+
+Iteration 38 completed Wave 3 with deterministic incremental major marking and
 compaction. Marking budgets consume complete descriptor scans; compaction budgets consume
 complete survivor relocations at VM instruction boundaries. A phase-local exact-ID read
 barrier keeps moved and unmoved objects usable without weakening generation traps, and an
@@ -25,6 +32,12 @@ between frames lives in `pending_exception_`, a precise mutable root traced alon
 frame stacks, locals, and closures. Exact-layout handlers receive the forwarded object;
 unmatched values continue outward. Host/runtime traps never enter this path. See
 [ADR-0012](adr/0012-exception-unwind-roots.md).
+
+Iteration 39 appends `TailCall` as a distinct verifier boundary rather than recognizing a
+`Call; Return` pattern. The verifier proves a direct eligible target, exact argument-only
+stack shape, complete argument and return signatures, and no active same-frame try range.
+The transition has no successor. The VM scrubs dying frame-owned roots before scheduled
+collection and then reinitializes that frame as the callee.
 
 ## Frontend surface
 
@@ -75,6 +88,11 @@ The source language is intentionally small:
   Function bodies have the same shape as the top level: statements followed by a final
   expression.
 - Calls are expressions and recursion is allowed.
+- `return tail f(args);` is a terminating statement inside a function or lambda. The
+  callee must be a directly named function, the call result must exactly match the
+  enclosing function's declared return type, and the statement cannot occur inside an
+  active try body. `return` is reserved; `tail` is contextual and remains available as an
+  ordinary identifier elsewhere.
 - Lambdas such as `fn(x: i64) -> i64 { body }` are expressions. They snapshot referenced
   enclosing locals by value in deterministic first-use order. Function values can be
   called, passed, returned, placed in pairs, and stored in `RefArray`s; referencing a named
@@ -92,7 +110,8 @@ The source language is intentionally small:
 - A program ends with a final expression, which becomes the VM result.
 
 Minimal cuts: there is no string interning/mutation, expression-valued blocks, capture
-mutation, recursion through a self-capture, or block-local `let` declarations.
+mutation, recursion through a self-capture, tail call through a function value, implicit
+tail-call optimization, or block-local `let` declarations.
 Bare `pair` remains an opaque pair leaf type for
 compatibility: it proves only "object" at function boundaries, so field reads through bare
 pair parameters/returns are rejected as unknown. Inside a function, the type checker still
@@ -219,14 +238,20 @@ control remains deferred.
   analysis over reachable bytecode, proving stack depth before every instruction,
   `LoadLocal` initialization over all incoming paths, branch target validity, call
   argument kinds/counts against the module signature table, return kind against the
-  current function signature, and value kinds for generated stack maps. This protects the
-  VM invariants for stack depth, initialized local reads, and function boundaries across
-  loops and merge points.
+  current function signature, and value kinds for generated stack maps. `TailCall` is
+  additionally terminal and proves target eligibility, exact complete caller/callee
+  return agreement, an argument-only stack, parameter conformance, and absence from an
+  active try range. This protects the VM invariants for stack depth, initialized local
+  reads, and function boundaries across loops and merge points.
 - Stack maps retain the existing operand `object_slots` and add an exact
   `local_object_slots` vector. Local root category is tracked separately from definite
   initialization so entry/backedge joins describe runtime slots without making an
   uninitialized local readable. Legacy hand-written maps may omit local bits; generated
   maps always include them, and the VM asserts them around instruction-boundary stress.
+  At a TailCall pc only, operand bits describe the outgoing arguments and every local bit
+  is false. The VM first replaces the corresponding dying locals with `nil` and clears
+  the frame closure, making that special map a physical root contract rather than an
+  liveness annotation over stale values.
 - Verifier rejection is structured. The compatibility APIs `verify` and
   `verify_with_stack_maps` still return only bool/optional results, while
   `verify_with_diagnostics` returns the same stack-map result plus deterministic
@@ -237,7 +262,10 @@ control remains deferred.
 - `lang::VM` owns a vector of call frames and registers itself as a `lang::gc::RootProvider`.
   Each frame owns its own operand stack and locals. Root tracing visits mutable `Value`
   slots in every live frame, not copied root values, so moving collection can update
-  active and suspended frames before mutator execution resumes.
+  active and suspended frames before mutator execution resumes. Tail transfer does not
+  change that walk: any boundary collection rewrites outgoing arguments on the active
+  stack plus suspended frames, `pending_exception_`, Handles, embedder roots, and
+  collector extra roots through their existing paths before the active frame is reused.
 - `lang::VM` also owns a deterministic byte output vector exposed read-only through
   `VM::output()`. Every execution resets it. `Print` copies string bytes and one `\n`; it
   never writes stdout or a host stream and attaches no time or address data. The fixed
@@ -369,6 +397,12 @@ control remains deferred.
   mixed-width graphs and emit output across all fifteen schedules while exercising every
   heap layout, holes, phase boundaries, and fixed-width mutations. The first twelve
   schedule definitions and all seventeen legacy corpus generators remain unchanged.
+- Iteration 39 adds a separate pinned `tailcalls` grammar. Its 32 seeds exercise direct
+  mutual tail recursion, per-hop dead locals, shared reference arguments, mutation,
+  non-empty graph/output oracles, and four non-vacuous rejection mutants under all
+  fifteen schedules. Its corpus dump SHA-256 is
+  `72e0af127c314f7bfa4ceb3961170b452fc490e5ea9f31fcfb6643cddebeaf61`;
+  all eighteen legacy corpus generators remain byte-identical.
 
 ## Performance measurement
 
@@ -432,6 +466,21 @@ Call depth is checked by an explicit `VM::set_max_call_depth` limit before pushi
 so recursion traps deterministically with a VM error instead of depending on the host C++
 stack.
 
+`TailCall` uses the same per-frame representation but never creates a continuation. Its
+verified boundary stack contains exactly the outgoing arguments. Before the ordinary
+instruction-boundary assertion and stress machinery run, the VM sets all old locals to
+`nil` and clears the optional frame closure; the TailCall map consequently exposes only
+those arguments. Atomic collection, incremental marking, and incremental compaction may
+move them in place through the normal root visitor.
+
+After that boundary, the VM pops the forwarded arguments into source order, keeps
+`frames_.size()` unchanged, sets the current frame's function and pc to the callee and
+zero, installs a fresh callee-sized `nil` local vector, and copies parameters into its
+leading locals. It inherits neither closure state nor a same-frame handler. This path does
+not consult the depth limit. A language exception from the callee unwinds the reused frame
+as the callee and can reach an outer suspended handler; a TailCall protected by the dying
+frame's own try range is rejected before execution.
+
 ## Source/Verifier agreement
 
 Well-typed source must compile to a `VerifiedModule` accepted by the module verifier. A
@@ -460,6 +509,11 @@ Compiler accommodations for verifier strictness:
 - Function boundaries: calls emit arguments left-to-right followed by `Call <callee>`.
   Function signatures initialize parameter locals in the verifier and VM, and `Return`
   must match the declared return kind plus any detailed pair field types.
+- Tail boundaries: `return tail f(args);` emits its arguments left-to-right followed by
+  one terminal `TailCall <callee>`, with no `Call` or `Return` on that path. The frontend
+  requires a direct named function and exact enclosing/callee return-type equality; the
+  verifier independently checks the complete signature, exact argument-only stack, and
+  active-try exclusion before producing the special outgoing-arguments-only root map.
 - Closures: capture analysis orders free locals by first use and emits each current value
   before `AllocClosure`. Layout signatures, capture types, and derived bitmap are emitted
   together. Value calls emit arguments followed by the callee and `CallClosure`; lambda
@@ -679,11 +733,17 @@ remembered-set entries.
   reference-capable slot. Hand-written maps, when present, must match the verifier state,
   and VM-controlled collection points assert that the active frame's runtime operand and
   local tags agree with the generated map for the current function and pc. Local bits
-  protect hidden for-in container roots across entry and backedge boundaries.
+  protect hidden for-in container roots across entry and backedge boundaries. TailCall is
+  the sole special map: it retains exact outgoing-argument bits and sets every local bit
+  false after the VM has physically scrubbed those locals and the frame closure.
 - Frame-root precision: every live frame's locals and operand stack slots are traced as
   mutable roots. A collection triggered in a deep callee rewrites references held by
   suspended callers before the callee or caller can resume. Closure frames additionally
   trace their frame-owned closure slot so `LoadCapture` always sees the forwarded object.
+  At TailCall only, that active closure is dead and cleared before collection; a captured
+  outgoing value has already been copied to the verified operand stack. Suspended
+  closures, `pending_exception_`, Handles, embedder providers, allocation extra roots, and
+  partial-compaction forwarding retain their ordinary tracing behavior.
 - GC identity safety: dereferencing, marking, forwarding, or validating an invalid/stale
   `ObjectId` throws, exposing root-precision and missed-forwarding bugs instead of silently
   ignoring or aliasing them.
@@ -732,8 +792,9 @@ remembered-set entries.
   checked against the current function signature. This keeps bytecode verification
   modular and rejects out-of-range calls, wrong arity, wrong argument kind, wrong
   pair-field kind, record or variant layout/case/field mismatch, malformed named-type
-  references,
-  infinite-unfolding misuse, and wrong return kind.
+  references, infinite-unfolding misuse, and wrong return kind. TailCall additionally
+  requires exact complete caller/callee return equality, an argument-only stack, a direct
+  target that needs no captures, and no active same-frame try region.
 - GC neutrality: pair-field types and named recursive types never participate in heap
   layout. Record types contribute only validated nominal layout identity and the exact
   descriptor bitmap. Scalar arrays and RefArrays are bytecode-only reference-capable values, but

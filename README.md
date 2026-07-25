@@ -1,8 +1,9 @@
 # Language Runtime: Verified Bytecode and Precise Moving GC
 
-Wave 3 is complete: records, sum types and match, exceptions, ephemerons, deterministic
-incremental marking, and deterministic incremental compaction all run under the same
-precise moving collector.
+Wave 3 is complete, and explicit verifier-checked tail calls now reuse VM frames without
+weakening its collector contract. Records, sum types and match, exceptions, ephemerons,
+deterministic incremental marking, and deterministic incremental compaction all run under
+the same precise moving collector.
 
 This repository is a correctness-first implementation of a small statically typed
 language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
@@ -35,6 +36,16 @@ cannot make an unreadable local readable or turn a maybe-object slot into a scal
 The VM traces mutable slots in every active and suspended frame and rewrites them before
 execution resumes. See [INVARIANTS.md](INVARIANTS.md#vm) and
 [ARCHITECTURE.md](ARCHITECTURE.md#protected-invariants).
+
+### Tail-call frame reuse
+
+`return tail f(args);` is an explicit terminal transfer to a directly named function.
+The verifier requires an argument-only stack and exact caller/callee return agreement.
+At that pc, outgoing arguments are the precise roots; every dying local and the frame
+closure is cleared before scheduled GC work, after which the callee is installed in the
+same frame. Self and mutual tail recursion therefore do not consume call depth, while
+ordinary calls retain the deterministic depth trap. Tail calls inside an active try
+region are rejected. See [ADR 0016](adr/0016-tail-call-frame-reuse.md).
 
 ### Capture maps
 
@@ -154,7 +165,8 @@ The language includes:
   variants with immutable tagged cases and exhaustive matching, scalar/reference
   arrays, insertion-order maps, weak references, and structural function types;
 - named functions, recursion, first-class function values, returned lambdas, and
-  immutable capture snapshots;
+  immutable capture snapshots; explicit direct `return tail f(args);` supports
+  constant-frame self and mutual recursion;
 - local, pair-field, record-field, array-element, and map-entry assignment;
 - `if`/`else`, `while`, array/map/range `for-in`, and nearest-loop `break`/`continue`;
 - string concat, equality, byte indexing, byte length, copying `sub`, unsigned byte-wise
@@ -182,7 +194,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The acceptance gate contains 37 CTest targets.
+The acceptance gate contains 41 CTest targets.
 
 Run only the executable documentation:
 
@@ -195,7 +207,7 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 18 isolated deterministic positive corpora. Shared source grammars run under
+The suite has 19 isolated deterministic positive corpora. Shared source grammars run under
 the same 15 schedules without changing any legacy generated program bytes:
 
 - `no_stress`
@@ -215,11 +227,11 @@ liveness expectations because clearing is intentionally observable. Generated so
 bytecode are constructive and deterministic; each grammar has its own corpus dump and an
 embedded pinned representative snapshot.
 
-Negative testing applies 57 positioned mutation operators across fixed seed sets, for 950
+Negative testing applies 61 positioned mutation forms across fixed seed sets, for 1,078
 frontend rejection checks. The operators cover type errors, undefined values, arity and
 return mismatches, missing nil refinement, invalid container operations, closure misuse,
 map key/value errors, weak-target errors, loop-control errors, conversion errors, and
-substring/ordering and nominal-record errors.
+substring/ordering and nominal-record errors, plus invalid tail position and targets.
 
 Run every corpus through CTest with the build command above. Run the fuzz executables
 directly to see their per-corpus summaries:
@@ -237,6 +249,7 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration35_exceptions_fuzz
 ./build/lang_iteration36_ephemerons_fuzz
 ./build/lang_iteration38_incremental_compaction_fuzz
+./build/lang_iteration39_tail_calls_fuzz
 ```
 
 ### Replay by grammar
@@ -263,6 +276,7 @@ Use one of the schedule names above.
 | source `exceptions` | 32 | deterministic fifteen-schedule sweep in `lang_iteration35_exceptions_fuzz` | typed rejection cases in `lang_iteration35_exceptions` |
 | source `ephemerons` | 32 | `./build/lang_iteration36_ephemerons_fuzz --seed N --schedule INDEX` | six fixed type mutants |
 | source `incremental_compaction` | 32 | `./build/lang_iteration38_incremental_compaction_fuzz --grammar incremental_compaction --seed N --schedule NAME` | `./build/lang_iteration38_incremental_compaction_fuzz --grammar incremental_compaction --seed N --mutant 0..3` |
+| source `tailcalls` | 32 | `./build/lang_iteration39_tail_calls_fuzz --grammar tailcalls --seed N --schedule NAME` | `./build/lang_iteration39_tail_calls_fuzz --grammar tailcalls --seed N --mutant 0..3` |
 
 For example:
 
@@ -292,7 +306,13 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration35_exceptions_fuzz --dump-corpus exceptions
 ./build/lang_iteration36_ephemerons_fuzz --dump-corpus ephemerons
 ./build/lang_iteration38_incremental_compaction_fuzz --dump-corpus incremental_compaction
+./build/lang_iteration39_tail_calls_fuzz --dump-corpus tailcalls
 ```
+
+The isolated `tailcalls` dump is pinned at SHA-256
+`72e0af127c314f7bfa4ceb3961170b452fc490e5ea9f31fcfb6643cddebeaf61`.
+It compares non-empty canonical graph and output oracles across all 15 schedules; four
+mutants prove the tail-position, direct-target, and return-signature gates are active.
 
 The generator design, oracle, schedules, and replay behavior are detailed in
 [docs/gc-stress-mode.md](docs/gc-stress-mode.md).
@@ -330,6 +350,8 @@ context, and before/after tables are in
   addressing, resize/tombstone policy, and structural hash caching are deferred.
 - Closure captures are immutable snapshots. There are no mutable capture cells or
   recursion through a self-capture.
+- Tail calls are explicit and direct-only. There is no implicit `Call; Return`
+  optimization or tail-call opcode for function values and closures.
 - Weak-keyed maps, finalizers, resurrection, mutable weak targets, and user-visible
   finalization ordering are not implemented.
 - Loop control is unlabeled. Labeled loops and labeled `break`/`continue` require a label

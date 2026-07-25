@@ -135,6 +135,8 @@ const char* op_name(lang::OpCode op) {
         return "EphemeronValue";
     case lang::OpCode::EphemeronSetValue:
         return "EphemeronSetValue";
+    case lang::OpCode::TailCall:
+        return "TailCall";
     }
     return "<unknown>";
 }

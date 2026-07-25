@@ -201,6 +201,8 @@ const char* op_name(OpCode op) {
         return "EphemeronValue";
     case OpCode::EphemeronSetValue:
         return "EphemeronSetValue";
+    case OpCode::TailCall:
+        return "TailCall";
     }
     return "<invalid>";
 }
@@ -1465,7 +1467,8 @@ JoinOutcome join_state_into(AbstractState& destination, const AbstractState& inc
     return changed ? JoinOutcome::Changed : JoinOutcome::Unchanged;
 }
 
-bool stack_map_matches(const StackMap& map, const AbstractState& state) {
+bool stack_map_matches(const StackMap& map, const AbstractState& state,
+                       bool tail_call_boundary) {
     if (map.object_slots.size() != state.stack.size()) {
         return false;
     }
@@ -1486,6 +1489,7 @@ bool stack_map_matches(const StackMap& map, const AbstractState& state) {
         }
         for (std::size_t i = 0; i < state.locals.size(); ++i) {
             const bool is_object =
+                !tail_call_boundary &&
                 state.local_reference_kinds[i].value_or(false);
             if (map.local_object_slots[i] != is_object) {
                 return false;
@@ -1495,7 +1499,8 @@ bool stack_map_matches(const StackMap& map, const AbstractState& state) {
     return true;
 }
 
-std::optional<StackMap> stack_map_from_state(const AbstractState& state) {
+std::optional<StackMap> stack_map_from_state(const AbstractState& state,
+                                             bool tail_call_boundary) {
     StackMap map;
     map.object_slots.reserve(state.stack.size());
     for (const auto& value : state.stack) {
@@ -1506,7 +1511,8 @@ std::optional<StackMap> stack_map_from_state(const AbstractState& state) {
     }
     map.local_object_slots.reserve(state.locals.size());
     for (const auto local_kind : state.local_reference_kinds) {
-        map.local_object_slots.push_back(local_kind.value_or(false));
+        map.local_object_slots.push_back(
+            !tail_call_boundary && local_kind.value_or(false));
     }
     return map;
 }
@@ -3257,6 +3263,102 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
     }
+    case OpCode::TailCall: {
+        if (enclosing_handler(function, pc) != nullptr) {
+            return reject(
+                diagnostics, function_index, pc,
+                VerifierReason::TailCallInTryRegion,
+                instruction_message(
+                    function, pc,
+                    "tail call is not allowed inside an active try region"));
+        }
+        if (ins.operand < 0 ||
+            static_cast<std::uint64_t>(ins.operand) >=
+                module.functions.size()) {
+            std::ostringstream message;
+            message << "callee " << ins.operand
+                    << " is outside function count "
+                    << module.functions.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadTailCallTarget,
+                          instruction_message(function, pc, message.str()));
+        }
+        const auto callee_index =
+            static_cast<std::size_t>(ins.operand);
+        const auto& callee_function = module.functions[callee_index];
+        if (callee_function.closure_layout.has_value()) {
+            assert(*callee_function.closure_layout <
+                       module.closure_layouts.size() &&
+                   "closure-body layout is validated before transfer");
+            if (!module.closure_layouts[*callee_function.closure_layout]
+                     .capture_types.empty()) {
+                return reject(
+                    diagnostics, function_index, pc,
+                    VerifierReason::BadTailCallTarget,
+                    instruction_message(
+                        function, pc,
+                        "direct TailCall cannot target a capture-bearing closure body"));
+            }
+        }
+        const auto& callee = callee_function.signature;
+        if (!signature_values_equal(
+                return_signature(callee),
+                return_signature(function.signature))) {
+            return reject(
+                diagnostics, function_index, pc,
+                VerifierReason::TailCallReturnTypeMismatch,
+                instruction_message(
+                    function, pc,
+                    "callee return type does not match caller return type"));
+        }
+        if (state.stack.size() < callee.parameters.size()) {
+            std::ostringstream message;
+            message << "tail call requires "
+                    << callee.parameters.size()
+                    << " argument(s) but stack has "
+                    << state.stack.size();
+            return reject(diagnostics, function_index, pc,
+                          VerifierReason::BadTailCallArity,
+                          instruction_message(function, pc, message.str()));
+        }
+        if (state.stack.size() > callee.parameters.size()) {
+            std::ostringstream message;
+            message << "tail call stack must contain exactly "
+                    << callee.parameters.size()
+                    << " argument(s) but has "
+                    << state.stack.size();
+            return reject(
+                diagnostics, function_index, pc,
+                VerifierReason::TailCallStackShapeMismatch,
+                instruction_message(function, pc, message.str()));
+        }
+        for (std::size_t i = callee.parameters.size(); i > 0; --i) {
+            AbstractValue argument;
+            const auto parameter_index = i - 1;
+            std::ostringstream context;
+            context << "tail argument " << parameter_index;
+            if (!pop_any_or_report(
+                    state, diagnostics, function, function_index, pc,
+                    VerifierReason::BadTailCallArity, context.str(),
+                    &argument)) {
+                return false;
+            }
+            if (!value_conforms_to_signature(
+                    module, state, argument,
+                    parameter_signature(callee, parameter_index))) {
+                std::ostringstream message;
+                message << "tail argument " << parameter_index
+                        << " does not conform to callee parameter "
+                        << value_kind_name(
+                               callee.parameters[parameter_index]);
+                return reject(
+                    diagnostics, function_index, pc,
+                    VerifierReason::BadTailCallArgKind,
+                    instruction_message(function, pc, message.str()));
+            }
+        }
+        return true;
+    }
     case OpCode::Return: {
         AbstractValue returned;
         if (!pop_any_or_report(state, diagnostics, function, function_index, pc,
@@ -3425,14 +3527,18 @@ std::optional<VerificationResult> verify_function_with_stack_maps(
                    "bytecode pc is unreachable from function entry");
             return std::nullopt;
         }
-        auto map = stack_map_from_state(*states[pc]);
+        const bool tail_call_boundary =
+            function.code[pc].op == OpCode::TailCall;
+        auto map =
+            stack_map_from_state(*states[pc], tail_call_boundary);
         if (!map.has_value()) {
             reject(diagnostics, function_index, pc, VerifierReason::PoisonUse,
                    "cannot generate stack map for poison stack value");
             return std::nullopt;
         }
         if (!function.stack_maps.empty() &&
-            !stack_map_matches(function.stack_maps[pc], *states[pc])) {
+            !stack_map_matches(function.stack_maps[pc], *states[pc],
+                               tail_call_boundary)) {
             reject(diagnostics, function_index, pc, VerifierReason::BadStackMap,
                    "supplied stack map does not match verifier state");
             return std::nullopt;
@@ -3591,6 +3697,18 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "EphemeronOperationOnNonEphemeron";
     case VerifierReason::EphemeronValueTypeMismatch:
         return "EphemeronValueTypeMismatch";
+    case VerifierReason::TailCallInTryRegion:
+        return "TailCallInTryRegion";
+    case VerifierReason::BadTailCallTarget:
+        return "BadTailCallTarget";
+    case VerifierReason::TailCallReturnTypeMismatch:
+        return "TailCallReturnTypeMismatch";
+    case VerifierReason::BadTailCallArity:
+        return "BadTailCallArity";
+    case VerifierReason::TailCallStackShapeMismatch:
+        return "TailCallStackShapeMismatch";
+    case VerifierReason::BadTailCallArgKind:
+        return "BadTailCallArgKind";
     }
     return "<unknown>";
 }

@@ -71,6 +71,7 @@ enum class OpCode {
     EphemeronKey,
     EphemeronValue,
     EphemeronSetValue,
+    TailCall,
 };
 
 struct Instruction {
@@ -458,6 +459,12 @@ enum class VerifierReason {
     BadEphemeronKeyType,
     EphemeronOperationOnNonEphemeron,
     EphemeronValueTypeMismatch,
+    TailCallInTryRegion,        // TailCall occurs inside an active same-frame try range.
+    BadTailCallTarget,          // TailCall operand is out of range or needs captures.
+    TailCallReturnTypeMismatch, // Callee return signature differs from the caller's.
+    BadTailCallArity,           // TailCall stack has fewer values than callee parameters.
+    TailCallStackShapeMismatch, // TailCall stack contains values beyond its arguments.
+    BadTailCallArgKind,         // TailCall argument violates the callee parameter type.
 };
 
 struct VerifierDiagnostic {

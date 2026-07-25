@@ -172,6 +172,7 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
             break;
         }
         case Statement::Kind::Throw:
+        case Statement::Kind::TailCall:
             falls_through = false;
             break;
         case Statement::Kind::Let:
@@ -288,6 +289,9 @@ bool add_statement_array_counts(const Statement& statement,
         return try_falls || catch_falls;
     }
     case Statement::Kind::Throw:
+        add_expr_array_counts(*statement.value, counts);
+        return false;
+    case Statement::Kind::TailCall:
         add_expr_array_counts(*statement.value, counts);
         return false;
     case Statement::Kind::Break:
@@ -590,6 +594,18 @@ private:
         case Statement::Kind::Throw:
             compile_expr(*statement.value);
             emit(OpCode::Throw, 0);
+            return false;
+        case Statement::Kind::TailCall:
+            assert(statement.value != nullptr &&
+                   statement.value->kind == Expr::Kind::Call &&
+                   statement.value->direct_call &&
+                   "type checker must restrict TailCall to named functions");
+            for (const auto& argument : statement.value->arguments) {
+                compile_expr(*argument);
+            }
+            emit(OpCode::TailCall,
+                 static_cast<std::int64_t>(
+                     statement.value->callee_index));
             return false;
         case Statement::Kind::TryCatch:
             return compile_try_catch(statement);
