@@ -1,0 +1,7 @@
+fn parse_count(text: str) -> i64 {
+  to_i64(text)
+}
+fn load_count() -> i64 {
+  parse_count("forty-two")
+}
+load_count()

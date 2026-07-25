@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -12,7 +13,7 @@
 
 namespace {
 
-constexpr std::array<const char*, 10> kExamples{
+constexpr std::array<const char*, 11> kExamples{
     "linked_list",
     "capture_accumulator",
     "word_frequency",
@@ -23,6 +24,7 @@ constexpr std::array<const char*, 10> kExamples{
     "generics_showcase",
     "generic_types_showcase",
     "string_interning",
+    "diagnostics_showcase",
 };
 
 std::string read_file(const std::string& path) {
@@ -55,6 +57,35 @@ lang::gc::StressConfig maximum_stress() {
     return stress;
 }
 
+std::string render_runtime_failure(
+    const std::exception& error,
+    const std::optional<lang::RuntimeTrace>& trace) {
+    if (!trace.has_value() || trace->frames.empty()) {
+        throw std::runtime_error(
+            "diagnostics showcase trap omitted its runtime trace");
+    }
+    std::ostringstream out;
+    out << "error: " << error.what() << "\n";
+    for (std::size_t i = 0; i < trace->frames.size(); ++i) {
+        const auto& frame = trace->frames[i];
+        out << "#" << i << " function=" << frame.function_index << " name=";
+        if (frame.function_name.has_value()) {
+            out << *frame.function_name;
+        } else {
+            out << "<unknown>";
+        }
+        out << " pc=" << frame.pc << " source=";
+        if (frame.source_position.has_value()) {
+            out << frame.source_position->line << ":"
+                << frame.source_position->column;
+        } else {
+            out << "<unknown>";
+        }
+        out << "\n";
+    }
+    return out.str();
+}
+
 void run_example(const std::string& name) {
     const std::string base = std::string(LANG_EXAMPLES_DIR) + "/" + name;
     const auto source = read_file(base + ".lang");
@@ -72,8 +103,24 @@ void run_example(const std::string& name) {
     for (const auto& [schedule_name, stress] : schedules) {
         lang::VM vm;
         vm.set_gc_stress(stress);
-        (void)vm.execute(*compiled.verified_module);
-        const std::string actual(vm.output().begin(), vm.output().end());
+        std::string actual;
+        if (name == "diagnostics_showcase") {
+            bool trapped = false;
+            try {
+                (void)vm.execute(*compiled.verified_module);
+            } catch (const std::exception& error) {
+                trapped = true;
+                actual = render_runtime_failure(
+                    error, vm.last_trap_trace());
+            }
+            if (!trapped) {
+                throw std::runtime_error(
+                    "diagnostics showcase unexpectedly succeeded");
+            }
+        } else {
+            (void)vm.execute(*compiled.verified_module);
+            actual.assign(vm.output().begin(), vm.output().end());
+        }
         if (actual != expected) {
             throw std::runtime_error(
                 "example output mismatch: " + name + " schedule=" + schedule_name +

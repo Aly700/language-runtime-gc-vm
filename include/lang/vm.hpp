@@ -37,6 +37,9 @@ public:
     [[nodiscard]] gc::StressConfig gc_stress_config() const { return gc_stress_; }
     void trace_roots(gc::RootVisitor& visitor) override;
     [[nodiscard]] const std::vector<std::uint8_t>& output() const { return output_; }
+    [[nodiscard]] const std::optional<RuntimeTrace>& last_trap_trace() const noexcept {
+        return last_trap_trace_;
+    }
 
     [[nodiscard]] const gc::Heap& heap() const { return heap_; }
     [[nodiscard]] gc::Heap& heap() { return heap_; }
@@ -68,8 +71,15 @@ private:
                     std::optional<Value> closure = std::nullopt);
     void reuse_frame_for_tail_call(const Module& module, Frame& frame,
                                    std::size_t function_index);
+    [[nodiscard]] RuntimeTrace capture_runtime_trace(
+        const Module& module, std::size_t active_function_index,
+        std::size_t active_pc, RuntimeFailureKind kind,
+        std::optional<std::string> exception_variant = std::nullopt) const;
     std::vector<Frame> frames_;
     std::optional<Value> pending_exception_;
+    // Deliberately absent from trace_roots: this owns copied host/plain data
+    // only and can neither dangle after movement nor extend heap liveness.
+    std::optional<RuntimeTrace> last_trap_trace_;
     gc::Heap heap_;
     gc::StressConfig gc_stress_{};
     std::uint64_t instructions_executed_{0};

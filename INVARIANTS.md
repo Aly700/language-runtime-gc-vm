@@ -68,6 +68,17 @@
   the in-flight exception is exactly one mutable `pending_exception_` root. Moving
   collection rewrites it and every surviving frame root before another frame is removed
   or a handler resumes.
+- Every terminal runtime trap or uncaught typed exception captures one deterministic
+  diagnostic trace before failure cleanup can erase its state. Frames are ordered
+  innermost to outermost; the active frame reports the dispatched pc, while suspended
+  callers report their `Call`/`CallClosure` pc rather than the stored return continuation.
+  TailCall frame reuse reports only the current callee and deliberately truncates the
+  reused caller's history.
+- Runtime traces own only function indexes, pcs, copied host names, optional copied
+  line/column positions, and an optional copied exception-variant name. Their public types
+  cannot name `Value`, `ObjectId`, `Heap`, or collector state; the coordinate leaves are
+  structurally asserted plain data. Traces are absent from `trace_roots`, so capture can
+  neither dangle after movement nor retain, forward, or extend the liveness of any object.
 - VM observable behavior must not depend on host pointer addresses.
 - The VM output buffer is execution-local copied byte state, never a heap root. Its
   contents are a pure function of the verified module and its inputs and must be
@@ -339,6 +350,11 @@
   closure layout whose ordered capture types and derived bitmap agree exactly. Function
   arrays must use `RefArray`, and closure-valued stack slots must carry the existing precise
   object-root bit.
+- Every frontend-emitted bytecode pc has one deterministic side-table source position, and
+  every frontend-emitted function has a deterministic module name. Ordinary declarations
+  use their source name, lambdas use their token position, and monomorphized functions keep
+  their canonical mangled name while mapping pcs back to cloned generic-template
+  positions. These append-only fields are not verifier inputs.
 
 - `str` values compile to the distinct verifier `Str` kind and runtime `ObjectKind::Str`.
   Literals decode into the per-module constant pool; concat, equality, length, and byte
@@ -410,6 +426,10 @@
 - A test that passes with GC disabled is not sufficient for runtime correctness.
 - Differential fuzz executions compare two independent observables across schedules: the
   canonical returned heap graph/value and the VM output byte log. Both must match exactly.
+- When a generated execution deliberately traps, the shared fuzz outcome additionally
+  compares the complete optional runtime trace as a third schedule oracle. This is
+  additive: successful corpus graph/output bytes and every pinned corpus stream remain
+  unchanged.
 - The isolated 32-seed `tailcalls` source corpus runs both observables under all 15
   schedules and has its own pinned source/outcome snapshots and corpus dump. Its mutants
   must prove that syntax, direct-target, tail-position, and return-signature gates are

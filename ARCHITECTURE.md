@@ -1,5 +1,11 @@
 # Architecture — Language Runtime
 
+Iteration 45 adds deterministic runtime diagnostics as a side channel. Frontend functions
+carry append-only names and per-pc line/column tables; terminal traps and uncaught typed
+exceptions copy the complete normalized frame stack before cleanup. The trace contains no
+heap value or object ID, so it is GC-neutral, and existing exception/output bytes remain
+unchanged. See [ADR-0021](adr/0021-deterministic-runtime-diagnostics.md).
+
 Iteration 44 adds explicit `intern(str) -> str` through append-only `StrIntern` and a
 collector-owned weak intern table. Equal bytes share one canonical object while that
 canonical is live, but table entries never extend liveness. Content-derived FNV lookup,
@@ -301,7 +307,10 @@ control remains deferred.
   map layout records complete structural key/value types plus the exactly-derived
   key-reference and value-reference flags. Each closure layout names
   its function body, repeats the body's structural function type, lists capture types in
-  slot order, and carries the exactly-derived object-reference bitmap.
+  slot order, and carries the exactly-derived object-reference bitmap. Each function also
+  has append-only verifier-inert debug data: a name string and a vector whose index maps
+  bytecode pc to source line/column. Frontend tables cover every pc; hand-built modules
+  may omit them without affecting verification or execution.
 - `lang::VerifiedModule` is the immutable execution proof for module bytecode. It is
   constructible only through `verify_module_with_diagnostics`, `verify_module`, or the
   frontend compiler path, all of which first run the module verifier, attach the generated
@@ -346,6 +355,12 @@ control remains deferred.
   `VM::kMaxOutputBytes` limit is 1 MiB, and an append that would exceed it traps at the
   `Print` pc with `output buffer overflow`. Because the vector contains copied bytes, it is
   absent from `trace_roots`; no collection path can visit or rewrite it.
+- `lang::VM` owns one optional terminal `RuntimeTrace`, exposed read-only through
+  `VM::last_trap_trace()`. It is cleared before execution and contains copied names,
+  indexes, pcs, and positions only. Ordinary failure capture runs before incremental-phase
+  cleanup. Uncaught typed exceptions take a candidate snapshot before iterative unwind
+  removes frames and publish it only if no handler resumes. The trace and module metadata
+  do not participate in root tracing, heap validation, barriers, or verifier semantics.
 - `VM::execute(const Module&)` and `VM::execute(const Function&)` remain compatibility
   entry points for deliberate raw bytecode tests and always verify before bytecode
   dispatch. They increment `VMMetrics::raw_module_executions` or
@@ -518,6 +533,11 @@ control remains deferred.
   graphs with observable sharing. Both canonical-graph and output oracles agree for all
   15 schedules (480 executions), and four positioned mutants reject i64, bool, pair, and
   nil operands. All 21 legacy corpus generators remain byte-identical.
+- Iteration 45 appends an optional terminal trace to the shared fuzz outcome. Successful
+  executions retain the canonical graph/value and output-byte oracles; deliberately
+  trapping executions additionally require complete trace equality. A focused matrix
+  covers ten trap families for all 15 schedules without adding or changing a corpus
+  generator, source dump, outcome pin, or benchmark counter.
 
 ## Performance measurement
 
@@ -591,6 +611,13 @@ Call depth is checked by an explicit `VM::set_max_call_depth` limit before pushi
 so recursion traps deterministically with a VM error instead of depending on the host C++
 stack.
 
+Runtime diagnostics normalize the representation boundary. The active frame reports the
+pc snapshotted before dispatch. Suspended callers have already advanced to their return
+continuation, so their diagnostic pc is one instruction earlier: the direct or closure
+call site. The public order is innermost-to-outermost. A TailCall has overwritten the
+current frame; its old caller is absent by design, preserving constant-space execution
+rather than maintaining a diagnostic shadow stack.
+
 `TailCall` uses the same per-frame representation but never creates a continuation. Its
 verified boundary stack contains exactly the outgoing arguments. Before the ordinary
 instruction-boundary assertion and stress machinery run, the VM sets all old locals to
@@ -639,6 +666,11 @@ Compiler accommodations for verifier strictness:
   have independent complete signatures and layout facts. Compiler entry asserts no
   frontend type parameter survives, and every instance is included in the same module
   verification and generated-stack-map round trip.
+- Debug boundaries: every instruction append also appends the current restored source
+  position. Function 0 is `<entry>`, declarations use source names, lambdas use
+  `<lambda@LINE:COLUMN>`, and concrete generic clones retain their canonical mangled names.
+  Clone AST positions come from the template, so generic runtime frames point into the
+  generic declaration body rather than the first requesting call.
 - Tail boundaries: `return tail f(args);` emits its arguments left-to-right followed by
   one terminal `TailCall <callee>`, with no `Call` or `Return` on that path. The frontend
   requires a direct named function and exact enclosing/callee return-type equality; the
@@ -963,6 +995,12 @@ remembered-set entries.
   Conversion allocations use the ordinary rooted string-allocation path. Output storage
   is not traced, forwarded, barriered, or validated by the heap, so collection scheduling
   cannot affect the emitted log.
+- Diagnostic determinism: frontend debug tables depend only on source-ordered emission,
+  and terminal capture reads the explicit frame vector in reverse order using fixed pc
+  normalization. `RuntimeTrace` has no `Value`/`ObjectId` dependency and is absent from
+  root tracing. The same trapping module therefore yields equal failure kind, variant,
+  frame order, names, indexes, pcs, and positions under all fifteen stress schedules
+  without changing exception or output bytes.
 
 ## Verifier join lattice
 
