@@ -11,6 +11,7 @@ add_library(lang_runtime
     src/vm.cpp
     src/frontend/compiler.cpp
     src/frontend/diagnostics.cpp
+    src/frontend/generics.cpp
     src/frontend/lexer.cpp
     src/frontend/parser.cpp
     src/frontend/type_checker.cpp
@@ -146,6 +147,15 @@ add_executable(lang_iteration40_map_lookup
     tests/iteration40_map_lookup.cpp)
 target_link_libraries(lang_iteration40_map_lookup PRIVATE lang_runtime)
 
+add_executable(lang_iteration41_generics
+    tests/iteration41_generics.cpp)
+target_link_libraries(lang_iteration41_generics PRIVATE lang_runtime)
+
+add_executable(lang_iteration41_generics_fuzz
+    tests/iteration41_generics_fuzz.cpp)
+target_link_libraries(
+    lang_iteration41_generics_fuzz PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -200,5 +210,9 @@ add_test(NAME lang_iteration39_tail_calls_fuzz
     COMMAND lang_iteration39_tail_calls_fuzz)
 add_test(NAME lang_iteration40_map_lookup
     COMMAND lang_iteration40_map_lookup)
+add_test(NAME lang_iteration41_generics
+    COMMAND lang_iteration41_generics)
+add_test(NAME lang_iteration41_generics_fuzz
+    COMMAND lang_iteration41_generics_fuzz)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

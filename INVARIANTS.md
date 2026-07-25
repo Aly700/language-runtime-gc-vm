@@ -278,6 +278,30 @@
   inside a function or lambda and outside an active try body, and `f` must be a directly
   named function whose argument and complete return types match. `return` is reserved;
   `tail` remains a contextual identifier so legacy uses of that name are unchanged.
+- Generic declarations `fn name<T, U>(...) -> ... { ... }` are frontend templates, not
+  module functions. `TypeSpec::TypeParameter` must be eliminated by a complete concrete
+  substitution before function indexing, bytecode signature emission, layout emission,
+  verifier invocation, or VM execution. A generic template cannot be used as a
+  first-class value.
+- An omitted generic type tuple is inferred only by deterministic first-order matching
+  from argument types. Every type parameter must receive one unambiguous equal concrete
+  binding; missing, nil-only, or conflicting evidence is rejected with an explicit-type-
+  argument fallback. Inference never depends on an expected return type or nominal
+  unfolding.
+- Every first-use generic clone must pass the same concrete type-resolution restrictions
+  and flow-sensitive checker as an ordinary declaration. This includes restrictions
+  deferred at the template for direct `map<K, V>`, `weak<T>`, and
+  `ephemeron<K, V>` positions. Every clone then participates in the ordinary
+  compiler/verifier stack-map agreement round trip.
+- Generic instantiation keys are canonical concrete type tuples plus declaration
+  identity. Lookup and allocation are insertion ordered: original non-generic functions
+  keep their indices, new instances are checked depth-first in left-to-right first-use
+  order, and an equal key shares one index and body. Registry lookup must close existing
+  self/mutual cycles before the deterministic depth-32 new-key limit is applied.
+- Concrete instantiation must preserve representation precision rather than erase or box:
+  scalar and reference array opcodes, closure capture bits, complete pair signatures, and
+  nominal record/variant layout identities are derived independently for each concrete
+  clone. No type variable or conservative root may cross the compile boundary.
 - Structural `fn(T1, ..., Tn) -> R` types must survive the compile boundary in locals,
   parameters, returns, pair fields, record fields, and reference-array elements. Lambda
   captures are immutable creation-time snapshots in deterministic first-use order; later
@@ -356,3 +380,8 @@
   schedules and has its own pinned source/outcome snapshots and corpus dump. Its mutants
   must prove that syntax, direct-target, tail-position, and return-signature gates are
   non-vacuous without changing any legacy corpus stream.
+- The isolated 32-seed `generics` source corpus runs both observables under all 15
+  schedules, reverifies every concrete function set, and has independent source,
+  graph/output, and exact corpus pins. Its 12 mutants cover inference, explicit arity,
+  first-class misuse, instantiation-site body restrictions, invalid concrete container
+  parameters, and polymorphic recursion without changing any of the 19 legacy streams.

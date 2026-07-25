@@ -1,9 +1,10 @@
 # Language Runtime: Verified Bytecode and Precise Moving GC
 
-Wave 3 is complete, and explicit verifier-checked tail calls now reuse VM frames without
-weakening its collector contract. Records, sum types and match, exceptions, ephemerons,
-deterministic incremental marking, and deterministic incremental compaction all run under
-the same precise moving collector.
+Wave 3 is complete, and source-level generic functions now monomorphize entirely in the
+frontend. Every used type tuple becomes ordinary verifier-checked bytecode, so explicit
+tail-call frame reuse, records, sum types and match, exceptions, ephemerons, deterministic
+incremental marking, and deterministic incremental compaction all retain the same precise
+moving-collector contract.
 
 This repository is a correctness-first implementation of a small statically typed
 language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
@@ -36,6 +37,17 @@ cannot make an unreadable local readable or turn a maybe-object slot into a scal
 The VM traces mutable slots in every active and suspended frame and rewrites them before
 execution resumes. See [INVARIANTS.md](INVARIANTS.md#vm) and
 [ARCHITECTURE.md](ARCHITECTURE.md#protected-invariants).
+
+### Generic function monomorphization
+
+`fn id<T>(value: T) -> T { value }` can be called explicitly as `id<i64>(5)` or
+with unambiguous argument-based inference as `id(5)`. The frontend deterministically
+deep-clones each first-used concrete tuple, shares equal tuples, checks every clone with
+the existing flow-sensitive checker, and gives it an ordinary direct function index.
+The verifier, VM, heap, and collector never see a type variable. A stable depth-32 guard
+rejects unbounded polymorphic recursion while equal self and mutual recursion close on
+the existing instance. See
+[ADR 0018](adr/0018-generic-functions-via-monomorphization.md).
 
 ### Tail-call frame reuse
 
@@ -176,7 +188,8 @@ The language includes:
   variants with immutable tagged cases and exhaustive matching, scalar/reference
   arrays, insertion-order maps, weak references, and structural function types;
 - named functions, recursion, first-class function values, returned lambdas, and
-  immutable capture snapshots; explicit direct `return tail f(args);` supports
+  immutable capture snapshots; generic function templates support explicit or inferred
+  concrete type arguments, while explicit direct `return tail f(args);` supports
   constant-frame self and mutual recursion;
 - local, pair-field, record-field, array-element, and map-entry assignment;
 - `if`/`else`, `while`, array/map/range `for-in`, and nearest-loop `break`/`continue`;
@@ -185,10 +198,10 @@ The language includes:
 - deterministic bounded `print(str)` output captured by the VM rather than written to a
   host stream.
 
-Seven executable programs live in [examples](examples): a named recursive linked list,
+Eight executable programs live in [examples](examples): a named recursive linked list,
 a capture-snapshot accumulator factory, insertion-order word frequencies, a higher-order
 array pipeline, string/conversion tools, a recursive record showcase, and a recursive
-variant showcase. Each `.lang` file
+variant showcase, plus a generic monomorphization showcase. Each `.lang` file
 has a byte-pinned `.expected` output. `lang_examples` compiles every file and runs it under
 both no stress and maximum combined major/minor/allocation/barrier stress.
 
@@ -205,7 +218,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The acceptance gate contains 41 CTest targets.
+The acceptance gate contains 44 CTest targets.
 
 Run only the executable documentation:
 
@@ -218,8 +231,9 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 19 isolated deterministic positive corpora. Shared source grammars run under
-the same 15 schedules without changing any legacy generated program bytes:
+The suite has 20 isolated deterministic positive corpora. The new `generics` stream is
+isolated, and all 19 legacy source/bytecode streams remain byte-identical. Shared source
+grammars run under the same 15 schedules:
 
 - `no_stress`
 - `before_every_alloc`
@@ -238,11 +252,12 @@ liveness expectations because clearing is intentionally observable. Generated so
 bytecode are constructive and deterministic; each grammar has its own corpus dump and an
 embedded pinned representative snapshot.
 
-Negative testing applies 61 positioned mutation forms across fixed seed sets, for 1,078
+Negative testing applies 73 positioned mutation forms across fixed seed sets, for 1,462
 frontend rejection checks. The operators cover type errors, undefined values, arity and
 return mismatches, missing nil refinement, invalid container operations, closure misuse,
 map key/value errors, weak-target errors, loop-control errors, conversion errors, and
-substring/ordering and nominal-record errors, plus invalid tail position and targets.
+substring/ordering and nominal-record errors, plus invalid tail position/targets and
+generic inference, concrete-instantiation, and polymorphic-recursion failures.
 
 Run every corpus through CTest with the build command above. Run the fuzz executables
 directly to see their per-corpus summaries:
@@ -261,6 +276,7 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration36_ephemerons_fuzz
 ./build/lang_iteration38_incremental_compaction_fuzz
 ./build/lang_iteration39_tail_calls_fuzz
+./build/lang_iteration41_generics_fuzz
 ```
 
 ### Replay by grammar
@@ -288,6 +304,7 @@ Use one of the schedule names above.
 | source `ephemerons` | 32 | `./build/lang_iteration36_ephemerons_fuzz --seed N --schedule INDEX` | six fixed type mutants |
 | source `incremental_compaction` | 32 | `./build/lang_iteration38_incremental_compaction_fuzz --grammar incremental_compaction --seed N --schedule NAME` | `./build/lang_iteration38_incremental_compaction_fuzz --grammar incremental_compaction --seed N --mutant 0..3` |
 | source `tailcalls` | 32 | `./build/lang_iteration39_tail_calls_fuzz --grammar tailcalls --seed N --schedule NAME` | `./build/lang_iteration39_tail_calls_fuzz --grammar tailcalls --seed N --mutant 0..3` |
+| source `generics` | 32 | `./build/lang_iteration41_generics_fuzz --grammar generics --seed N --schedule NAME` | `./build/lang_iteration41_generics_fuzz --grammar generics --seed N --mutant 0..11` |
 
 For example:
 
@@ -318,12 +335,18 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration36_ephemerons_fuzz --dump-corpus ephemerons
 ./build/lang_iteration38_incremental_compaction_fuzz --dump-corpus incremental_compaction
 ./build/lang_iteration39_tail_calls_fuzz --dump-corpus tailcalls
+./build/lang_iteration41_generics_fuzz --dump-corpus generics
 ```
 
 The isolated `tailcalls` dump is pinned at SHA-256
 `72e0af127c314f7bfa4ceb3961170b452fc490e5ea9f31fcfb6643cddebeaf61`.
 It compares non-empty canonical graph and output oracles across all 15 schedules; four
 mutants prove the tail-position, direct-target, and return-signature gates are active.
+
+The isolated `generics` dump is pinned at SHA-256
+`8885efba70fb5788ae1486efd05453c46bf3a3e782bab73e801279b6778b350e`.
+Its 32 seeds compare non-empty canonical graph and output oracles across all 15 schedules,
+reverify every concrete function set, and run 12 positioned rejection mutants per seed.
 
 The generator design, oracle, schedules, and replay behavior are detailed in
 [docs/gc-stress-mode.md](docs/gc-stress-mode.md).
@@ -374,6 +397,9 @@ Timings remain informational; the exact counters, host context, and corpus proof
   recursion through a self-capture.
 - Tail calls are explicit and direct-only. There is no implicit `Call; Return`
   optimization or tail-call opcode for function values and closures.
+- Generic functions are monomorphized and direct-call-only as templates. Generic named
+  aliases, records, and variants are deferred until nominal recursive layout
+  instantiation has its own finite deterministic identity proof.
 - Weak-keyed maps, finalizers, resurrection, mutable weak targets, and user-visible
   finalization ordering are not implemented.
 - Loop control is unlabeled. Labeled loops and labeled `break`/`continue` require a label

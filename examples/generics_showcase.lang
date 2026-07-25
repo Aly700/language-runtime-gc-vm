@@ -1,0 +1,43 @@
+fn identity<T>(value: T) -> T {
+  value
+}
+
+fn package<T, U>(first: T, second: U) -> pair<[T], map<i64, U>> {
+  let values: [T] = [first];
+  let table: map<i64, U> = map<i64, U>();
+  table[0] = second;
+  pair(values, table)
+}
+
+fn getter<T>(value: T) -> fn() -> T {
+  fn() -> T { value }
+}
+
+fn relay<T>(count: i64, value: T) -> T {
+  if count < 1 {
+  } else {
+    return tail relay<T>(count + -1, value);
+  }
+  value
+}
+
+let first: i64 = identity<i64>(41);
+let second: i64 = identity(first + 1);
+let flag: bool = identity(true);
+let object: pair<i64, i64> = pair(17, 29);
+let packaged: pair<[i64], map<i64, pair<i64, i64>>> =
+  package<i64, pair<i64, i64>>(4294967296, object);
+let captured: fn() -> pair<i64, i64> = getter(object);
+let relayed: pair<i64, i64> = relay(12, captured());
+
+print(to_str(first));
+print(to_str(second));
+if flag {
+  print("inferred bool");
+} else {
+  print("unexpected");
+}
+print(to_str(packaged.left[0]));
+print(to_str(packaged.right[0].right));
+print(to_str(relayed.left));
+packaged

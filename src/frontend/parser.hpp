@@ -22,6 +22,7 @@ struct TypeSpec {
         Map,
         Weak,
         Ephemeron,
+        TypeParameter,
         Named,
         Record,
         Variant,
@@ -43,6 +44,7 @@ struct TypeSpec {
     std::optional<std::size_t> named_type_index;
     std::optional<std::size_t> record_layout_index;
     std::optional<std::size_t> variant_layout_index;
+    std::optional<std::size_t> type_parameter_index;
 
     [[nodiscard]] bool has_pair_fields() const {
         return kind == Kind::Pair && left != nullptr && right != nullptr;
@@ -81,6 +83,8 @@ TypeSpec function_type(std::vector<TypeSpec> parameters, TypeSpec result);
 TypeSpec map_type(TypeSpec key, TypeSpec value);
 TypeSpec weak_type(TypeSpec target);
 TypeSpec ephemeron_type(TypeSpec key, TypeSpec value);
+TypeSpec type_parameter_type(std::string name, std::size_t index,
+                             SourcePosition position);
 
 bool operator==(const TypeSpec& lhs, const TypeSpec& rhs);
 bool operator!=(const TypeSpec& lhs, const TypeSpec& rhs);
@@ -140,6 +144,8 @@ struct Expr {
     TypeSpec map_key_type{invalid_type()};
     TypeSpec map_value_type{invalid_type()};
     std::vector<std::unique_ptr<Expr>> arguments;
+    std::vector<TypeSpec> explicit_type_arguments;
+    SourcePosition type_arguments_position;
     std::vector<std::string> field_names;
     std::vector<SourcePosition> field_positions;
     TypeSpec inferred_type{invalid_type()};
@@ -272,9 +278,16 @@ struct LambdaExpr {
     std::uint32_t local_count{0};
 };
 
+struct TypeParameterDecl {
+    std::string name;
+    SourcePosition position;
+    std::size_t index{0};
+};
+
 struct FunctionDecl {
     std::string name;
     SourcePosition position;
+    std::vector<TypeParameterDecl> type_parameters;
     std::vector<Parameter> parameters;
     TypeSpec return_type{invalid_type()};
     std::vector<Statement> statements;
@@ -282,6 +295,7 @@ struct FunctionDecl {
     std::size_t function_index{0};
     std::size_t closure_layout_index{0};
     std::uint32_t local_count{0};
+    std::size_t declaration_order{0};
 };
 
 struct TypeDecl {
@@ -323,6 +337,7 @@ struct Program {
     std::vector<RecordDecl> records;
     std::vector<VariantDecl> variants;
     std::vector<FunctionDecl> functions;
+    std::vector<FunctionDecl> generic_functions;
     std::vector<std::shared_ptr<LambdaExpr>> lambdas;
     std::vector<Statement> statements;
     std::unique_ptr<Expr> result;
