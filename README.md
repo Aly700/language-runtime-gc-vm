@@ -1,7 +1,8 @@
 # Language Runtime: Verified Bytecode and Precise Moving GC
 
-Wave 3 is complete, and source-level generic functions now monomorphize entirely in the
-frontend. Every used type tuple becomes ordinary verifier-checked bytecode, so explicit
+Wave 3 is complete, and source-level generic functions plus generic named aliases,
+records, and variants now monomorphize entirely in the frontend. Every used concrete tuple
+becomes ordinary verifier-checked bytecode and ordinary exact layouts, so explicit
 tail-call frame reuse, records, sum types and match, exceptions, ephemerons, deterministic
 incremental marking, and deterministic incremental compaction all retain the same precise
 moving-collector contract.
@@ -48,6 +49,24 @@ The verifier, VM, heap, and collector never see a type variable. A stable depth-
 rejects unbounded polymorphic recursion while equal self and mutual recursion close on
 the existing instance. See
 [ADR 0018](adr/0018-generic-functions-via-monomorphization.md).
+
+### Generic named type monomorphization
+
+Named aliases, records, and variants may declare type parameters:
+
+```text
+type List<T> = pair<T, List<T>>;
+record Node<T> { value: T, next: Node<T> }
+variant Option<T> { None(), Some(T) }
+```
+
+Applications such as `Node<i64>`, `Node<str>`, and
+`Option<List<pair<i64, str>>>` are demand-instantiated, shared by canonical concrete key,
+and emitted as ordinary concrete declarations. Same-key structural recursion closes on
+the reserved identity; genuinely growing keys reach the shared depth-32 guard. Record
+field and variant-case reference maps are derived independently for each concrete
+instance, so scalar payload bits stay opaque and object payloads remain precisely traced.
+See [ADR 0019](adr/0019-generic-named-types-via-monomorphization.md).
 
 ### Tail-call frame reuse
 
@@ -185,8 +204,9 @@ The language includes:
 
 - `i64`, `bool`, immutable byte `str`, typed and opaque pairs, nullable named recursive
   pair types, nominal recursive records with ordered mutable fields, nominal recursive
-  variants with immutable tagged cases and exhaustive matching, scalar/reference
-  arrays, insertion-order maps, weak references, and structural function types;
+  variants with immutable tagged cases and exhaustive matching, plus generic templates
+  for all three named declaration forms; scalar/reference arrays, insertion-order maps,
+  weak references, and structural function types;
 - named functions, recursion, first-class function values, returned lambdas, and
   immutable capture snapshots; generic function templates support explicit or inferred
   concrete type arguments, while explicit direct `return tail f(args);` supports
@@ -198,12 +218,13 @@ The language includes:
 - deterministic bounded `print(str)` output captured by the VM rather than written to a
   host stream.
 
-Eight executable programs live in [examples](examples): a named recursive linked list,
+Nine executable programs live in [examples](examples): a named recursive linked list,
 a capture-snapshot accumulator factory, insertion-order word frequencies, a higher-order
 array pipeline, string/conversion tools, a recursive record showcase, and a recursive
-variant showcase, plus a generic monomorphization showcase. Each `.lang` file
-has a byte-pinned `.expected` output. `lang_examples` compiles every file and runs it under
-both no stress and maximum combined major/minor/allocation/barrier stress.
+variant showcase, a generic-function showcase, and a recursive generic-type showcase.
+Each `.lang` file has a byte-pinned `.expected` output. `lang_examples` compiles every
+file and runs it under both no stress and maximum combined
+major/minor/allocation/barrier stress.
 
 Weak clearing is not presented as a source example because the language has no explicit
 collection primitive and [ADR 0005](adr/0005-weak-references.md) makes clearing
@@ -218,7 +239,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The acceptance gate contains 44 CTest targets.
+The acceptance gate contains 46 CTest targets.
 
 Run only the executable documentation:
 
@@ -231,9 +252,9 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 20 isolated deterministic positive corpora. The new `generics` stream is
-isolated, and all 19 legacy source/bytecode streams remain byte-identical. Shared source
-grammars run under the same 15 schedules:
+The suite has 21 isolated deterministic positive corpora. The new `generic-types` stream
+is isolated, and all 20 legacy source/bytecode streams remain byte-identical. Shared
+source grammars run under the same 15 schedules:
 
 - `no_stress`
 - `before_every_alloc`
@@ -252,12 +273,13 @@ liveness expectations because clearing is intentionally observable. Generated so
 bytecode are constructive and deterministic; each grammar has its own corpus dump and an
 embedded pinned representative snapshot.
 
-Negative testing applies 73 positioned mutation forms across fixed seed sets, for 1,462
+Negative testing applies 85 positioned mutation forms across fixed seed sets, for 1,846
 frontend rejection checks. The operators cover type errors, undefined values, arity and
 return mismatches, missing nil refinement, invalid container operations, closure misuse,
 map key/value errors, weak-target errors, loop-control errors, conversion errors, and
-substring/ordering and nominal-record errors, plus invalid tail position/targets and
-generic inference, concrete-instantiation, and polymorphic-recursion failures.
+substring/ordering and nominal-record errors, plus invalid tail position/targets, generic
+inference and concrete instantiation, unbound generic type parameters, growing type
+recursion, nominal separation, payload typing, and generic-variant exhaustiveness.
 
 Run every corpus through CTest with the build command above. Run the fuzz executables
 directly to see their per-corpus summaries:
@@ -277,6 +299,7 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration38_incremental_compaction_fuzz
 ./build/lang_iteration39_tail_calls_fuzz
 ./build/lang_iteration41_generics_fuzz
+./build/lang_iteration42_generic_types_fuzz
 ```
 
 ### Replay by grammar
@@ -305,6 +328,7 @@ Use one of the schedule names above.
 | source `incremental_compaction` | 32 | `./build/lang_iteration38_incremental_compaction_fuzz --grammar incremental_compaction --seed N --schedule NAME` | `./build/lang_iteration38_incremental_compaction_fuzz --grammar incremental_compaction --seed N --mutant 0..3` |
 | source `tailcalls` | 32 | `./build/lang_iteration39_tail_calls_fuzz --grammar tailcalls --seed N --schedule NAME` | `./build/lang_iteration39_tail_calls_fuzz --grammar tailcalls --seed N --mutant 0..3` |
 | source `generics` | 32 | `./build/lang_iteration41_generics_fuzz --grammar generics --seed N --schedule NAME` | `./build/lang_iteration41_generics_fuzz --grammar generics --seed N --mutant 0..11` |
+| source `generic-types` | 32 | `./build/lang_iteration42_generic_types_fuzz --grammar generic-types --seed N --schedule NAME` | `./build/lang_iteration42_generic_types_fuzz --grammar generic-types --seed N --mutant 0..11` |
 
 For example:
 
@@ -336,6 +360,7 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration38_incremental_compaction_fuzz --dump-corpus incremental_compaction
 ./build/lang_iteration39_tail_calls_fuzz --dump-corpus tailcalls
 ./build/lang_iteration41_generics_fuzz --dump-corpus generics
+./build/lang_iteration42_generic_types_fuzz --dump-corpus generic-types
 ```
 
 The isolated `tailcalls` dump is pinned at SHA-256
@@ -347,6 +372,12 @@ The isolated `generics` dump is pinned at SHA-256
 `8885efba70fb5788ae1486efd05453c46bf3a3e782bab73e801279b6778b350e`.
 Its 32 seeds compare non-empty canonical graph and output oracles across all 15 schedules,
 reverify every concrete function set, and run 12 positioned rejection mutants per seed.
+
+The isolated `generic-types` dump is pinned at SHA-256
+`ecabdcc1db804f0a9021b8d2a040f6b5fbbf22a9f8d7fcde348a670dc9552ca1`.
+Its 32 seeds compare non-empty canonical graph and output oracles across all 15 schedules,
+reverify every concrete module and exact layout family, and run 12 positioned rejection
+mutants per seed.
 
 The generator design, oracle, schedules, and replay behavior are detailed in
 [docs/gc-stress-mode.md](docs/gc-stress-mode.md).
@@ -398,8 +429,8 @@ Timings remain informational; the exact counters, host context, and corpus proof
 - Tail calls are explicit and direct-only. There is no implicit `Call; Return`
   optimization or tail-call opcode for function values and closures.
 - Generic functions are monomorphized and direct-call-only as templates. Generic named
-  aliases, records, and variants are deferred until nominal recursive layout
-  instantiation has its own finite deterministic identity proof.
+  types are likewise first-order, invariant templates: there are no higher-kinded
+  parameters, generic values, runtime type arguments, or first-class generic functions.
 - Weak-keyed maps, finalizers, resurrection, mutable weak targets, and user-visible
   finalization ordering are not implemented.
 - Loop control is unlabeled. Labeled loops and labeled `break`/`continue` require a label

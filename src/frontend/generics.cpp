@@ -31,6 +31,7 @@ TypeSpec substitute_type(const TypeSpec& type,
     result.weak_target.reset();
     result.function_parameters.clear();
     result.function_return.reset();
+    result.generic_arguments.clear();
     if (type.left != nullptr) {
         result.left = std::make_shared<TypeSpec>(
             substitute_type(*type.left, arguments));
@@ -63,6 +64,11 @@ TypeSpec substitute_type(const TypeSpec& type,
     if (type.function_return != nullptr) {
         result.function_return = std::make_shared<TypeSpec>(
             substitute_type(*type.function_return, arguments));
+    }
+    result.generic_arguments.reserve(type.generic_arguments.size());
+    for (const auto& argument : type.generic_arguments) {
+        result.generic_arguments.push_back(
+            substitute_type(argument, arguments));
     }
     return result;
 }
@@ -468,6 +474,11 @@ bool contains_type_parameter(const TypeSpec& type) {
             return true;
         }
     }
+    for (const auto& argument : type.generic_arguments) {
+        if (contains_type_parameter(argument)) {
+            return true;
+        }
+    }
     return type.function_return != nullptr &&
            contains_type_parameter(*type.function_return);
 }
@@ -497,6 +508,19 @@ std::string mangle_generic_function_name(
     const std::string& name, std::span<const TypeSpec> arguments) {
     return name + "$mono$" +
            canonical_type_argument_tuple_key(arguments);
+}
+
+std::string render_generic_type_name(
+    const std::string& name, std::span<const TypeSpec> arguments) {
+    std::string result = name + "<";
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        if (i != 0) {
+            result += ", ";
+        }
+        result += type_name(arguments[i]);
+    }
+    result += ">";
+    return result;
 }
 
 FunctionDecl instantiate_generic_function(
@@ -529,6 +553,70 @@ FunctionDecl instantiate_generic_function(
     }
     if (declaration.result != nullptr) {
         result.result = clone_expr(*declaration.result, arguments);
+    }
+    return result;
+}
+
+TypeDecl instantiate_generic_type(
+    const TypeDecl& declaration, std::span<const TypeSpec> arguments) {
+    if (declaration.type_parameters.size() != arguments.size()) {
+        throw std::logic_error(
+            "generic type instantiation argument count mismatch");
+    }
+    TypeDecl result;
+    result.name =
+        mangle_generic_function_name(declaration.name, arguments);
+    result.position = declaration.position;
+    result.body_position = declaration.body_position;
+    result.body = substitute_type(declaration.body, arguments);
+    result.declaration_order = declaration.declaration_order;
+    return result;
+}
+
+RecordDecl instantiate_generic_record(
+    const RecordDecl& declaration, std::span<const TypeSpec> arguments) {
+    if (declaration.type_parameters.size() != arguments.size()) {
+        throw std::logic_error(
+            "generic record instantiation argument count mismatch");
+    }
+    RecordDecl result;
+    result.name =
+        mangle_generic_function_name(declaration.name, arguments);
+    result.position = declaration.position;
+    result.declaration_order = declaration.declaration_order;
+    result.fields.reserve(declaration.fields.size());
+    for (const auto& source_field : declaration.fields) {
+        RecordFieldDecl field;
+        field.name = source_field.name;
+        field.position = source_field.position;
+        field.type = substitute_type(source_field.type, arguments);
+        result.fields.push_back(std::move(field));
+    }
+    return result;
+}
+
+VariantDecl instantiate_generic_variant(
+    const VariantDecl& declaration, std::span<const TypeSpec> arguments) {
+    if (declaration.type_parameters.size() != arguments.size()) {
+        throw std::logic_error(
+            "generic variant instantiation argument count mismatch");
+    }
+    VariantDecl result;
+    result.name =
+        mangle_generic_function_name(declaration.name, arguments);
+    result.position = declaration.position;
+    result.declaration_order = declaration.declaration_order;
+    result.cases.reserve(declaration.cases.size());
+    for (const auto& source_case : declaration.cases) {
+        VariantCaseDecl variant_case;
+        variant_case.name = source_case.name;
+        variant_case.position = source_case.position;
+        variant_case.fields.reserve(source_case.fields.size());
+        for (const auto& source_field : source_case.fields) {
+            variant_case.fields.push_back(
+                substitute_type(source_field, arguments));
+        }
+        result.cases.push_back(std::move(variant_case));
     }
     return result;
 }

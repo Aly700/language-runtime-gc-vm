@@ -114,7 +114,16 @@ bool operator==(const TypeSpec& lhs, const TypeSpec& rhs) {
         if (lhs.named_type_index.has_value() && rhs.named_type_index.has_value()) {
             return lhs.named_type_index == rhs.named_type_index;
         }
-        return lhs.name == rhs.name;
+        if (lhs.name != rhs.name ||
+            lhs.generic_arguments.size() != rhs.generic_arguments.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < lhs.generic_arguments.size(); ++i) {
+            if (lhs.generic_arguments[i] != rhs.generic_arguments[i]) {
+                return false;
+            }
+        }
+        return true;
     }
     if (lhs.kind == TypeSpec::Kind::TypeParameter) {
         return lhs.type_parameter_index == rhs.type_parameter_index &&
@@ -278,11 +287,21 @@ std::string type_name(const TypeSpec& type) {
     case TypeSpec::Kind::TypeParameter:
         return type.name;
     case TypeSpec::Kind::Named:
-        return type.name;
     case TypeSpec::Kind::Record:
-        return type.name;
-    case TypeSpec::Kind::Variant:
-        return type.name;
+    case TypeSpec::Kind::Variant: {
+        if (type.generic_arguments.empty()) {
+            return type.name;
+        }
+        std::string rendered = type.name + "<";
+        for (std::size_t i = 0; i < type.generic_arguments.size(); ++i) {
+            if (i != 0) {
+                rendered += ", ";
+            }
+            rendered += type_name(type.generic_arguments[i]);
+        }
+        rendered += ">";
+        return rendered;
+    }
     case TypeSpec::Kind::Nil:
         return "nil";
     case TypeSpec::Kind::Invalid:
@@ -333,6 +352,19 @@ public:
                 tokens_[i + 2].kind == TokenKind::Less) {
                 generic_function_names_.insert(tokens_[i + 1].text);
             }
+            if (brace_depth == 0 &&
+                (tokens_[i].kind == TokenKind::Type ||
+                 tokens_[i].kind == TokenKind::Record ||
+                 tokens_[i].kind == TokenKind::Variant) &&
+                tokens_[i + 1].kind == TokenKind::Identifier &&
+                tokens_[i + 2].kind == TokenKind::Less) {
+                generic_nominal_names_.insert(tokens_[i + 1].text);
+                if (tokens_[i].kind == TokenKind::Record) {
+                    generic_record_names_.insert(tokens_[i + 1].text);
+                } else if (tokens_[i].kind == TokenKind::Variant) {
+                    generic_variant_names_.insert(tokens_[i + 1].text);
+                }
+            }
             if (tokens_[i].kind == TokenKind::LBrace) {
                 ++brace_depth;
             } else if (tokens_[i].kind == TokenKind::RBrace &&
@@ -350,21 +382,36 @@ public:
             if (match(TokenKind::Type)) {
                 auto declaration = parse_type_declaration(previous());
                 if (declaration.has_value()) {
-                    program.types.push_back(std::move(*declaration));
+                    if (declaration->type_parameters.empty()) {
+                        program.types.push_back(std::move(*declaration));
+                    } else {
+                        program.generic_types.push_back(
+                            std::move(*declaration));
+                    }
                 } else {
                     synchronize();
                 }
             } else if (match(TokenKind::Record)) {
                 auto declaration = parse_record_declaration(previous());
                 if (declaration.has_value()) {
-                    program.records.push_back(std::move(*declaration));
+                    if (declaration->type_parameters.empty()) {
+                        program.records.push_back(std::move(*declaration));
+                    } else {
+                        program.generic_records.push_back(
+                            std::move(*declaration));
+                    }
                 } else {
                     synchronize();
                 }
             } else if (match(TokenKind::Variant)) {
                 auto declaration = parse_variant_declaration(previous());
                 if (declaration.has_value()) {
-                    program.variants.push_back(std::move(*declaration));
+                    if (declaration->type_parameters.empty()) {
+                        program.variants.push_back(std::move(*declaration));
+                    } else {
+                        program.generic_variants.push_back(
+                            std::move(*declaration));
+                    }
                 } else {
                     synchronize();
                 }
@@ -475,19 +522,68 @@ private:
                tokens_[current_ + 2].kind == TokenKind::Colon;
     }
 
+    std::vector<TypeParameterDecl> parse_type_parameters(
+        const std::string& declaration_kind) {
+        std::vector<TypeParameterDecl> parameters;
+        if (!match(TokenKind::Less)) {
+            return parameters;
+        }
+        if (check(TokenKind::Greater)) {
+            add_diagnostic(
+                diagnostics_, peek().position,
+                "generic " + declaration_kind +
+                    " requires at least one type parameter");
+        } else {
+            do {
+                const auto parameter = expect(
+                    TokenKind::Identifier, "expected type parameter name");
+                if (parameter.has_value()) {
+                    parameters.push_back(TypeParameterDecl{
+                        parameter->text, parameter->position,
+                        parameters.size()});
+                }
+            } while (match(TokenKind::Comma));
+        }
+        expect(TokenKind::Greater,
+               "expected '>' after type parameters");
+        return parameters;
+    }
+
+    std::vector<TypeSpec> parse_type_arguments() {
+        std::vector<TypeSpec> arguments;
+        expect(TokenKind::Less, "expected '<' before type arguments");
+        if (check(TokenKind::Greater)) {
+            add_diagnostic(diagnostics_, peek().position,
+                           "generic type application requires at least one type argument");
+        } else {
+            do {
+                arguments.push_back(parse_type());
+            } while (match(TokenKind::Comma));
+        }
+        expect(TokenKind::Greater,
+               "expected '>' after type arguments");
+        return arguments;
+    }
+
     std::optional<TypeDecl> parse_type_declaration(const Token& type_token) {
         TypeDecl declaration;
         declaration.position = type_token.position;
+        declaration.declaration_order = next_type_declaration_order_++;
 
         const auto name = expect(TokenKind::Identifier, "expected type name after 'type'");
         if (name.has_value()) {
             declaration.name = name->text;
             declaration.position = name->position;
         }
+        declaration.type_parameters =
+            parse_type_parameters("type declaration");
+        const auto previous_type_parameters = active_type_parameters_;
+        active_type_parameters_ = declaration.type_parameters;
         expect(TokenKind::Equal, "expected '=' in type declaration");
         declaration.body_position = peek().position;
         declaration.body = parse_type();
         expect(TokenKind::Semicolon, "expected ';' after type declaration");
+        active_type_parameters_ = previous_type_parameters;
         return declaration;
     }
 
@@ -495,6 +591,7 @@ private:
         const Token& record_token) {
         RecordDecl declaration;
         declaration.position = record_token.position;
+        declaration.declaration_order = next_type_declaration_order_++;
         const auto name =
             expect(TokenKind::Identifier, "expected record name after 'record'");
         if (name.has_value()) {
@@ -502,6 +599,10 @@ private:
             declaration.position = name->position;
             record_names_.insert(name->text);
         }
+        declaration.type_parameters =
+            parse_type_parameters("record declaration");
+        const auto previous_type_parameters = active_type_parameters_;
+        active_type_parameters_ = declaration.type_parameters;
         expect(TokenKind::LBrace, "expected '{' before record fields");
         if (!check(TokenKind::RBrace)) {
             do {
@@ -518,6 +619,7 @@ private:
             } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
         }
         expect(TokenKind::RBrace, "expected '}' after record fields");
+        active_type_parameters_ = previous_type_parameters;
         return declaration;
     }
 
@@ -525,12 +627,17 @@ private:
         const Token& variant_token) {
         VariantDecl declaration;
         declaration.position = variant_token.position;
+        declaration.declaration_order = next_type_declaration_order_++;
         const auto name = expect(TokenKind::Identifier,
                                  "expected variant name after 'variant'");
         if (name.has_value()) {
             declaration.name = name->text;
             declaration.position = name->position;
         }
+        declaration.type_parameters =
+            parse_type_parameters("variant declaration");
+        const auto previous_type_parameters = active_type_parameters_;
+        active_type_parameters_ = declaration.type_parameters;
         expect(TokenKind::LBrace, "expected '{' before variant cases");
         if (!check(TokenKind::RBrace)) {
             do {
@@ -554,6 +661,7 @@ private:
             } while (match(TokenKind::Comma) && !check(TokenKind::RBrace));
         }
         expect(TokenKind::RBrace, "expected '}' after variant cases");
+        active_type_parameters_ = previous_type_parameters;
         return declaration;
     }
 
@@ -871,14 +979,20 @@ private:
             return type;
         }
         if (match(TokenKind::Identifier)) {
+            const auto identifier = previous();
+            if (check(TokenKind::Less)) {
+                auto type = named_type(identifier.text, identifier.position);
+                type.generic_arguments = parse_type_arguments();
+                return type;
+            }
             for (const auto& parameter : active_type_parameters_) {
-                if (parameter.name == previous().text) {
+                if (parameter.name == identifier.text) {
                     return type_parameter_type(
                         parameter.name, parameter.index,
-                        previous().position);
+                        identifier.position);
                 }
             }
-            return named_type(previous().text, previous().position);
+            return named_type(identifier.text, identifier.position);
         }
         add_diagnostic(diagnostics_, peek().position,
                        "expected type 'i64', 'bool', 'str', 'pair', 'map', function type, array type, or named type");
@@ -1405,6 +1519,47 @@ private:
             match(TokenKind::Right)) {
             const auto identifier = previous();
             if (identifier.kind == TokenKind::Identifier &&
+                generic_nominal_names_.contains(identifier.text) &&
+                check(TokenKind::Less)) {
+                auto type_arguments = parse_type_arguments();
+                if (generic_record_names_.contains(identifier.text) &&
+                    match(TokenKind::LBrace)) {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::RecordLiteral;
+                    node->position = identifier.position;
+                    node->name = identifier.text;
+                    node->explicit_type_arguments =
+                        std::move(type_arguments);
+                    if (!check(TokenKind::RBrace)) {
+                        do {
+                            const auto field = expect_field_name(
+                                "expected record initializer field name");
+                            if (field.has_value()) {
+                                node->field_names.push_back(field->text);
+                                node->field_positions.push_back(
+                                    field->position);
+                            }
+                            expect(
+                                TokenKind::Colon,
+                                "expected ':' after record initializer field name");
+                            node->arguments.push_back(parse_expression());
+                        } while (match(TokenKind::Comma) &&
+                                 !check(TokenKind::RBrace));
+                    }
+                    expect(
+                        TokenKind::RBrace,
+                        "expected '}' after record initializer fields");
+                    return node;
+                }
+                auto node = std::make_unique<Expr>();
+                node->kind = Expr::Kind::Variable;
+                node->position = identifier.position;
+                node->name = identifier.text;
+                node->explicit_type_arguments =
+                    std::move(type_arguments);
+                return node;
+            }
+            if (identifier.kind == TokenKind::Identifier &&
                 allow_record_literal_ && looks_like_record_literal(identifier) &&
                 match(TokenKind::LBrace)) {
                 auto node = std::make_unique<Expr>();
@@ -1526,8 +1681,12 @@ private:
     std::size_t current_{0};
     std::size_t next_pair_site_{0};
     std::size_t next_function_declaration_order_{0};
+    std::size_t next_type_declaration_order_{0};
     std::set<std::string> record_names_;
     std::set<std::string> generic_function_names_;
+    std::set<std::string> generic_nominal_names_;
+    std::set<std::string> generic_record_names_;
+    std::set<std::string> generic_variant_names_;
     std::vector<TypeParameterDecl> active_type_parameters_;
     std::vector<std::shared_ptr<LambdaExpr>> lambdas_;
     bool allow_record_literal_{true};

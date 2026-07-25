@@ -156,6 +156,16 @@ add_executable(lang_iteration41_generics_fuzz
 target_link_libraries(
     lang_iteration41_generics_fuzz PRIVATE lang_runtime)
 
+add_executable(lang_iteration42_generic_types
+    tests/iteration42_generic_types.cpp)
+target_link_libraries(
+    lang_iteration42_generic_types PRIVATE lang_runtime)
+
+add_executable(lang_iteration42_generic_types_fuzz
+    tests/iteration42_generic_types_fuzz.cpp)
+target_link_libraries(
+    lang_iteration42_generic_types_fuzz PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -214,5 +224,9 @@ add_test(NAME lang_iteration41_generics
     COMMAND lang_iteration41_generics)
 add_test(NAME lang_iteration41_generics_fuzz
     COMMAND lang_iteration41_generics_fuzz)
+add_test(NAME lang_iteration42_generic_types
+    COMMAND lang_iteration42_generic_types)
+add_test(NAME lang_iteration42_generic_types_fuzz
+    COMMAND lang_iteration42_generic_types_fuzz)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

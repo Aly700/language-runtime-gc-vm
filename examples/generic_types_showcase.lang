@@ -1,0 +1,65 @@
+type List<T> = pair<T, List<T>>;
+record Node<T> { value: T, next: Node<T> }
+variant Option<T> { None(), Some(T) }
+
+fn length<T>(items: List<T>) -> i64 {
+  let answer: i64 = 0;
+  if is_nil(items) {
+    answer = 0;
+  } else {
+    answer = 1 + length<T>(items.right);
+  }
+  answer
+}
+
+fn or_else<T>(item: Option<T>, fallback: T) -> T {
+  let answer: T = fallback;
+  if is_nil(item) {
+    answer = fallback;
+  } else {
+    match item {
+      None => { answer = fallback; },
+      Some(value) => { answer = value; }
+    }
+  }
+  answer
+}
+
+fn option_state<T>(item: Option<T>) -> str {
+  let answer: str = "nil";
+  if is_nil(item) {
+    answer = "nil";
+  } else {
+    match item {
+      None => { answer = "none"; },
+      Some(value) => { answer = "some"; }
+    }
+  }
+  answer
+}
+
+let numbers: List<i64> = nil;
+let i: i64 = 0;
+while i < 5 {
+  numbers = pair(i, numbers);
+  i = i + 1;
+}
+
+let words: Node<str> =
+    Node<str> { value: "initial", next: nil };
+if is_nil(words) {
+  print("head=nil");
+} else {
+  words.value = "updated";
+  print("head=" + words.value);
+}
+
+let choice: Option<i64> = Option<i64>.Some(42);
+let nested: Option<List<pair<i64, str>>> =
+    Option<List<pair<i64, str>>>.Some(
+        pair(pair(7, "seven"), nil));
+
+print("length=" + to_str(length(numbers)));
+print("choice=" + to_str(or_else(choice, 0)));
+print("nested=" + option_state(nested));
+nested
