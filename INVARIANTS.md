@@ -166,6 +166,23 @@
   their payload bits equal a live, dead, stale, or forwarded `ObjectId`. Descriptor shape
   validation requires the entry count to match the payload and every slot tag to agree
   with its static reference flag; reference values may carry `Object` or `Nil`.
+- The ordered map entry vector is the sole authority for payload, positional access,
+  tracing order, insertion-order iteration, and mutation-during-iteration entry-count
+  checks. Its deterministic lookup index stores only encoded entry-vector positions:
+  never a `Value`, `ObjectId`, pointer, handle, or owner. Index buckets are scalar metadata
+  outside both reference-edge categories; they may not mark, retain, forward, clear,
+  barrier, or validate a reference, and they do not change logical heap width.
+- Map hashes are fixed 64-bit FNV-1a over a domain byte plus an explicit content encoding:
+  eight little-endian `uint64_t` bytes for `i64`, canonical `0`/`1` for `bool`, and
+  immutable bytes for `str`. No object identity, slot, generation, address, host
+  endianness, library hash, random seed, clock, or process state may influence a bucket.
+  Hash collisions always fall back to the existing tagged/content equality.
+- Every map lookup index must be the exact deterministic half-load, power-of-two
+  open-addressing rebuild of its ordered entries. The coherence validator runs after
+  every map mutation and at every heap-layout/collection validation boundary, proving
+  capacity, unique and complete entry indices, probe reachability, and exact buckets.
+  Atomic/incremental movement and map-growth relocation copy the scalar index unchanged;
+  forwarded immutable string IDs cannot change their content-derived buckets.
 - `Record` payloads are mutable ordered tagged field slots. Each heap record retains its
   validated module layout index and the exactly-derived per-field reference bitmap. The
   descriptor visits only bitmap-selected fields in declaration order; scalar fields stay
@@ -191,15 +208,18 @@
   an inserted young string key or a young reference value into an old map, that single
   funnel records the old owner in the remembered set. Updates barrier the replacement
   value and preserve the original key slot and insertion position. No mutable map payload
-  is exposed outside this funnel, and remembered-set validation must reject every omitted
-  old-map-to-young edge.
+  is exposed outside this funnel. A new insertion prepares any resized index before
+  appending, publishes the ordered entry and its encoded index exactly once, then validates
+  their coherence; an update changes no bucket. Remembered-set validation must reject
+  every omitted old-map-to-young edge.
 - A map's logical storage width is `1 + 2 * current_entry_count` and may grow only between
   collections. Every allocator, storage-layout validator, growth relocation, compaction
   cursor, and forwarding pass computes that same width from the current entry count. The
   collector asserts that an object's width is unchanged within one collection. If an
   append cannot claim the adjacent two logical slots, deterministic relocation rewrites
   all roots, descriptor-declared references, and remembered-set entries before the entry
-  is published.
+  is published. The host-side lookup-index capacity is not part of this width and cannot
+  affect allocation, movement order, or compaction byte accounting.
 - Every record mutation flows through `Heap::store_record_field`. The funnel validates the
   owner's immutable layout identity, field bounds, bitmap shape, and stored tag; before
   publishing a young object in a reference field of an old record it records the owner in
@@ -284,8 +304,9 @@
 - `map<K, V>` accepts only `i64`, `bool`, or `str` for `K`; the type checker and compile
   boundary enforce exactly the same restriction as the verifier. `map<K, V>()`, indexed
   get/set, `.has(key)`, and `.len` preserve complete nested `K`/`V` facts through function
-  signatures, pair fields, arrays, captures, and map values. String keys compare by bytes,
-  never by `ObjectId`, so lookup remains valid after moving collection.
+  signatures, pair fields, arrays, captures, and map values. String keys hash and compare
+  by immutable bytes, never by `ObjectId`, so lookup remains valid after moving
+  collection.
 - `for x in array`, `for k, v in map`, and `for i in lo..hi` are statement-only forms
   lowered to index-based control flow and ordinary compiler-managed locals. Loop bindings
   are immutable and lexically scoped; hidden names contain characters the lexer cannot
@@ -299,9 +320,10 @@
   local root bits.
 - Array iteration snapshots length but loads each element through the live forwarded
   container, so element writes are visible. Map iteration snapshots entry count, observes
-  ADR-0004 insertion order, sees existing-value updates, and traps if a new key grows the
-  map. Range bounds are evaluated once left-to-right and `[lo, hi)` executes zero times
-  when `hi <= lo`. Compiler and verifier must agree on every hidden local and boundary map.
+  ADR-0004/ADR-0007 insertion order directly from the ordered entry vector, never from the
+  lookup index, sees existing-value updates, and traps if a new key grows the map. Range
+  bounds are evaluated once left-to-right and `[lo, hi)` executes zero times when
+  `hi <= lo`. Compiler and verifier must agree on every hidden local and boundary map.
 
 - A source array type's element type determines its runtime representation at the compile
   boundary: `[i64]` and `[bool]` must emit only scalar `AllocArray`/`ArrayGet`/`ArraySet`

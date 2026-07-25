@@ -305,9 +305,12 @@ control remains deferred.
   capture-map metadata; its logical storage width is one function-index slot plus N capture
   slots. No closure capture setter exists.
 - `Map` is variable-width mutable storage with ordered tagged `(key, value)` entries and a
-  retained verified layout identity. Its logical width is one header slot plus two slots
-  per current entry. Empty construction therefore starts at width one, and every append
-  grows the logical width by exactly two.
+  retained verified layout identity. The ordered vector remains the sole payload,
+  positional-access, tracing, and iteration authority. A private deterministic
+  open-addressing side index contains only encoded ordered-entry positions for lookup.
+  Its logical width is one header slot plus two slots per current entry; side-index
+  capacity is host metadata and contributes no logical slot. Empty construction therefore
+  starts at width one, and every append grows the logical width by exactly two.
 - `Record` is fixed-width mutable storage with a retained verified layout identity and one
   tagged slot per declared field. Its logical width is permanently one header plus the
   layout's field count; replacing a field never changes that width.
@@ -338,7 +341,8 @@ control remains deferred.
   visits each inserted key before its value in insertion order, but only when the layout's
   corresponding reference flag is set. String keys and reference values are therefore
   traced and forwarded; scalar slots stay opaque even when their payload bits resemble an
-  `ObjectId`.
+  `ObjectId`. It never visits the lookup index: bucket values are scalar entry positions,
+  not a third reference category.
 - Pair field types, array element types, named recursive types, and record/variant nominal
   types are verification-time metadata. Records and variants retain only their validated
   layout identities and exact bitmaps at runtime; none of these types changes `Value` or
@@ -359,11 +363,14 @@ control remains deferred.
 - Map insertion and update are routed through `Heap::store_map_entry`, the only map payload
   mutation funnel. It records an old owner before publishing an inserted young string key
   or young reference value; updates keep the original key and barrier the replacement
-  value. When an append cannot claim two adjacent logical slots, the heap relocates that
-  map deterministically to a sufficiently large run and rewrites every precise root,
-  descriptor-declared heap reference, and remembered-set entry through a forwarding table
-  before publishing. This preserves exact current-entry-count width without exposing a
-  stale identity.
+  value without changing the index. New insertion prepares any deterministic table resize,
+  appends one ordered entry, publishes its encoded position, and validates exact
+  index/vector coherence. When an append cannot claim two adjacent logical slots, the heap
+  relocates that map deterministically to a sufficiently large run and rewrites every
+  precise root, descriptor-declared heap reference, and remembered-set entry through a
+  forwarding table before publishing. The scalar index moves with the descriptor and
+  needs no forwarding or rehashing. This preserves exact current-entry-count width without
+  exposing a stale identity.
 - Deterministic GC stress is configured with explicit counters: before every allocation,
   after every allocation, after every barrier-triggering old-to-young store, every N
   major-collection bytecode instructions, and every N minor-collection bytecode
@@ -413,6 +420,14 @@ VM/heap counters separately from median wall-clock timings; wall-clock values ar
 only in this measurement tool and are documented as machine-specific. The current baseline
 and observed cost centers live in `docs/perf-baseline.md` as the ADR-0001 anchor for future
 optimization work.
+
+Iteration 40 follows the same profile gate for maps. `map_lookup_heavy` isolates 8,000
+steady-state string-key hit/miss operations after setup. A measured 58.1%–65.7% linear
+scan share admitted a fixed FNV-1a content-hash index. Candidate comparisons fell from
+982,336 to 8,069 and the assertions-enabled seven-run median fell from 278.967 ms to
+153.575 ms (44.9%, 1.816x). `map_hash_probes` and
+`map_index_validation_entries` expose the new work without changing control flow. See
+[ADR 0017](adr/0017-deterministic-content-hashed-map-index.md).
 
 Rejected alternative for verified execution: VM-side verification caching keyed by
 `Module` identity. Raw `Module` remains a mutable value type, so an identity cache would
@@ -631,7 +646,9 @@ Collection is mark, forward, rewrite-strong, process-weak, install, validate:
    rewriting is not a separate collector path; it is the variable-length case of the same
    descriptor visitor used by pairs. Closure capture rewriting is the per-bitmap case of
    that same visitor; record field rewriting is another per-bitmap case. Scalar capture
-   and scalar record slots are never presented to the forwarding pass.
+   and scalar record slots are never presented to the forwarding pass. Map lookup-index
+   buckets are copied scalar entry positions and are likewise never presented to
+   forwarding; forwarded string-key IDs preserve content hashes.
 5. The weak phase walks the exact registry in ascending old owner-slot order. Dead owners
    are pruned. Nil stays nil, targets with forwarding entries are rewritten, and targets
    without entries clear to canonical `Nil`. This never marks a target. Map-growth
@@ -772,7 +789,11 @@ remembered-set entries.
   well formed, its key to be `i64`, `bool`, or `str`, and both reference flags to equal the
   derived static types. Every heap phase uses the descriptor visitor, which sees exactly
   those flagged ordered slots. Map growth preserves `1 + 2N` width and rewrites the owner
-  identity before an append whenever adjacent storage is unavailable.
+  identity before an append whenever adjacent storage is unavailable. Lookup uses a
+  fixed-content-hash table of ordered-entry positions; the loud validator proves exact
+  half-load capacity, complete/unique indices, probe reachability, and deterministic
+  buckets after every mutation and collection. The index is not an edge and cannot change
+  iteration order or logical width.
 - Record-layout precision: verification requires every record layout to have a unique
   non-empty nominal name, well-formed ordered field signatures, and one reference bit per
   field equal to the static field classification. Every heap phase uses the descriptor

@@ -46,6 +46,8 @@ struct HeapMetrics {
     std::uint64_t heap_peak_slots{0};
     std::uint64_t map_lookup_entries_examined{0};
     std::uint64_t map_descriptor_entries_scanned{0};
+    std::uint64_t map_hash_probes{0};
+    std::uint64_t map_index_validation_entries{0};
     std::uint64_t closure_capture_slots_scanned{0};
     std::uint64_t weak_targets_processed{0};
     std::uint64_t weak_targets_forwarded{0};
@@ -149,6 +151,7 @@ struct Object {
     bool map_key_is_ref{false};
     bool map_value_is_ref{false};
     std::vector<MapEntry> map_entries;
+    std::vector<std::size_t> map_lookup_index;
     std::uint32_t record_layout_index{0};
     std::vector<Value> record_fields;
     std::vector<bool> record_ref_map;
@@ -324,6 +327,9 @@ public:
     void TEST_ONLY_corrupt_next_incremental_compaction_copy() {
         TEST_ONLY_corrupt_next_incremental_compaction_copy_ = true;
     }
+    [[nodiscard]] std::vector<std::size_t>
+    TEST_ONLY_map_lookup_index(ObjectId id) const;
+    void TEST_ONLY_corrupt_map_lookup_index(ObjectId id);
     void TEST_ONLY_validate_incremental_marking() const;
 
 private:
@@ -420,6 +426,12 @@ private:
                                  std::size_t required_width);
     [[nodiscard]] std::optional<std::size_t> find_map_entry(
         ObjectId id, Value key) const;
+    [[nodiscard]] std::uint64_t map_key_hash(Value key) const;
+    [[nodiscard]] bool map_keys_equal(const Object& map, Value stored,
+                                      Value query) const;
+    [[nodiscard]] std::vector<std::size_t> build_map_lookup_index(
+        const Object& map, std::size_t capacity) const;
+    void validate_map_lookup_index(const Object& map) const;
     void validate_map_key(const Object& map, Value key) const;
     void validate_map_value(const Object& map, Value value) const;
     [[nodiscard]] bool record_write_barrier_if_needed(ObjectId owner, Value value);

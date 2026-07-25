@@ -407,3 +407,188 @@ Seven-run medians using the same command and machine:
 `map_heavy` is the decision workload. The other changes are reported because the full
 protocol measures every workload, but they are corroborating effects or host-run variance
 rather than additional optimization targets.
+
+## Iteration 40 Phase A: Map Lookup Gate (2026-07-25)
+
+Iteration 40 reopens only ADR-0004's deferred lookup question. The clean input revision is
+`9223111`; assertions are active in the default CMake build on
+`Darwin Affans-MacBook-Pro.local 25.5.0 ... RELEASE_ARM64_T8112 arm64` with Apple clang
+17.0.0. The independently verified baseline gate is 41/41 with zero warnings. A redundant
+local baseline run was sent SIGTERM by the host during CTest contention after compilation;
+it is not counted as a test failure.
+
+### Existing workloads are not lookup-isolated
+
+Commands:
+
+```bash
+build/lang_bench --bench map_heavy --counters-only
+build/lang_bench --bench mixed_graph --counters-only
+build/lang_bench --bench map_heavy --repetitions 7
+build/lang_bench --bench mixed_graph --repetitions 7
+```
+
+| workload | median ms | lookup entries examined | map descriptor entries scanned | storage occupancy headers examined |
+| --- | ---: | ---: | ---: | ---: |
+| `map_heavy` | 133.031 | 41,809 | 481,745 | 8,002,102 |
+| `mixed_graph` | 15.684 | 320 | 3,729 | 199,694 |
+
+The deterministic counters exactly reproduce iteration 27. `map_heavy` still combines
+insertion, update, allocation, 76 collections, movement, and growth relocation; it
+performs 11.5 descriptor scans and 191.4 occupancy-header examinations per key
+comparison. `mixed_graph` performs only 320 comparisons. Neither workload can honestly
+admit a lookup representation change on its own.
+
+### Lookup-isolated extension
+
+`map_lookup_heavy` is appended after `map_heavy` without changing any prior workload. It
+constructs 192 long-common-prefix string keys once, retains fresh byte-equal first,
+middle, last, and absent query strings, and executes 2,000 fixed lookup rounds with no
+loop allocation or GC stress. The pre-extension command failed as expected with
+`unknown benchmark: map_lookup_heavy`; the post-extension smoke reports
+`smoke=determinism status=ok workloads=1`.
+
+Deterministic capture:
+
+| seed | instr | alloc | major/minor | moved | lookup comparisons | descriptor entries | occupancy headers |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 269136357 | 70,796 | 205 | 0 / 0 | 35 | 982,336 | 2,821,806 | 9,213,065 |
+
+The uninstrumented seven-run median is 278.967 ms. All 205 allocations, 35 map-growth
+relocations, and occupancy-header work occur during setup; the repeated lookup loop
+allocates and collects nothing.
+
+### Profile attribution and GO decision
+
+The managed sandbox denied `/usr/bin/sample` process inspection. `xctrace` could launch
+only after redirecting its cache to a writable temporary directory, but DTServiceHub was
+unavailable and the trace contained zero duration/samples. This platform limitation is
+recorded rather than silently substituting a guessed profile.
+
+As in iteration 19, temporary `steady_clock` accumulators were added around three
+disjoint heap phases and removed immediately after capture. Five independent one-run
+measurements gave:
+
+| run | total ms | linear scan ms | scan share | checked-map ms | key validation ms |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 281.483 | 171.258 | 60.8% | 25.048 | 0.562 |
+| 2 | 316.236 | 183.857 | 58.1% | 25.924 | 0.609 |
+| 3 | 295.063 | 188.102 | 63.8% | 25.800 | 0.594 |
+| 4 | 273.127 | 160.344 | 58.7% | 24.448 | 0.558 |
+| 5 | 496.394 | 326.002 | 65.7% | 41.968 | 0.938 |
+
+Absolute time varies with current host contention, but the attribution is stable: the
+linear content scan consumes a majority of end-to-end time in every run. Full map shape
+validation is 8.2%–8.9%, and query-key validation is about 0.2%. The deterministic
+counters were unchanged by instrumentation, and no timing code remains.
+
+**Decision: GO.** Linear lookup is a dominant measured cost center on a workload that
+isolates repeated lookup from allocation and collection. Phase B may add the deterministic
+content-hash entry-index side table described in the iteration-40 plan. Final before/after
+counters and timings are appended after implementation.
+
+## Iteration 40 Phase B: Deterministic Content-Hash Index (2026-07-25)
+
+Phase B keeps the ordered entry vector as the only payload, tracing, positional-access,
+and insertion-order iteration authority. Each map now carries a private open-addressing
+vector whose nonzero buckets encode `entry_index + 1`. The table starts at eight buckets,
+doubles before exceeding one-half load, rebuilds in insertion order, and uses ascending
+linear probing. It contains no `Value`, `ObjectId`, pointer, or handle, adds no collector
+edge, and contributes no logical heap slot or compaction byte.
+
+The fixed 64-bit FNV-1a encoding uses offset basis `14695981039346656037`, prime
+`1099511628211`, and domain bytes `1`/`2`/`3` for `i64`/`bool`/`str`. Integers feed eight
+explicit little-endian bytes, booleans one canonical byte, and strings their immutable
+bytes. No identity, address, process seed, library hash, native endianness, randomness, or
+clock participates. Candidate buckets still use the pre-existing tagged/content equality,
+so collisions cannot alter lookup semantics.
+
+The coherence validator deterministically rebuilds the expected table and proves capacity,
+load, index range/uniqueness/completeness, probe reachability, and every bucket after each
+map mutation and every collection validation boundary. A test-only corruption hook clears
+one occupied bucket; `TEST_ONLY_validate_gc_invariants` rejects it with
+`map lookup index is missing an ordered entry`, proving non-vacuity. Atomic compaction,
+budget-one incremental compaction, combined marking/compaction, and map-growth relocation
+tests prove that owner and key movement leave content-derived buckets coherent.
+
+### Deterministic counter deltas
+
+Commands:
+
+```bash
+build/lang_bench --bench map_lookup_heavy --counters-only
+build/lang_bench --bench map_heavy --counters-only
+build/lang_bench --bench mixed_graph --counters-only
+```
+
+| workload | candidate comparisons before | after | change | hash probes | index-validation entries |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `map_lookup_heavy` | 982,336 | 8,069 | -99.2% | 10,260 | 38,746 |
+| `map_heavy` | 41,809 | 951 | -97.7% | 1,046 | 97,831 |
+| `mixed_graph` | 320 | 320 | 0.0% | 320 | 632 |
+
+The new probe count includes insertion/update existence checks as well as language-level
+gets/has operations. The validation count records ordered entries consumed by exact
+coherence rebuilds; it is deliberately separate from descriptor work.
+
+To prove the rest of the counter stream rather than infer it, revision `9223111` was
+extracted into `/private/tmp`, the Phase-A-only `map_lookup_heavy` extension was applied,
+and that isolated `lang_bench` was built. For each workload above, both counter streams
+were filtered only for the deliberately changed `map_lookup_entries_examined` line and the
+two new lines, then compared with `cmp`. All remaining lines were byte-identical:
+
+| workload | SHA-256 of identical stable counter stream |
+| --- | --- |
+| `map_lookup_heavy` | `aa5f5ec173da2ab4df3cf33076093278019a00956401c631d8087d3176ccb4c1` |
+| `map_heavy` | `386972cb952fb6fcad8b83bf459522c7bd0aed693c470f350247966d5ff5642d` |
+| `mixed_graph` | `769ed9298960ff7c799fff570d03ae9ad2b6acb1c559fad949f005b34803332e` |
+
+Thus instructions, allocations, collection counts, movement, barriers, remembered-set
+shape, heap shape, descriptor scans, allocator/occupancy work, existing validation work,
+weak outcomes, and logical compaction bytes are unchanged. The directly relevant stable
+work counters remain:
+
+| workload | map descriptor entries | occupancy headers |
+| --- | ---: | ---: |
+| `map_lookup_heavy` | 2,821,806 | 9,213,065 |
+| `map_heavy` | 481,745 | 8,002,102 |
+| `mixed_graph` | 3,729 | 199,694 |
+
+### Wall-time result
+
+The final implementation was rebuilt before the seven-repetition capture series on the
+same assertions-enabled host:
+
+| workload | Phase A median ms | Phase B median ms | change |
+| --- | ---: | ---: | ---: |
+| `map_lookup_heavy` | 278.967 | 153.575 | -44.9% (1.816x) |
+| `map_heavy` | 133.031 | 121.033 | -9.0% (1.099x) |
+| `mixed_graph` | 15.684 | 11.877 | -24.3% |
+
+`map_lookup_heavy` is the admitted decision workload and measured speedup. `map_heavy`
+corroborates the lookup reduction despite its large allocation/collection component.
+`mixed_graph` performs exactly the same 320 candidate comparisons before and after, so its
+wall-time movement is honestly classified as current host-run variance rather than an
+index speedup. No timing value is a test threshold.
+
+### Semantic identity
+
+All 19 Phase-B corpus dumps were compared with `cmp` against the clean `9223111`
+captures. `single`, `calls`, `arrays`, `legacy`, `recursive`, `array`, `strings`,
+`closures`, `maps`, `weak`, `loops`, `output`, `strings2`, `records`, `variants`,
+`exceptions`, `ephemerons`, `incremental_compaction`, and `tailcalls` are 19/19
+byte-identical, and every SHA-256 remains the value pinned in the iteration-40 plan.
+
+### Final verification
+
+The focused map/for-in/incremental set passed 6/6. The exact full gate
+`cmake -S . -B build && cmake --build build && ctest --test-dir build
+--output-on-failure` then passed twice independently:
+
+| gate | result | CTest real time | compiler warnings |
+| --- | --- | ---: | ---: |
+| 1 | 42/42, zero failures | 51.12 s | 0 |
+| 2 | 42/42, zero failures | 46.02 s | 0 |
+
+After gate 2, all 19 corpus streams were regenerated from the twice-gated binaries and
+again compared with the clean captures: 19/19 were byte-identical with the pinned hashes.

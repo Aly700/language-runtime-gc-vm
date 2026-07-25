@@ -96,6 +96,17 @@ collector itself. See
 [ARCHITECTURE.md](ARCHITECTURE.md#generational-collection) and
 [ADR 0004](adr/0004-deterministic-insertion-order-maps.md).
 
+### Deterministic map lookup
+
+Maps keep their ordered entry vector as the sole payload and insertion-order iteration
+authority. Lookup uses a private half-load open-addressing index whose buckets contain
+only entry positions. Fixed FNV-1a hashes consume explicit `i64`/`bool` encodings or
+immutable string bytes; object IDs, addresses, library hashes, and per-process seeds never
+participate. The index therefore survives atomic/incremental movement without forwarding,
+adds no reference edge, and cannot change the ADR-0007 mutation-during-iteration trap.
+Every mutation and collection validates exact index/vector coherence. See
+[ADR 0017](adr/0017-deterministic-content-hashed-map-index.md).
+
 ### Weak phase
 
 Weak targets are the sole non-descriptor edge category. An exact slot-ordered registry
@@ -325,6 +336,7 @@ measurements:
 ```bash
 ./build/lang_bench --counters-only
 ./build/lang_bench --repetitions 7
+./build/lang_bench --bench map_lookup_heavy --repetitions 7
 ./build/lang_bench --smoke --repetitions 1
 ```
 
@@ -342,12 +354,22 @@ context, and before/after tables are in
 [docs/perf-baseline.md](docs/perf-baseline.md) and
 [ADR 0006](adr/0006-performance-capstone.md).
 
+Iteration 40 added `map_lookup_heavy` only after the existing workloads were shown to
+under-measure steady lookup. The isolated workload measured linear scanning at
+58.1%–65.7% of total time. The deterministic content-hash index reduced candidate
+comparisons from 982,336 to 8,069 (99.2%) and its seven-run median from 278.967 ms to
+153.575 ms (44.9%, 1.816x). On the broader `map_heavy` workload, comparisons fell from
+41,809 to 951 and the same-host median moved from 133.031 ms to 121.033 ms (9.0%).
+Timings remain informational; the exact counters, host context, and corpus proof are in
+[docs/perf-baseline.md](docs/perf-baseline.md).
+
 ## Limitations and deferred work
 
 - Strings are immutable byte sequences, not Unicode text. There is no mutation,
   interning, interpolation, rope, or substring-view representation; `sub` copies.
-- Maps use deterministic O(n) linear lookup and have no deletion. Hashing, open
-  addressing, resize/tombstone policy, and structural hash caching are deferred.
+- Maps have deterministic expected-O(1) content-hashed lookup and insertion-order
+  iteration, but no deletion. Tombstones, shrink policy, and structural hash caching are
+  deferred.
 - Closure captures are immutable snapshots. There are no mutable capture cells or
   recursion through a self-capture.
 - Tail calls are explicit and direct-only. There is no implicit `Call; Return`

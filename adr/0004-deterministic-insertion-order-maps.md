@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted.
+Accepted for insertion-order payload, layout, growth, and iteration semantics. The
+no-hashing lookup decision is refined by
+[ADR 0017](0017-deterministic-content-hashed-map-index.md); identity/address hashing
+remains rejected.
 
 ## Decision
 
@@ -12,11 +15,14 @@ order; setting an existing key replaces only its value, while setting a new key 
 entry. Keys are restricted to `i64`, `bool`, and `str`. Integer and bool keys compare by
 tagged scalar value, and string keys compare their immutable bytes structurally.
 
-No hashing is used. In particular, an `ObjectId` may not be used as an identity hash:
+As originally accepted, no hashing was used. In particular, an `ObjectId` may not be used
+as an identity hash:
 moving collection changes its slot/generation bits when forwarding the same language-level
 object. Structural string equality plus insertion order makes lookup independent of those
 move-sensitive bits and keeps iteration, tracing, fuzz observables, and traps deterministic.
-The accepted cost is O(n) lookup; open addressing is deferred.
+The originally accepted cost was O(n) lookup and open addressing was deferred. Iteration
+40's measured content-hash entry-index optimization now replaces that linear lookup under
+ADR-0017 without changing any other decision in this ADR.
 
 Every module carries a map-layout table. Each layout stores complete structural key/value
 types and the exactly-derived `key-is-ref` and `value-is-ref` flags. A heap map retains its
