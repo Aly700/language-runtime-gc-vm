@@ -86,6 +86,11 @@ struct CounterSnapshot {
     std::uint64_t compaction_closure_bytes{0};
     std::uint64_t compaction_map_bytes{0};
     std::uint64_t compaction_weak_ref_bytes{0};
+    std::uint64_t compaction_slots_copied_1_8{0};
+    std::uint64_t compaction_slots_copied_9_64{0};
+    std::uint64_t compaction_slots_copied_65_512{0};
+    std::uint64_t compaction_slots_copied_gt_512{0};
+    std::uint64_t max_object_storage_slots_allocated{0};
 };
 
 bool operator==(const CounterSnapshot& lhs, const CounterSnapshot& rhs) {
@@ -137,7 +142,17 @@ bool operator==(const CounterSnapshot& lhs, const CounterSnapshot& rhs) {
            lhs.compaction_string_bytes == rhs.compaction_string_bytes &&
            lhs.compaction_closure_bytes == rhs.compaction_closure_bytes &&
            lhs.compaction_map_bytes == rhs.compaction_map_bytes &&
-           lhs.compaction_weak_ref_bytes == rhs.compaction_weak_ref_bytes;
+           lhs.compaction_weak_ref_bytes == rhs.compaction_weak_ref_bytes &&
+           lhs.compaction_slots_copied_1_8 ==
+               rhs.compaction_slots_copied_1_8 &&
+           lhs.compaction_slots_copied_9_64 ==
+               rhs.compaction_slots_copied_9_64 &&
+           lhs.compaction_slots_copied_65_512 ==
+               rhs.compaction_slots_copied_65_512 &&
+           lhs.compaction_slots_copied_gt_512 ==
+               rhs.compaction_slots_copied_gt_512 &&
+           lhs.max_object_storage_slots_allocated ==
+               rhs.max_object_storage_slots_allocated;
 }
 
 bool operator!=(const CounterSnapshot& lhs, const CounterSnapshot& rhs) {
@@ -161,6 +176,31 @@ struct Options {
     bool smoke{false};
     bool counters_only{false};
     std::optional<std::string> selected_bench;
+};
+
+class BenchmarkRoots final : public lang::gc::RootProvider {
+public:
+    std::size_t add(lang::ObjectId id) {
+        values_.push_back(lang::Value::object(id));
+        return values_.size() - 1;
+    }
+
+    [[nodiscard]] lang::Value value(std::size_t index) const {
+        return values_.at(index);
+    }
+
+    [[nodiscard]] lang::ObjectId object(std::size_t index) const {
+        return value(index).as_object();
+    }
+
+    void trace_roots(lang::gc::RootVisitor& visitor) override {
+        for (auto& value : values_) {
+            visitor.visit(value);
+        }
+    }
+
+private:
+    std::vector<lang::Value> values_;
 };
 
 void set_signature(lang::Function& function,
@@ -283,6 +323,16 @@ CounterSnapshot run_module(const lang::VerifiedModule& module, lang::gc::StressC
     base.compaction_closure_bytes = metrics.heap.compaction_closure_bytes;
     base.compaction_map_bytes = metrics.heap.compaction_map_bytes;
     base.compaction_weak_ref_bytes = metrics.heap.compaction_weak_ref_bytes;
+    base.compaction_slots_copied_1_8 =
+        metrics.heap.compaction_slots_copied_1_8;
+    base.compaction_slots_copied_9_64 =
+        metrics.heap.compaction_slots_copied_9_64;
+    base.compaction_slots_copied_65_512 =
+        metrics.heap.compaction_slots_copied_65_512;
+    base.compaction_slots_copied_gt_512 =
+        metrics.heap.compaction_slots_copied_gt_512;
+    base.max_object_storage_slots_allocated =
+        metrics.heap.max_object_storage_slots_allocated;
     return base;
 }
 
@@ -746,6 +796,191 @@ Workload verifier_compile_workload(std::uint64_t seed, std::string source,
         }};
 }
 
+CounterSnapshot large_object_pressure_run(std::size_t large_width,
+                                          std::size_t replicas,
+                                          std::size_t map_entries,
+                                          std::size_t major_cycles,
+                                          std::uint64_t seed) {
+    if (large_width <= 512 || map_entries <= 255) {
+        throw std::logic_error(
+            "large-object pressure shape must cross the >512-slot class");
+    }
+
+    SplitMix64 rng(seed);
+    lang::gc::Heap heap;
+    BenchmarkRoots roots;
+    heap.set_root_provider(&roots);
+
+    (void)heap.allocate_pair(lang::Value::int64(-1),
+                             lang::Value::int64(-2));
+    const auto anchor_index = roots.add(heap.allocate_pair(
+        lang::Value::int64(static_cast<std::int64_t>(rng.bounded(10'000))),
+        lang::Value::int64(static_cast<std::int64_t>(rng.bounded(10'000)))));
+
+    std::size_t first_scalar_index = 0;
+    for (std::size_t replica = 0; replica < replicas; ++replica) {
+        const auto index = roots.add(heap.allocate_scalar_array(
+            large_width, static_cast<std::int64_t>(replica)));
+        if (replica == 0) {
+            first_scalar_index = index;
+        }
+    }
+
+    const auto ref_array_index = roots.add(heap.allocate_ref_array(
+        large_width, roots.value(anchor_index)));
+
+    const auto string_byte_count = (large_width - 1) * sizeof(std::int64_t);
+    std::vector<std::uint8_t> retained_bytes(string_byte_count);
+    for (std::size_t byte = 0; byte < retained_bytes.size(); ++byte) {
+        retained_bytes[byte] =
+            static_cast<std::uint8_t>((byte + seed) & 0xFFu);
+    }
+    std::size_t first_string_index = 0;
+    for (std::size_t replica = 0; replica < replicas; ++replica) {
+        retained_bytes[replica % retained_bytes.size()] ^=
+            static_cast<std::uint8_t>(replica + 1);
+        const auto index = roots.add(heap.allocate_string(retained_bytes));
+        if (replica == 0) {
+            first_string_index = index;
+        }
+    }
+
+    const auto map_index =
+        roots.add(heap.allocate_map(0, false, true));
+    for (std::size_t entry = 0; entry < map_entries; ++entry) {
+        heap.map_set(
+            roots.object(map_index),
+            lang::Value::int64(static_cast<std::int64_t>(entry)),
+            roots.value(anchor_index));
+    }
+
+    for (std::size_t cycle = 0; cycle < major_cycles; ++cycle) {
+        for (std::size_t garbage = 0; garbage < 8; ++garbage) {
+            (void)heap.allocate_pair(
+                lang::Value::int64(static_cast<std::int64_t>(
+                    rng.bounded(1'000'000))),
+                lang::Value::int64(static_cast<std::int64_t>(
+                    cycle * 8 + garbage)));
+        }
+        (void)heap.allocate_scalar_array(8,
+                                         static_cast<std::int64_t>(cycle));
+
+        const auto child = heap.allocate_pair(
+            lang::Value::int64(static_cast<std::int64_t>(cycle)),
+            lang::Value::int64(
+                static_cast<std::int64_t>(rng.bounded(1'000'000))));
+        heap.ref_array_set(roots.object(ref_array_index),
+                           cycle % large_width,
+                           lang::Value::object(child));
+        heap.map_set(
+            roots.object(map_index),
+            lang::Value::int64(
+                static_cast<std::int64_t>(cycle % map_entries)),
+            lang::Value::object(child));
+        heap.collect();
+    }
+
+    if (heap.array_length(roots.object(first_scalar_index)) != large_width ||
+        heap.ref_array_length(roots.object(ref_array_index)) != large_width ||
+        heap.string_length(roots.object(first_string_index)) != string_byte_count ||
+        heap.map_length(roots.object(map_index)) != map_entries) {
+        throw std::runtime_error(
+            "large-object pressure survivors lost their requested shape");
+    }
+    heap.TEST_ONLY_validate_gc_invariants();
+
+    const auto metrics = heap.metrics();
+    CounterSnapshot counters;
+    counters.allocations = metrics.allocations;
+    counters.major_collections = metrics.major_collections;
+    counters.minor_collections = metrics.minor_collections;
+    counters.objects_moved = metrics.objects_moved;
+    counters.barrier_hits = metrics.write_barrier_hits;
+    counters.remembered_set_peak = metrics.remembered_set_peak;
+    counters.heap_peak_slots = metrics.heap_peak_slots;
+    counters.heap_live_objects = heap.live_count();
+    counters.heap_capacity_slots = heap.capacity_slots();
+    counters.map_lookup_entries_examined =
+        metrics.map_lookup_entries_examined;
+    counters.map_descriptor_entries_scanned =
+        metrics.map_descriptor_entries_scanned;
+    counters.map_hash_probes = metrics.map_hash_probes;
+    counters.map_index_validation_entries =
+        metrics.map_index_validation_entries;
+    counters.closure_capture_slots_scanned =
+        metrics.closure_capture_slots_scanned;
+    counters.weak_targets_processed = metrics.weak_targets_processed;
+    counters.weak_targets_forwarded = metrics.weak_targets_forwarded;
+    counters.weak_targets_cleared = metrics.weak_targets_cleared;
+    counters.major_weak_targets_forwarded =
+        metrics.major_weak_targets_forwarded;
+    counters.major_weak_targets_cleared =
+        metrics.major_weak_targets_cleared;
+    counters.minor_weak_targets_forwarded =
+        metrics.minor_weak_targets_forwarded;
+    counters.minor_weak_targets_cleared =
+        metrics.minor_weak_targets_cleared;
+    counters.allocation_candidate_slots_examined =
+        metrics.allocation_candidate_slots_examined;
+    counters.allocation_storage_slots_checked =
+        metrics.allocation_storage_slots_checked;
+    counters.storage_occupancy_headers_examined =
+        metrics.storage_occupancy_headers_examined;
+    counters.heap_layout_objects_checked =
+        metrics.heap_layout_objects_checked;
+    counters.heap_layout_slots_checked =
+        metrics.heap_layout_slots_checked;
+    counters.remembered_set_entries_checked =
+        metrics.remembered_set_entries_checked;
+    counters.remembered_set_heap_slots_examined =
+        metrics.remembered_set_heap_slots_examined;
+    counters.remembered_set_reference_fields_checked =
+        metrics.remembered_set_reference_fields_checked;
+    counters.compaction_objects_copied =
+        metrics.compaction_objects_copied;
+    counters.compaction_pair_bytes = metrics.compaction_pair_bytes;
+    counters.compaction_scalar_array_bytes =
+        metrics.compaction_scalar_array_bytes;
+    counters.compaction_ref_array_bytes =
+        metrics.compaction_ref_array_bytes;
+    counters.compaction_string_bytes = metrics.compaction_string_bytes;
+    counters.compaction_closure_bytes =
+        metrics.compaction_closure_bytes;
+    counters.compaction_map_bytes = metrics.compaction_map_bytes;
+    counters.compaction_weak_ref_bytes =
+        metrics.compaction_weak_ref_bytes;
+    counters.compaction_slots_copied_1_8 =
+        metrics.compaction_slots_copied_1_8;
+    counters.compaction_slots_copied_9_64 =
+        metrics.compaction_slots_copied_9_64;
+    counters.compaction_slots_copied_65_512 =
+        metrics.compaction_slots_copied_65_512;
+    counters.compaction_slots_copied_gt_512 =
+        metrics.compaction_slots_copied_gt_512;
+    counters.max_object_storage_slots_allocated =
+        metrics.max_object_storage_slots_allocated;
+    return counters;
+}
+
+Workload large_object_pressure_workload(bool smoke) {
+    constexpr std::uint64_t seed = 0x10A6'0B1Eull;
+    const auto large_width = smoke ? std::size_t{513}
+                                   : std::size_t{1024};
+    const auto replicas = smoke ? std::size_t{1}
+                                : std::size_t{4};
+    const auto map_entries = smoke ? std::size_t{256}
+                                   : std::size_t{256};
+    const auto major_cycles = smoke ? std::size_t{2}
+                                    : std::size_t{96};
+    return Workload{
+        "large_object_pressure", seed,
+        "retained scalar/ref arrays, strings, and grown maps repeatedly survive majors",
+        [large_width, replicas, map_entries, major_cycles] {
+            return large_object_pressure_run(
+                large_width, replicas, map_entries, major_cycles, seed);
+        }};
+}
+
 std::vector<Workload> build_workloads(bool smoke) {
     const auto alloc_iterations = smoke ? 120 : 1200;
     const auto survivor_iterations = smoke ? 80 : 900;
@@ -845,6 +1080,7 @@ std::vector<Workload> build_workloads(bool smoke) {
         "mixed_graph", 0xA11D'600Dull,
         mixed_graph_source(mixed_iterations, 0xA11D'600Dull), mixed_stress,
         "pairs, arrays, strings, closures, maps, and weak refs interleaved in one graph"));
+    workloads.push_back(large_object_pressure_workload(smoke));
     return workloads;
 }
 
@@ -899,6 +1135,16 @@ std::vector<std::pair<const char*, std::uint64_t>> counter_items(
         {"compaction_closure_bytes", counters.compaction_closure_bytes},
         {"compaction_map_bytes", counters.compaction_map_bytes},
         {"compaction_weak_ref_bytes", counters.compaction_weak_ref_bytes},
+        {"compaction_slots_copied_1_8",
+         counters.compaction_slots_copied_1_8},
+        {"compaction_slots_copied_9_64",
+         counters.compaction_slots_copied_9_64},
+        {"compaction_slots_copied_65_512",
+         counters.compaction_slots_copied_65_512},
+        {"compaction_slots_copied_gt_512",
+         counters.compaction_slots_copied_gt_512},
+        {"max_object_storage_slots_allocated",
+         counters.max_object_storage_slots_allocated},
     };
 }
 

@@ -592,3 +592,123 @@ The focused map/for-in/incremental set passed 6/6. The exact full gate
 
 After gate 2, all 19 corpus streams were regenerated from the twice-gated binaries and
 again compared with the clean captures: 19/19 were byte-identical with the pinned hashes.
+
+## Iteration 43 Phase A: Large-Object-Space Gate (2026-07-25)
+
+Iteration 43 tests whether repeatedly copying wide survivors justifies a separate
+non-moving large-object space. The input revision is `ecbb2d1`; the lead-verified
+baseline is 46/46 with zero warnings and was not rerun merely to establish green.
+Phase A adds only passive copy-width counters, one focused counter test, and one additive
+benchmark workload. It makes no allocation, marking, movement, or representation
+decision.
+
+### Fixed measurement classes and workload
+
+The size classes were locked before measurement:
+
+```text
+1..8 slots
+9..64 slots
+65..512 slots
+>512 slots
+```
+
+`large_object_pressure` has fixed seed `279317278` (`0x10A60B1E`). It retains four
+1,024-slot scalar arrays, one 1,024-slot reference array, four 1,024-slot immutable
+strings, and one map grown to 513 logical slots. Small pairs are held by the reference
+array and map. Ninety-six explicit major collections repeatedly copy the retained graph;
+each cycle allocates only small garbage.
+
+An initial workload draft allocated fresh huge garbage on every cycle and reported
+4,541,765,283 storage-occupancy header examinations. That shape was rejected before the
+admission capture because it measured the already documented ADR-0006 allocator search
+rather than survivor copying.
+
+Reproduction:
+
+```bash
+build/lang_bench --smoke --bench large_object_pressure --repetitions 1
+build/lang_bench --bench large_object_pressure --counters-only
+build/lang_bench --bench large_object_pressure --repetitions 7
+```
+
+The smoke run reports `smoke=determinism status=ok workloads=1`. The final deterministic
+capture is:
+
+| measure | value |
+| --- | ---: |
+| allocations | 972 |
+| major / minor collections | 96 / 0 |
+| objects moved | 107 |
+| compaction objects copied | 5,712 |
+| copied slots `1..8` | 4,752 |
+| copied slots `9..64` | 0 |
+| copied slots `65..512` | 0 |
+| copied slots `>512` | 933,984 |
+| maximum allocated width | 1,024 |
+| scalar-array copy bytes | 3,145,728 |
+| RefArray copy bytes | 786,432 |
+| string copy bytes | 3,145,728 |
+| map copy bytes | 393,984 |
+| heap peak / final capacity slots | 9,842 / 9,842 |
+
+The `>512` class contributes 933,984 of 938,736 copied slots, or 99.4938%. The first
+admission signal therefore passes.
+
+### Wall-clock attribution
+
+The assertions-enabled seven-run median is 509.987 ms. `/usr/bin/sample` could not
+examine the benchmark process in the managed environment. Temporary disjoint
+`steady_clock` instrumentation, removed after capture, measured complete collection,
+`compact_live_objects`, and the actual `Object` copy split at 512 slots:
+
+| run | wall ms | collection ms | compact-live ms | copy `<=512` ms | copy `>512` ms | large-copy wall share |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 485.841 | 156.710 | 39.890 | 1.003 | 0.783 | 0.1611% |
+| 2 | 473.555 | 149.100 | 37.717 | 0.957 | 0.683 | 0.1442% |
+| 3 | 475.710 | 151.185 | 38.458 | 0.969 | 0.737 | 0.1550% |
+| 4 | 478.316 | 151.928 | 38.766 | 0.966 | 0.725 | 0.1515% |
+| 5 | 469.382 | 153.196 | 39.374 | 0.997 | 0.775 | 0.1652% |
+
+Large survivor copying is only 1.81%–1.97% of `compact_live_objects` and
+0.14%–0.17% of end-to-end time. Small-object copy overhead is larger even though small
+objects contribute only 0.51% of copied slots. The second admission signal therefore
+fails decisively.
+
+### Decision: NO-GO
+
+Iteration 43 requires both a clear copied-slot majority and meaningful wall-clock cost.
+Only the first condition is true. A large-object space would add tagged identity,
+deterministic sweep/reuse, cross-space barriers, weak/ephemeron rules, map migration,
+incremental-compaction shadowing, and new validators to remove a sub-percent measured
+cost. Phase B is not justified and no LOS, ADR-0020, or two-space invariant amendment is
+introduced.
+
+The five permanent counters remain useful passive observations:
+
+```text
+compaction_slots_copied_1_8
+compaction_slots_copied_9_64
+compaction_slots_copied_65_512
+compaction_slots_copied_gt_512
+max_object_storage_slots_allocated
+```
+
+After temporary timing removal, filtering these five additive lines and the new workload
+from `build/lang_bench --counters-only` yields the exact 462-line pre-edit stream.
+Its SHA-256 remains
+`787f63e639baf2fce58f831db237613fe7d810ccfa1ef7024c470c87f8f0c81b`.
+
+### Final verification
+
+The exact configure/build/CTest gate passed twice from the final implementation:
+
+| gate | tally | failures | compiler warnings | CTest wall time |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 47/47 | 0 | 0 | 115.64 s |
+| 2 | 47/47 | 0 | 0 | 115.34 s |
+
+After gate 2, all 21 pre-existing pinned corpus streams were regenerated and matched
+their Iteration-42 SHA-256 values byte for byte (21/21). No LOS corpus was added because
+the admission decision is NO-GO. `git diff --check` is clean, and the Iteration-43
+working tree remains deliberately uncommitted.
