@@ -757,8 +757,8 @@ m
 
 void maps_source_fuzz_corpus_and_mutants() {
     const auto all_schedules = fuzz::schedules();
-    require(all_schedules.size() == 12,
-            "maps source fuzz requires exactly twelve deterministic schedules");
+    require(all_schedules.size() == 15,
+            "maps source fuzz requires exactly fifteen deterministic schedules");
     for (std::uint64_t seed = 1; seed <= 10; ++seed) {
         for (const auto& schedule : all_schedules) {
             run_maps_seed_schedule(seed, schedule);

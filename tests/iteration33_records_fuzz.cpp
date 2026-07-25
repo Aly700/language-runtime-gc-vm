@@ -319,8 +319,8 @@ std::size_t parse_mutant(const std::string& text) {
 
 int run(int argc, char** argv) {
     const auto schedules = fuzz::schedules();
-    require(schedules.size() == 12,
-            "records fuzz target requires exactly twelve deterministic schedules");
+    require(schedules.size() == 15,
+            "records fuzz target requires exactly fifteen deterministic schedules");
     const auto& baseline = fuzz::find_schedule(schedules, "no_stress");
 
     if (argc == 7 &&

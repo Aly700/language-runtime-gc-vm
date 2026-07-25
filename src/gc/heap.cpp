@@ -523,6 +523,82 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn,
     throw std::logic_error("unknown object kind");
 }
 
+bool values_equal(Value left, Value right) {
+    if (left.tag() != right.tag()) {
+        return false;
+    }
+    switch (left.tag()) {
+    case Value::Tag::Int64:
+        return left.as_i64() == right.as_i64();
+    case Value::Tag::Bool:
+        return left.as_bool() == right.as_bool();
+    case Value::Tag::Object:
+        return left.as_object() == right.as_object();
+    case Value::Tag::Nil:
+        return true;
+    }
+    return false;
+}
+
+bool value_vectors_equal(const std::vector<Value>& left,
+                         const std::vector<Value>& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (!values_equal(left[i], right[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool map_entries_equal(const std::vector<MapEntry>& left,
+                       const std::vector<MapEntry>& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (!values_equal(left[i].key, right[i].key) ||
+            !values_equal(left[i].value, right[i].value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool objects_equal(const Object& left, const Object& right) {
+    return left.marked == right.marked &&
+           left.generation == right.generation &&
+           left.kind == right.kind && left.length == right.length &&
+           values_equal(left.left, right.left) &&
+           values_equal(left.right, right.right) &&
+           left.scalar_elements == right.scalar_elements &&
+           value_vectors_equal(left.ref_elements, right.ref_elements) &&
+           left.string_bytes == right.string_bytes &&
+           left.closure_layout_index == right.closure_layout_index &&
+           left.closure_function_index == right.closure_function_index &&
+           value_vectors_equal(left.closure_captures,
+                               right.closure_captures) &&
+           left.closure_capture_map == right.closure_capture_map &&
+           left.map_layout_index == right.map_layout_index &&
+           left.map_key_is_ref == right.map_key_is_ref &&
+           left.map_value_is_ref == right.map_value_is_ref &&
+           map_entries_equal(left.map_entries, right.map_entries) &&
+           left.record_layout_index == right.record_layout_index &&
+           value_vectors_equal(left.record_fields, right.record_fields) &&
+           left.record_ref_map == right.record_ref_map &&
+           left.variant_layout_index == right.variant_layout_index &&
+           left.variant_case_index == right.variant_case_index &&
+           value_vectors_equal(left.variant_fields, right.variant_fields) &&
+           left.variant_case_ref_maps == right.variant_case_ref_maps &&
+           values_equal(left.weak_target(), right.weak_target()) &&
+           values_equal(left.ephemeron_key(), right.ephemeron_key()) &&
+           values_equal(left.ephemeron_value(), right.ephemeron_value()) &&
+           left.ephemeron_value_is_ref() ==
+               right.ephemeron_value_is_ref();
+}
+
 } // namespace
 
 Object Object::pair(Value left_value, Value right_value) {
@@ -801,6 +877,20 @@ public:
 private:
     const Heap& heap_;
     const ForwardingTable& forwarding_;
+};
+
+class Heap::PartialForwardingVisitor final : public RootVisitor {
+public:
+    PartialForwardingVisitor(const Heap& heap, bool require_forwarded)
+        : heap_(heap), require_forwarded_(require_forwarded) {}
+
+    void visit(Value& root) override {
+        heap_.rewrite_incremental_compaction_value(root, require_forwarded_);
+    }
+
+private:
+    const Heap& heap_;
+    bool require_forwarded_;
 };
 
 class Heap::ValidatingVisitor final : public RootVisitor {
@@ -1107,6 +1197,21 @@ Handle Heap::make_handle(ObjectId id) {
 }
 
 ObjectId Heap::allocate_object(Object object) {
+    if (incremental_compaction_active_) {
+        std::vector<Value*> construction_roots;
+        visit_reference_fields(object, [&](Value& field) {
+            construction_roots.push_back(&field);
+        }, &metrics_);
+        if (object.kind == ObjectKind::WeakRef) {
+            construction_roots.push_back(&object.weak_target_);
+        } else if (object.kind == ObjectKind::Ephemeron) {
+            construction_roots.push_back(&object.ephemeron_key_);
+            if (object.ephemeron_value_is_ref_) {
+                construction_roots.push_back(&object.ephemeron_value_);
+            }
+        }
+        finish_incremental_compaction_impl(nullptr, construction_roots);
+    }
     validate_descriptor_shape(object, &metrics_);
     const auto required_slots = storage_slot_count(object);
     auto base = find_free_storage_run(required_slots);
@@ -1216,11 +1321,33 @@ bool Heap::is_storage_slot_free(std::size_t slot) const {
 std::size_t Heap::checked_slot(ObjectId id) const {
     const auto slot = slot_from(id);
     const auto generation = generation_from(id);
-    if (generation == 0 || slot >= objects_.size() || slot >= generations_.size() ||
-        generations_[slot] != generation || !objects_[slot].has_value()) {
-        throw std::out_of_range("invalid or stale object id");
+    if (generation != 0 && slot < objects_.size() &&
+        slot < generations_.size() && generations_[slot] == generation &&
+        objects_[slot].has_value()) {
+        return slot;
     }
-    return slot;
+
+    if (incremental_compaction_active_ &&
+        slot < incremental_compaction_source_ids_.size() &&
+        incremental_compaction_source_ids_[slot].has_value() &&
+        *incremental_compaction_source_ids_[slot] == id &&
+        slot < incremental_compaction_forwarding_.size() &&
+        incremental_compaction_forwarding_[slot].has_value()) {
+        const auto forwarded = *incremental_compaction_forwarding_[slot];
+        const auto destination_slot = slot_from(forwarded);
+        const auto destination_generation = generation_from(forwarded);
+        if (destination_generation == 0 ||
+            destination_slot >= objects_.size() ||
+            destination_slot >= generations_.size() ||
+            generations_[destination_slot] != destination_generation ||
+            !objects_[destination_slot].has_value()) {
+            throw std::logic_error(
+                "incremental compaction forwarding entry names no current object");
+        }
+        return destination_slot;
+    }
+
+    throw std::out_of_range("invalid or stale object id");
 }
 
 const Object& Heap::object(ObjectId id) const {
@@ -1411,11 +1538,11 @@ void Heap::trace_handle_roots(RootVisitor& visitor) const {
 }
 
 Value Heap::left(ObjectId id) const {
-    return checked_pair(id).left;
+    return canonicalize_incremental_compaction_read(checked_pair(id).left);
 }
 
 Value Heap::right(ObjectId id) const {
-    return checked_pair(id).right;
+    return canonicalize_incremental_compaction_read(checked_pair(id).right);
 }
 
 void Heap::set_left(ObjectId id, Value value) {
@@ -1444,6 +1571,15 @@ void Heap::array_set(ObjectId id, std::size_t index, std::int64_t value) {
         throw std::out_of_range("scalar array index out of bounds");
     }
     object.scalar_elements[index] = value;
+    if (incremental_compaction_active_) {
+        auto& shadow = incremental_compaction_shadow_object(id);
+        if (shadow.kind != ObjectKind::ScalarArray ||
+            index >= shadow.scalar_elements.size()) {
+            throw std::logic_error(
+                "incremental compaction scalar-array shadow shape drifted");
+        }
+        shadow.scalar_elements[index] = value;
+    }
 }
 
 std::size_t Heap::ref_array_length(ObjectId id) const {
@@ -1455,7 +1591,8 @@ Value Heap::ref_array_get(ObjectId id, std::size_t index) const {
     if (index >= object.ref_elements.size()) {
         throw std::out_of_range("ref array index out of bounds");
     }
-    return object.ref_elements[index];
+    return canonicalize_incremental_compaction_read(
+        object.ref_elements[index]);
 }
 
 void Heap::ref_array_set(ObjectId id, std::size_t index, Value value) {
@@ -1502,7 +1639,11 @@ Value Heap::closure_capture(ObjectId id, std::size_t index) const {
     if (index >= object.closure_captures.size()) {
         throw std::out_of_range("closure capture index out of bounds");
     }
-    return object.closure_captures[index];
+    auto value = object.closure_captures[index];
+    if (object.closure_capture_map[index]) {
+        value = canonicalize_incremental_compaction_read(value);
+    }
+    return value;
 }
 
 std::size_t Heap::map_layout_index(ObjectId id) const {
@@ -1575,7 +1716,12 @@ Value Heap::map_get(ObjectId id, Value key) const {
     if (!entry.has_value()) {
         throw std::out_of_range("map key not found");
     }
-    return checked_map(id).map_entries[*entry].value;
+    const auto& map = checked_map(id);
+    auto value = map.map_entries[*entry].value;
+    if (map.map_value_is_ref) {
+        value = canonicalize_incremental_compaction_read(value);
+    }
+    return value;
 }
 
 Value Heap::map_key_at(ObjectId id, std::size_t index) const {
@@ -1583,7 +1729,11 @@ Value Heap::map_key_at(ObjectId id, std::size_t index) const {
     if (index >= map.map_entries.size()) {
         throw std::out_of_range("map entry index out of bounds");
     }
-    return map.map_entries[index].key;
+    auto key = map.map_entries[index].key;
+    if (map.map_key_is_ref) {
+        key = canonicalize_incremental_compaction_read(key);
+    }
+    return key;
 }
 
 Value Heap::map_value_at(ObjectId id, std::size_t index) const {
@@ -1591,19 +1741,30 @@ Value Heap::map_value_at(ObjectId id, std::size_t index) const {
     if (index >= map.map_entries.size()) {
         throw std::out_of_range("map entry index out of bounds");
     }
-    return map.map_entries[index].value;
+    auto value = map.map_entries[index].value;
+    if (map.map_value_is_ref) {
+        value = canonicalize_incremental_compaction_read(value);
+    }
+    return value;
 }
 
 Value Heap::weak_get(ObjectId id) const {
-    return checked_weak_ref(id).weak_target();
+    return canonicalize_incremental_compaction_read(
+        checked_weak_ref(id).weak_target());
 }
 
 Value Heap::ephemeron_key(ObjectId id) const {
-    return checked_ephemeron(id).ephemeron_key();
+    return canonicalize_incremental_compaction_read(
+        checked_ephemeron(id).ephemeron_key());
 }
 
 Value Heap::ephemeron_value(ObjectId id) const {
-    return checked_ephemeron(id).ephemeron_value();
+    const auto& ephemeron = checked_ephemeron(id);
+    auto value = ephemeron.ephemeron_value();
+    if (ephemeron.ephemeron_value_is_ref()) {
+        value = canonicalize_incremental_compaction_read(value);
+    }
+    return value;
 }
 
 void Heap::ephemeron_set_value(ObjectId id, Value value) {
@@ -1623,7 +1784,11 @@ Value Heap::record_get(ObjectId id, std::size_t index) const {
     if (index >= record.record_fields.size()) {
         throw std::out_of_range("record field index out of bounds");
     }
-    return record.record_fields[index];
+    auto value = record.record_fields[index];
+    if (record.record_ref_map[index]) {
+        value = canonicalize_incremental_compaction_read(value);
+    }
+    return value;
 }
 
 void Heap::record_set(ObjectId id, std::size_t index, Value value) {
@@ -1647,7 +1812,16 @@ Value Heap::variant_get(ObjectId id, std::size_t index) const {
     if (index >= variant.variant_fields.size()) {
         throw std::out_of_range("variant field index out of bounds");
     }
-    return variant.variant_fields[index];
+    auto value = variant.variant_fields[index];
+    if (variant.variant_case_index >= variant.variant_case_ref_maps.size()) {
+        throw std::logic_error("variant case index exceeds reference maps");
+    }
+    const auto& ref_map =
+        variant.variant_case_ref_maps[variant.variant_case_index];
+    if (ref_map[index]) {
+        value = canonicalize_incremental_compaction_read(value);
+    }
+    return value;
 }
 
 void Heap::map_set(ObjectId id, Value key, Value value) {
@@ -1759,6 +1933,10 @@ void Heap::store_map_entry(ObjectId id, Value key, Value value) {
     validate_map_value(checked_map(id), value);
 
     if (!existing.has_value()) {
+        if (incremental_compaction_active_) {
+            std::array<Value*, 3> insertion_roots{&owner, &key, &value};
+            finish_incremental_compaction_impl(nullptr, insertion_roots);
+        }
         const auto& before = checked_map(owner.as_object());
         if (before.map_entries.size() >=
             std::numeric_limits<std::uint32_t>::max()) {
@@ -1768,6 +1946,15 @@ void Heap::store_map_entry(ObjectId id, Value key, Value value) {
         ensure_map_growth_storage(owner, key, value, required_width);
     }
 
+    if (incremental_compaction_active_) {
+        const auto& descriptor = checked_map(owner.as_object());
+        if (descriptor.map_key_is_ref) {
+            key = canonicalize_incremental_compaction_read(key);
+        }
+        if (descriptor.map_value_is_ref) {
+            value = canonicalize_incremental_compaction_read(value);
+        }
+    }
     incremental_write_barrier_before_publish(owner.as_object(), key);
     incremental_write_barrier_before_publish(owner.as_object(), value);
     const bool barrier_triggered = record_map_write_barrier_if_needed(
@@ -1782,6 +1969,23 @@ void Heap::store_map_entry(ObjectId id, Value key, Value value) {
         map.length = static_cast<std::uint32_t>(map.map_entries.size());
     }
     validate_descriptor_shape(map, &metrics_);
+    if (incremental_compaction_active_) {
+        if (!existing.has_value()) {
+            throw std::logic_error(
+                "incremental compaction shadow saw width-changing map insert");
+        }
+        auto& shadow =
+            incremental_compaction_shadow_object(owner.as_object());
+        if (shadow.kind != ObjectKind::Map ||
+            *existing >= shadow.map_entries.size()) {
+            throw std::logic_error(
+                "incremental compaction map shadow shape drifted");
+        }
+        shadow.map_entries[*existing].value =
+            shadow.map_value_is_ref
+                ? normalize_incremental_compaction_shadow_value(value)
+                : value;
+    }
 
     if (barrier_triggered &&
         stress_config_.collect_minor_after_every_write_barrier) {
@@ -1797,6 +2001,7 @@ void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     // Barrier hook: every pair field mutation must flow through this method. The public
     // heap API intentionally exposes only const object inspection plus set_left/set_right,
     // so bytecode cannot publish a field without running this old-to-young barrier.
+    value = canonicalize_incremental_compaction_read(value);
     auto& obj = checked_pair(id);
     incremental_write_barrier_before_publish(id, value);
     const bool barrier_triggered = record_write_barrier_if_needed(id, value);
@@ -1806,6 +2011,20 @@ void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     } else {
         obj.right = value;
     }
+    if (incremental_compaction_active_) {
+        auto& shadow = incremental_compaction_shadow_object(id);
+        if (shadow.kind != ObjectKind::Pair) {
+            throw std::logic_error(
+                "incremental compaction pair shadow kind drifted");
+        }
+        const auto shadow_value =
+            normalize_incremental_compaction_shadow_value(value);
+        if (field == PairField::Left) {
+            shadow.left = shadow_value;
+        } else {
+            shadow.right = shadow_value;
+        }
+    }
 
     if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
         collect_minor();
@@ -1814,6 +2033,7 @@ void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
 
 void Heap::store_ref_array_element(ObjectId id, std::size_t index, Value value) {
     require_object_reference_value(value, "ref array stored value");
+    value = canonicalize_incremental_compaction_read(value);
     auto& obj = checked_ref_array(id);
     if (index >= obj.ref_elements.size()) {
         throw std::out_of_range("ref array index out of bounds");
@@ -1822,6 +2042,16 @@ void Heap::store_ref_array_element(ObjectId id, std::size_t index, Value value) 
     incremental_write_barrier_before_publish(id, value);
     const bool barrier_triggered = record_write_barrier_if_needed(id, value);
     obj.ref_elements[index] = value;
+    if (incremental_compaction_active_) {
+        auto& shadow = incremental_compaction_shadow_object(id);
+        if (shadow.kind != ObjectKind::RefArray ||
+            index >= shadow.ref_elements.size()) {
+            throw std::logic_error(
+                "incremental compaction ref-array shadow shape drifted");
+        }
+        shadow.ref_elements[index] =
+            normalize_incremental_compaction_shadow_value(value);
+    }
 
     if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
         collect_minor();
@@ -1842,6 +2072,7 @@ void Heap::store_record_field(ObjectId id, std::size_t index, Value value) {
         }
         if (value.is_object()) {
             (void)checked_slot(value.as_object());
+            value = canonicalize_incremental_compaction_read(value);
         }
     } else if (value.tag() != Value::Tag::Int64 &&
                value.tag() != Value::Tag::Bool) {
@@ -1853,6 +2084,19 @@ void Heap::store_record_field(ObjectId id, std::size_t index, Value value) {
         is_reference && record_write_barrier_if_needed(id, value);
     record.record_fields[index] = value;
     validate_descriptor_shape(record, &metrics_);
+    if (incremental_compaction_active_) {
+        auto& shadow = incremental_compaction_shadow_object(id);
+        if (shadow.kind != ObjectKind::Record ||
+            index >= shadow.record_fields.size() ||
+            shadow.record_ref_map[index] != is_reference) {
+            throw std::logic_error(
+                "incremental compaction record shadow shape drifted");
+        }
+        shadow.record_fields[index] =
+            is_reference
+                ? normalize_incremental_compaction_shadow_value(value)
+                : value;
+    }
 
     if (barrier_triggered &&
         stress_config_.collect_minor_after_every_write_barrier) {
@@ -1871,7 +2115,10 @@ void Heap::store_ephemeron_value(ObjectId id, Value value) {
         if (value.tag() != Value::Tag::Object && value.tag() != Value::Tag::Nil) {
             throw std::logic_error("ephemeron reference value must be object or nil");
         }
-        if (value.is_object()) (void)checked_slot(value.as_object());
+        if (value.is_object()) {
+            (void)checked_slot(value.as_object());
+            value = canonicalize_incremental_compaction_read(value);
+        }
     } else if (value.tag() != Value::Tag::Int64 && value.tag() != Value::Tag::Bool) {
         throw std::logic_error("ephemeron scalar value must be i64 or bool");
     }
@@ -1881,6 +2128,19 @@ void Heap::store_ephemeron_value(ObjectId id, Value value) {
     const bool barrier = ephemeron.ephemeron_value_is_ref() &&
                          record_write_barrier_if_needed(id, value);
     ephemeron.ephemeron_value_ = value;
+    if (incremental_compaction_active_) {
+        auto& shadow = incremental_compaction_shadow_object(id);
+        if (shadow.kind != ObjectKind::Ephemeron ||
+            shadow.ephemeron_value_is_ref_ !=
+                ephemeron.ephemeron_value_is_ref_) {
+            throw std::logic_error(
+                "incremental compaction ephemeron shadow shape drifted");
+        }
+        shadow.ephemeron_value_ =
+            shadow.ephemeron_value_is_ref_
+                ? normalize_incremental_compaction_shadow_value(value)
+                : value;
+    }
     if (barrier && stress_config_.collect_minor_after_every_write_barrier) {
         std::array<Value*, 2> roots{&owner, &value};
         collect_impl(CollectionKind::Minor, nullptr, roots);
@@ -2112,6 +2372,10 @@ void Heap::start_incremental_marking() {
     if (incremental_marking_active_) {
         throw std::logic_error("incremental marking cycle already active");
     }
+    if (incremental_compaction_active_) {
+        throw std::logic_error(
+            "incremental marking cannot start during incremental compaction");
+    }
     validate_heap_storage_layout();
     validate_remembered_set();
     validate_weak_targets();
@@ -2164,26 +2428,603 @@ void Heap::finish_incremental_marking() {
     finish_incremental_marking_impl(nullptr, {});
 }
 
+void Heap::finish_incremental_marking_to_incremental_compaction() {
+    finish_incremental_marking_liveness(nullptr, {});
+    incremental_mark_worklist_.clear();
+    incremental_marking_active_ = false;
+    ++metrics_.incremental_final_pauses;
+    ++metrics_.incremental_compaction_cycles_started;
+    prepare_incremental_compaction_from_marked();
+}
+
+void Heap::start_incremental_compaction() {
+    if (incremental_compaction_active_) {
+        throw std::logic_error("incremental compaction cycle already active");
+    }
+    if (incremental_marking_active_) {
+        throw std::logic_error(
+            "incremental compaction cannot start during incremental marking");
+    }
+    validate_heap_storage_layout();
+    validate_remembered_set();
+    validate_weak_targets();
+    validate_ephemerons();
+    ++metrics_.major_collections;
+    ++metrics_.incremental_compaction_cycles_started;
+    prepare_incremental_compaction();
+}
+
+std::size_t Heap::incremental_compact_step(std::size_t budget) {
+    return incremental_compact_step_impl(budget, nullptr, {});
+}
+
+std::size_t Heap::incremental_compact_step_impl(
+    std::size_t budget, RootProvider* roots,
+    std::span<Value*> extra_roots) {
+    if (!incremental_compaction_active_) {
+        throw std::logic_error("incremental compaction step without active cycle");
+    }
+    ++metrics_.incremental_compaction_steps;
+    metrics_.incremental_compaction_budget_requested += budget;
+
+    std::size_t consumed = 0;
+    while (consumed < budget &&
+           incremental_compaction_cursor_ <
+               incremental_compaction_plan_.size()) {
+        const auto& entry =
+            incremental_compaction_plan_[incremental_compaction_cursor_];
+        const auto source_slot = checked_slot(entry.source_id);
+        if (source_slot != entry.source_slot ||
+            source_slot >= objects_.size() ||
+            !objects_[source_slot].has_value()) {
+            throw std::logic_error(
+                "incremental compaction source identity drifted");
+        }
+        if (storage_slot_count(*objects_[source_slot]) != entry.width) {
+            throw std::logic_error(
+                "incremental compaction source width drifted");
+        }
+        if (entry.destination_slot + entry.width > objects_.size()) {
+            throw std::logic_error(
+                "incremental compaction destination exceeds heap storage");
+        }
+        for (std::size_t offset = 0; offset < entry.width; ++offset) {
+            const auto slot = entry.destination_slot + offset;
+            if (objects_[slot].has_value() && slot != entry.source_slot) {
+                throw std::logic_error(
+                    "incremental compaction destination overlaps a live header");
+            }
+        }
+
+        auto moved = *objects_[source_slot];
+        const bool promoted =
+            moved.generation == ObjectGeneration::Young;
+        moved.marked = false;
+        if (promoted) {
+            moved.generation = ObjectGeneration::Old;
+        }
+        if (TEST_ONLY_corrupt_next_incremental_compaction_copy_) {
+            TEST_ONLY_corrupt_next_incremental_compaction_copy_ = false;
+            if (moved.kind != ObjectKind::Pair ||
+                moved.left.tag() != Value::Tag::Int64 ||
+                moved.left.as_i64() ==
+                    std::numeric_limits<std::int64_t>::max()) {
+                throw std::logic_error(
+                    "test-only compaction corruption requires a scalar pair");
+            }
+            moved.left = Value::int64(moved.left.as_i64() + 1);
+        }
+        if (entry.source_slot != entry.destination_slot) {
+            objects_[entry.source_slot].reset();
+            ++metrics_.objects_moved;
+        }
+        generations_[entry.destination_slot] =
+            generation_from(entry.destination_id);
+        objects_[entry.destination_slot] = std::move(moved);
+
+        ++metrics_.compaction_objects_copied;
+        const auto copied_bytes = entry.width * kStorageSlotBytes;
+        switch (objects_[entry.destination_slot]->kind) {
+        case ObjectKind::Pair:
+            metrics_.compaction_pair_bytes += copied_bytes;
+            break;
+        case ObjectKind::ScalarArray:
+            metrics_.compaction_scalar_array_bytes += copied_bytes;
+            break;
+        case ObjectKind::RefArray:
+            metrics_.compaction_ref_array_bytes += copied_bytes;
+            break;
+        case ObjectKind::Str:
+            metrics_.compaction_string_bytes += copied_bytes;
+            break;
+        case ObjectKind::Closure:
+            metrics_.compaction_closure_bytes += copied_bytes;
+            break;
+        case ObjectKind::Map:
+            metrics_.compaction_map_bytes += copied_bytes;
+            break;
+        case ObjectKind::WeakRef:
+            metrics_.compaction_weak_ref_bytes += copied_bytes;
+            break;
+        case ObjectKind::Record:
+        case ObjectKind::Variant:
+        case ObjectKind::Ephemeron:
+            break;
+        }
+
+        incremental_compaction_forwarding_[entry.source_slot] =
+            entry.destination_id;
+        ++incremental_compaction_cursor_;
+        ++consumed;
+        ++metrics_.incremental_compaction_objects_relocated;
+
+        rewrite_incremental_compaction_roots(roots, extra_roots);
+        forward_incremental_compaction_registries(entry);
+        if (promoted) {
+            const std::array<std::size_t, 1> promoted_slots{
+                entry.destination_slot};
+            record_promoted_object_edges(promoted_slots);
+        }
+        validate_after_collection(roots, extra_roots);
+    }
+    if (consumed == 0) {
+        validate_after_collection(roots, extra_roots);
+    }
+    return consumed;
+}
+
+void Heap::finish_incremental_compaction() {
+    finish_incremental_compaction_impl(nullptr, {});
+}
+
+void Heap::finish_incremental_compaction_impl(
+    RootProvider* roots, std::span<Value*> extra_roots) {
+    if (!incremental_compaction_active_) {
+        throw std::logic_error("incremental compaction finish without active cycle");
+    }
+    if (!incremental_compaction_quiescent()) {
+        const auto remaining =
+            incremental_compaction_plan_.size() -
+            incremental_compaction_cursor_;
+        (void)incremental_compact_step_impl(remaining, roots, extra_roots);
+    }
+    finalize_incremental_compaction(roots, extra_roots);
+}
+
+void Heap::prepare_incremental_compaction() {
+    if (incremental_compaction_active_) {
+        throw std::logic_error(
+            "incremental compaction preparation during active cycle");
+    }
+
+    std::vector<ObjectId> worklist;
+    MarkingVisitor marker(*this, worklist, CollectionKind::Major);
+    trace_collection_roots(marker, nullptr, {});
+    drain_mark_worklist(worklist, CollectionKind::Major);
+    process_ephemeron_fixpoint(worklist, CollectionKind::Major);
+    prepare_incremental_compaction_from_marked();
+}
+
+void Heap::prepare_incremental_compaction_from_marked() {
+    incremental_compaction_plan_.clear();
+    incremental_compaction_cursor_ = 0;
+    incremental_compaction_forwarding_.assign(objects_.size(), std::nullopt);
+    incremental_compaction_source_ids_.assign(objects_.size(), std::nullopt);
+    incremental_compaction_destination_generations_ = generations_;
+
+    std::size_t destination_slot = 0;
+    for (std::size_t source_slot = 0; source_slot < objects_.size();
+         ++source_slot) {
+        if (!objects_[source_slot].has_value() ||
+            !objects_[source_slot]->marked) {
+            continue;
+        }
+        const auto width = storage_slot_count(*objects_[source_slot]);
+        if (destination_slot + width > objects_.size()) {
+            throw std::logic_error(
+                "incremental compaction plan exceeds heap storage");
+        }
+        const auto source_id = make_object_id(
+            static_cast<std::uint32_t>(source_slot),
+            generations_[source_slot]);
+        if (source_slot != destination_slot) {
+            incremental_compaction_destination_generations_[destination_slot] =
+                generation_for_new_base(
+                    incremental_compaction_destination_generations_[
+                        destination_slot]);
+        }
+        const auto destination_id = make_object_id(
+            static_cast<std::uint32_t>(destination_slot),
+            incremental_compaction_destination_generations_[
+                destination_slot]);
+        incremental_compaction_source_ids_[source_slot] = source_id;
+        incremental_compaction_plan_.push_back(
+            IncrementalCompactionEntry{source_id, source_slot, width,
+                                       destination_id, destination_slot});
+        destination_slot += width;
+    }
+
+    std::vector<ObjectId> live_weak_refs;
+    live_weak_refs.reserve(weak_refs_.size());
+    for (const auto owner_id : weak_refs_) {
+        const auto owner_slot = checked_slot(owner_id);
+        if (!objects_[owner_slot]->marked) {
+            continue;
+        }
+        auto& target = objects_[owner_slot]->weak_target_;
+        if (target.is_object()) {
+            const auto target_slot = checked_slot(target.as_object());
+            if (!objects_[target_slot]->marked) {
+                target = Value::nil();
+            }
+        }
+        live_weak_refs.push_back(owner_id);
+    }
+    weak_refs_ = std::move(live_weak_refs);
+
+    std::vector<ObjectId> live_ephemerons;
+    live_ephemerons.reserve(ephemerons_.size());
+    for (const auto owner_id : ephemerons_) {
+        const auto owner_slot = checked_slot(owner_id);
+        if (!objects_[owner_slot]->marked) {
+            continue;
+        }
+        auto& owner = *objects_[owner_slot];
+        if (owner.ephemeron_key_.is_object()) {
+            const auto key_slot = checked_slot(owner.ephemeron_key_.as_object());
+            if (!objects_[key_slot]->marked) {
+                owner.ephemeron_key_ = Value::nil();
+                owner.ephemeron_value_ = Value::nil();
+            }
+        }
+        live_ephemerons.push_back(owner_id);
+    }
+    ephemerons_ = std::move(live_ephemerons);
+
+    std::vector<ObjectId> live_remembered;
+    live_remembered.reserve(remembered_set_.size());
+    for (const auto owner_id : remembered_set_) {
+        const auto owner_slot = checked_slot(owner_id);
+        if (objects_[owner_slot]->marked) {
+            live_remembered.push_back(owner_id);
+        }
+    }
+    remembered_set_ = std::move(live_remembered);
+
+    for (auto& slot : objects_) {
+        if (!slot.has_value()) {
+            continue;
+        }
+        if (slot->marked) {
+            slot->marked = false;
+        } else {
+            slot.reset();
+        }
+    }
+
+    incremental_compaction_shadow_objects_ = objects_;
+    incremental_compaction_shadow_generations_ = generations_;
+    incremental_compaction_shadow_weak_refs_ = weak_refs_;
+    incremental_compaction_shadow_ephemerons_ = ephemerons_;
+    incremental_compaction_active_ = true;
+    validate_after_collection(nullptr, {});
+}
+
+void Heap::rewrite_incremental_compaction_roots(
+    RootProvider* roots, std::span<Value*> extra_roots) {
+    PartialForwardingVisitor visitor(*this, false);
+    trace_collection_roots(visitor, roots, extra_roots);
+}
+
+void Heap::rewrite_incremental_compaction_value(
+    Value& value, bool require_forwarded) const {
+    if (!value.is_object()) {
+        return;
+    }
+    const auto id = value.as_object();
+    const auto source_slot = static_cast<std::size_t>(slot_from(id));
+    if (source_slot < incremental_compaction_source_ids_.size() &&
+        incremental_compaction_source_ids_[source_slot].has_value() &&
+        *incremental_compaction_source_ids_[source_slot] == id) {
+        if (source_slot < incremental_compaction_forwarding_.size() &&
+            incremental_compaction_forwarding_[source_slot].has_value()) {
+            value = Value::object(
+                *incremental_compaction_forwarding_[source_slot]);
+            (void)checked_slot(value.as_object());
+            return;
+        }
+        if (require_forwarded) {
+            throw std::logic_error(
+                "incremental compaction final rewrite found an unmoved object");
+        }
+        (void)checked_slot(id);
+        return;
+    }
+    (void)checked_slot(id);
+}
+
+Value Heap::canonicalize_incremental_compaction_read(Value value) const {
+    if (incremental_compaction_active_) {
+        rewrite_incremental_compaction_value(value, false);
+    }
+    return value;
+}
+
+Value Heap::normalize_incremental_compaction_shadow_value(Value value) const {
+    if (!value.is_object()) {
+        return value;
+    }
+    const auto id = value.as_object();
+    const auto possible_source_slot =
+        static_cast<std::size_t>(slot_from(id));
+    if (possible_source_slot <
+            incremental_compaction_source_ids_.size() &&
+        incremental_compaction_source_ids_[possible_source_slot].has_value() &&
+        *incremental_compaction_source_ids_[possible_source_slot] == id) {
+        return value;
+    }
+    for (const auto& entry : incremental_compaction_plan_) {
+        if (entry.destination_id == id) {
+            return Value::object(entry.source_id);
+        }
+    }
+    (void)checked_slot(id);
+    throw std::logic_error(
+        "incremental compaction shadow saw an object outside its source snapshot");
+}
+
+Object& Heap::incremental_compaction_shadow_object(ObjectId id) {
+    if (!incremental_compaction_active_) {
+        throw std::logic_error(
+            "incremental compaction shadow access outside active phase");
+    }
+    const auto normalized_owner =
+        normalize_incremental_compaction_shadow_value(Value::object(id));
+    const auto source_slot =
+        static_cast<std::size_t>(slot_from(normalized_owner.as_object()));
+    if (source_slot >= incremental_compaction_shadow_objects_.size() ||
+        !incremental_compaction_shadow_objects_[source_slot].has_value()) {
+        throw std::logic_error(
+            "incremental compaction mutation has no shadow owner");
+    }
+    return *incremental_compaction_shadow_objects_[source_slot];
+}
+
+void Heap::forward_incremental_compaction_registries(
+    const IncrementalCompactionEntry& entry) {
+    const auto forward_owner = [&](ObjectId& owner) {
+        if (owner == entry.source_id) {
+            owner = entry.destination_id;
+        }
+    };
+    for (auto& owner : remembered_set_) {
+        forward_owner(owner);
+    }
+    for (auto& owner : weak_refs_) {
+        forward_owner(owner);
+    }
+    for (auto& owner : ephemerons_) {
+        forward_owner(owner);
+    }
+}
+
+void Heap::validate_incremental_compaction_against_atomic(
+    RootProvider* roots, std::span<Value*> extra_roots) const {
+    if (!incremental_compaction_active_ ||
+        incremental_compaction_cursor_ !=
+            incremental_compaction_plan_.size()) {
+        throw std::logic_error(
+            "incremental compaction differential validation outside quiescence");
+    }
+
+    ForwardingTable expected_forwarding(
+        incremental_compaction_shadow_objects_.size());
+    std::vector<std::optional<Object>> expected_objects(
+        incremental_compaction_shadow_objects_.size());
+    auto expected_generations =
+        incremental_compaction_shadow_generations_;
+    std::size_t destination_slot = 0;
+    for (std::size_t source_slot = 0;
+         source_slot < incremental_compaction_shadow_objects_.size();
+         ++source_slot) {
+        const auto& source =
+            incremental_compaction_shadow_objects_[source_slot];
+        if (!source.has_value()) {
+            continue;
+        }
+        const auto width = storage_slot_count(*source);
+        if (destination_slot + width > expected_objects.size()) {
+            throw std::logic_error(
+                "incremental compaction/STW differential plan overflow");
+        }
+        if (source_slot != destination_slot) {
+            expected_generations[destination_slot] =
+                generation_for_new_base(
+                    expected_generations[destination_slot]);
+        }
+        const auto destination_id = make_object_id(
+            static_cast<std::uint32_t>(destination_slot),
+            expected_generations[destination_slot]);
+        expected_forwarding[source_slot] = destination_id;
+        auto moved = *source;
+        moved.marked = false;
+        moved.generation = ObjectGeneration::Old;
+        expected_objects[destination_slot] = std::move(moved);
+        destination_slot += width;
+    }
+
+    const auto rewrite_shadow_value = [&](Value& value) {
+        if (!value.is_object()) {
+            return;
+        }
+        const auto source_id = value.as_object();
+        const auto source_slot =
+            static_cast<std::size_t>(slot_from(source_id));
+        if (generation_from(source_id) == 0 ||
+            source_slot >= incremental_compaction_shadow_objects_.size() ||
+            source_slot >= incremental_compaction_shadow_generations_.size() ||
+            incremental_compaction_shadow_generations_[source_slot] !=
+                generation_from(source_id) ||
+            !incremental_compaction_shadow_objects_[source_slot].has_value() ||
+            source_slot >= expected_forwarding.size() ||
+            !expected_forwarding[source_slot].has_value()) {
+            throw std::logic_error(
+                "incremental compaction/STW differential invalid source reference");
+        }
+        value = Value::object(*expected_forwarding[source_slot]);
+    };
+
+    for (auto& slot : expected_objects) {
+        if (!slot.has_value()) {
+            continue;
+        }
+        visit_reference_fields(*slot, [&](Value& field) {
+            rewrite_shadow_value(field);
+        });
+        if (slot->kind == ObjectKind::WeakRef) {
+            rewrite_shadow_value(slot->weak_target_);
+        } else if (slot->kind == ObjectKind::Ephemeron) {
+            rewrite_shadow_value(slot->ephemeron_key_);
+            if (slot->ephemeron_value_is_ref_) {
+                rewrite_shadow_value(slot->ephemeron_value_);
+            }
+        }
+    }
+
+    const auto rewrite_shadow_registry =
+        [&](const std::vector<ObjectId>& source_registry) {
+            std::vector<ObjectId> rewritten;
+            rewritten.reserve(source_registry.size());
+            for (const auto source_id : source_registry) {
+                auto value = Value::object(source_id);
+                rewrite_shadow_value(value);
+                rewritten.push_back(value.as_object());
+            }
+            return rewritten;
+        };
+    const auto expected_weak_refs = rewrite_shadow_registry(
+        incremental_compaction_shadow_weak_refs_);
+    const auto expected_ephemerons = rewrite_shadow_registry(
+        incremental_compaction_shadow_ephemerons_);
+
+    class RootSnapshotVisitor final : public RootVisitor {
+    public:
+        explicit RootSnapshotVisitor(std::vector<Value>& values)
+            : values_(values) {}
+        void visit(Value& value) override { values_.push_back(value); }
+
+    private:
+        std::vector<Value>& values_;
+    };
+    std::vector<Value> actual_roots;
+    RootSnapshotVisitor root_visitor(actual_roots);
+    trace_collection_roots(root_visitor, roots, extra_roots);
+    std::vector<Value> expected_roots = actual_roots;
+    for (auto& root : expected_roots) {
+        root = normalize_incremental_compaction_shadow_value(root);
+        rewrite_shadow_value(root);
+    }
+
+    if (expected_forwarding.size() !=
+        incremental_compaction_forwarding_.size()) {
+        throw std::logic_error(
+            "incremental compaction/STW differential forwarding size mismatch");
+    }
+    for (std::size_t slot = 0; slot < expected_forwarding.size(); ++slot) {
+        if (expected_forwarding[slot] !=
+            incremental_compaction_forwarding_[slot]) {
+            throw std::logic_error(
+                "incremental compaction/STW differential forwarding mismatch at heap slot " +
+                std::to_string(slot));
+        }
+    }
+    if (expected_generations != generations_) {
+        throw std::logic_error(
+            "incremental compaction/STW differential generation mismatch");
+    }
+    if (expected_objects.size() != objects_.size()) {
+        throw std::logic_error(
+            "incremental compaction/STW differential heap size mismatch");
+    }
+    for (std::size_t slot = 0; slot < expected_objects.size(); ++slot) {
+        if (expected_objects[slot].has_value() !=
+            objects_[slot].has_value()) {
+            throw std::logic_error(
+                "incremental compaction/STW differential occupancy mismatch at heap slot " +
+                std::to_string(slot));
+        }
+        if (expected_objects[slot].has_value() &&
+            !objects_equal(*expected_objects[slot], *objects_[slot])) {
+            throw std::logic_error(
+                "incremental compaction/STW differential object mismatch at heap slot " +
+                std::to_string(slot));
+        }
+    }
+    if (expected_weak_refs != weak_refs_) {
+        throw std::logic_error(
+            "incremental compaction/STW differential weak registry mismatch");
+    }
+    if (expected_ephemerons != ephemerons_) {
+        throw std::logic_error(
+            "incremental compaction/STW differential ephemeron registry mismatch");
+    }
+    if (!remembered_set_.empty()) {
+        throw std::logic_error(
+            "incremental compaction/STW differential remembered-set mismatch");
+    }
+    if (!value_vectors_equal(expected_roots, actual_roots)) {
+        throw std::logic_error(
+            "incremental compaction/STW differential precise-root mismatch");
+    }
+    ++metrics_.incremental_compaction_differential_validations;
+}
+
+void Heap::finalize_incremental_compaction(
+    RootProvider* roots, std::span<Value*> extra_roots) {
+    if (!incremental_compaction_quiescent()) {
+        throw std::logic_error(
+            "incremental compaction finalized before relocation quiescence");
+    }
+    PartialForwardingVisitor visitor(*this, true);
+    trace_collection_roots(visitor, roots, extra_roots);
+    for (auto& slot : objects_) {
+        if (!slot.has_value()) {
+            continue;
+        }
+        visit_reference_fields(*slot, [&](Value& field) {
+            rewrite_incremental_compaction_value(field, true);
+        }, &metrics_);
+        if (slot->kind == ObjectKind::WeakRef) {
+            rewrite_incremental_compaction_value(slot->weak_target_, true);
+        } else if (slot->kind == ObjectKind::Ephemeron) {
+            rewrite_incremental_compaction_value(slot->ephemeron_key_, true);
+            if (slot->ephemeron_value_is_ref_) {
+                rewrite_incremental_compaction_value(
+                    slot->ephemeron_value_, true);
+            }
+        }
+    }
+    prune_remembered_set();
+    validate_after_collection(roots, extra_roots);
+    validate_incremental_compaction_against_atomic(roots, extra_roots);
+
+    incremental_compaction_active_ = false;
+    incremental_compaction_plan_.clear();
+    incremental_compaction_cursor_ = 0;
+    incremental_compaction_forwarding_.clear();
+    incremental_compaction_source_ids_.clear();
+    incremental_compaction_destination_generations_.clear();
+    incremental_compaction_shadow_objects_.clear();
+    incremental_compaction_shadow_generations_.clear();
+    incremental_compaction_shadow_weak_refs_.clear();
+    incremental_compaction_shadow_ephemerons_.clear();
+    ++metrics_.incremental_compaction_final_pauses;
+    validate_after_collection(roots, extra_roots);
+}
+
 void Heap::finish_incremental_marking_impl(RootProvider* roots,
                                            std::span<Value*> extra_roots) {
-    if (!incremental_marking_active_) {
-        throw std::logic_error("incremental marking finish without active cycle");
-    }
-    TEST_ONLY_validate_incremental_marking();
-
-    // The final pause is also the differential liveness oracle. Recompute from the
-    // current root graph so floating garbage created by edge deletion cannot make an
-    // incremental schedule differ from an atomic major collection at this boundary.
-    // The bounded phase remains independently checked by the tri-colour validator above.
-    for (auto& slot : objects_) {
-        if (slot.has_value()) slot->marked = false;
-    }
-    incremental_mark_worklist_.clear();
-    MarkingVisitor marker(*this, incremental_mark_worklist_, CollectionKind::Major);
-    trace_collection_roots(marker, roots, extra_roots);
-    drain_mark_worklist(incremental_mark_worklist_, CollectionKind::Major);
-    process_ephemeron_fixpoint(incremental_mark_worklist_, CollectionKind::Major);
-    validate_incremental_result_against_atomic(roots, extra_roots);
+    finish_incremental_marking_liveness(roots, extra_roots);
 
     auto compacted = compact_live_objects(CollectionKind::Major);
     metrics_.objects_moved += compacted.objects_moved;
@@ -2205,6 +3046,28 @@ void Heap::finish_incremental_marking_impl(RootProvider* roots,
     record_promoted_object_edges(compacted.promoted_slots);
     prune_remembered_set();
     validate_after_collection(roots, extra_roots);
+}
+
+void Heap::finish_incremental_marking_liveness(
+    RootProvider* roots, std::span<Value*> extra_roots) {
+    if (!incremental_marking_active_) {
+        throw std::logic_error("incremental marking finish without active cycle");
+    }
+    TEST_ONLY_validate_incremental_marking();
+
+    // The final pause is also the differential liveness oracle. Recompute from the
+    // current root graph so floating garbage created by edge deletion cannot make an
+    // incremental schedule differ from an atomic major collection at this boundary.
+    // The bounded phase remains independently checked by the tri-colour validator above.
+    for (auto& slot : objects_) {
+        if (slot.has_value()) slot->marked = false;
+    }
+    incremental_mark_worklist_.clear();
+    MarkingVisitor marker(*this, incremental_mark_worklist_, CollectionKind::Major);
+    trace_collection_roots(marker, roots, extra_roots);
+    drain_mark_worklist(incremental_mark_worklist_, CollectionKind::Major);
+    process_ephemeron_fixpoint(incremental_mark_worklist_, CollectionKind::Major);
+    validate_incremental_result_against_atomic(roots, extra_roots);
 }
 
 void Heap::validate_incremental_result_against_atomic(
@@ -2285,6 +3148,9 @@ void Heap::collect_with_extra_roots(std::span<Value*> extra_roots) {
 }
 
 void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots) {
+    if (incremental_compaction_active_) {
+        finish_incremental_compaction_impl(roots, extra_roots);
+    }
     if (incremental_marking_active_) {
         finish_incremental_marking_impl(roots, extra_roots);
     }

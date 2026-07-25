@@ -72,6 +72,7 @@ private:
     gc::StressConfig gc_stress_{};
     std::uint64_t instructions_executed_{0};
     std::size_t incremental_budget_cursor_{0};
+    std::size_t incremental_compaction_budget_cursor_{0};
     std::uint64_t raw_module_executions_{0};
     std::uint64_t raw_function_executions_{0};
     std::size_t max_call_depth_{1024};

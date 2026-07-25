@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     const auto schedules = fuzz::schedules();
-    if (schedules.size() != 12) throw std::runtime_error("expected twelve schedules");
+    if (schedules.size() != 15) throw std::runtime_error("expected fifteen schedules");
     for (std::uint64_t seed = 1; seed <= kSeeds; ++seed) {
         const auto module = compile(seed);
         const auto baseline = fuzz::execute_once(module, schedules.front());
@@ -51,5 +51,5 @@ int main(int argc, char** argv) {
             }
         }
     }
-    std::cerr << "[PASS] lang_iteration35_exceptions_fuzz seeds=32 schedules=10 executions=320\n";
+    std::cerr << "[PASS] lang_iteration35_exceptions_fuzz seeds=32 schedules=15 executions=480\n";
 }

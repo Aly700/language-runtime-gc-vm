@@ -101,7 +101,10 @@ bool schedule_clears_dropped_target(const fuzz::Schedule& schedule) {
     const std::string name = schedule.name;
     return name == "major_every_1" || name == "major_every_3" ||
            name == "major_every_7" || name == "incremental_1" ||
-           name == "incremental_3_1" || name == "combined";
+           name == "incremental_3_1" || name == "combined" ||
+           name == "incremental_compact_1" ||
+           name == "incremental_compact_3_1" ||
+           name == "combined_mark_compact";
 }
 
 std::string expected_observable(const GeneratedProgram& generated,
@@ -301,8 +304,8 @@ void require_weak_grammar(const std::string& value) {
 
 int run(int argc, char** argv) {
     const auto all_schedules = fuzz::schedules();
-    require(all_schedules.size() == 12,
-            "weak fuzz target requires exactly twelve deterministic schedules");
+    require(all_schedules.size() == 15,
+            "weak fuzz target requires exactly fifteen deterministic schedules");
 
     if (argc == 7 && std::string(argv[1]) == "--grammar" &&
         std::string(argv[3]) == "--seed" &&

@@ -1,11 +1,12 @@
 # Architecture — Language Runtime
 
-Iteration 37 completes Wave 3 with deterministic incremental major marking. Integer
-budgets consume complete descriptor scans at VM instruction boundaries; insertion
-barriers preserve no-black-to-white, allocation shades new objects, and a final atomic
-remark makes liveness identical to stop-the-world marking. Ephemeron fixpoint, weak
-clearing, and movement remain in the final stop-the-world phase. See
-[ADR-0014](adr/0014-incremental-marking.md).
+Iteration 38 completes Wave 3 with deterministic incremental major marking and
+compaction. Marking budgets consume complete descriptor scans; compaction budgets consume
+complete survivor relocations at VM instruction boundaries. A phase-local exact-ID read
+barrier keeps moved and unmoved objects usable without weakening generation traps, and an
+independent shadow slide proves the final graph matches stop-the-world compaction. See
+[ADR-0014](adr/0014-incremental-marking.md) and
+[ADR-0015](adr/0015-incremental-compaction.md).
 
 ## Pipeline
 
@@ -341,10 +342,12 @@ control remains deferred.
   instructions. Every stress collection runs the same post-collection reference validation
   as explicit collections. No stress trigger depends on wall-clock time, randomness,
   threads, or host addresses.
-- Incremental stress adds cyclic positive object-scan budgets. `incremental_1` and
-  `incremental_3_1` run independently, while `combined` composes budgets with allocation,
-  atomic major/minor, and barrier triggers. Map-growth movement forwards the grey list;
-  VM execution finishes an active cycle before returning.
+- Incremental stress adds cyclic positive object-scan and survivor-relocation budgets.
+  `incremental_1` and `incremental_3_1` preserve the marking-only paths;
+  `incremental_compact_1` and `incremental_compact_3_1` establish liveness atomically and
+  move incrementally. `combined_mark_compact` transfers the final marking remark into
+  compaction. Map growth and allocation finish compaction before changing layout; VM
+  execution finishes either active phase before returning or propagating a trap.
 - Differential fuzz outcomes retain both the canonical return value/heap graph and the
   exact output bytes. Every schedule comparison checks both fields. Iteration 29 owns a
   separate pinned `output` grammar so the eleven legacy generators and corpus dumps remain
@@ -352,16 +355,20 @@ control remains deferred.
   for-in map recovery, printing, and deterministic runtime traps.
 - Iteration 31 adds a separate pinned `strings2` grammar. Its 32 seeds exercise
   substring/ordering/concat/length/index composition, map keys, closures, for-in break,
-  and output across the same ten schedules. The target supports deterministic schedule and
+  and output across the same fifteen schedules. The target supports deterministic schedule and
   mutant replay without modifying any legacy generator stream.
 - Iteration 33 adds a separate pinned `records` grammar. Its 32 seeds compare canonical
   heap graphs and output bytes while exercising mixed field layouts, mutation, recursive
   records, containers, captures, weak targets, and for-in use. No legacy generator stream
   or pinned corpus changes.
 - Iteration 34 adds a separate pinned `variants` grammar. Its 32 seeds compare canonical
-  heap graphs and output bytes across ten schedules while exercising nominal construction,
+  heap graphs and output bytes across fifteen schedules while exercising nominal construction,
   exhaustive matches, recursion, exact arm bindings, and mixed scalar/reference cases.
   Every legacy generator stream and pinned dump remains byte-identical.
+- Iteration 38 adds a separate pinned `incremental_compaction` grammar. Its 32 seeds return
+  mixed-width graphs and emit output across all fifteen schedules while exercising every
+  heap layout, holes, phase boundaries, and fixed-width mutations. The first twelve
+  schedule definitions and all seventeen legacy corpus generators remain unchanged.
 
 ## Performance measurement
 
@@ -584,6 +591,27 @@ Rejected alternative: a permanent handle-indirection table where ObjectIds never
 That would preserve external numeric handles, but it would not exercise the root and heap
 field rewriting invariant this phase is meant to protect. The current forwarding design
 makes missed updates fail as stale IDs.
+
+### Incremental compaction
+
+Incremental major compaction freezes a source-ordered sliding plan after atomic liveness,
+weak-target decisions, and ephemeron fixpoint. One integer budget unit copies and installs
+one complete survivor. The checked dereference funnel accepts either a physically current
+full ID or an exact saved source ID with installed forwarding; every other generation
+traps. Roots and collector registries are partially rewritten after each unit, while
+descriptor fields may retain resolvable source IDs until final canonical rewriting.
+
+Incremental marking and compaction never overlap. Combined stress transfers marking's
+final-remark live set into compaction without an atomic move. Fixed-width stores mirror
+their exact field update into an independent source-positioned shadow. Allocation,
+new-key map insertion, map growth, and explicit collection are width/phase boundaries
+that first finish compaction with temporary operands rooted. Preparation, each unit, and
+finalization run the ordinary layout, root, remembered-set, weak, and ephemeron validators.
+
+The completion oracle independently repeats an atomic slide from the shadow, including
+generation minting, descriptor rewrites, weak/ephemeron registries, precise roots, and
+payload comparison. It does not copy production destination objects or consult installed
+production forwarding to derive its expected heap.
 
 ## Generational collection
 

@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("unknown mutant");
         }
         const auto schedules = fuzz::schedules();
-        if (schedules.size() != 12) throw std::runtime_error("expected twelve schedules");
+        if (schedules.size() != 15) throw std::runtime_error("expected fifteen schedules");
         if (argc == 5 && std::string(argv[1]) == "--seed" &&
             std::string(argv[3]) == "--schedule") {
             const auto seed = static_cast<std::uint64_t>(std::stoull(argv[2]));
@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
                                              " schedule=" + schedule.name);
             }
         }
-        std::cerr << "[PASS] lang_iteration36_ephemerons_fuzz seeds=32 schedules=10 executions=320 mutants=6\n";
+        std::cerr << "[PASS] lang_iteration36_ephemerons_fuzz seeds=32 schedules=15 executions=480 mutants=6\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "[FAIL] " << error.what() << '\n';

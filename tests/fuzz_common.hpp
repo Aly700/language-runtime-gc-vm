@@ -94,6 +94,19 @@ inline std::vector<Schedule> schedules() {
     combined.incremental_mark_step_budgets = {2, 1};
     result.push_back({"combined", combined});
 
+    lang::gc::StressConfig incremental_compact_one;
+    incremental_compact_one.incremental_compact_step_budgets = {1};
+    result.push_back({"incremental_compact_1", incremental_compact_one});
+
+    lang::gc::StressConfig incremental_compact_mixed;
+    incremental_compact_mixed.incremental_compact_step_budgets = {3, 1};
+    result.push_back(
+        {"incremental_compact_3_1", incremental_compact_mixed});
+
+    auto combined_mark_compact = combined;
+    combined_mark_compact.incremental_compact_step_budgets = {1, 2};
+    result.push_back({"combined_mark_compact", combined_mark_compact});
+
     return result;
 }
 
@@ -110,6 +123,14 @@ inline const Schedule& find_schedule(const std::vector<Schedule>& all,
         out << " " << schedule.name;
     }
     throw std::runtime_error(out.str());
+}
+
+inline Schedule find_schedule(std::vector<Schedule>&& all,
+                              const std::string& name) {
+    // A caller may look up directly in schedules(). Returning a reference to an
+    // element of that temporary would dangle at the end of the full expression.
+    // Materialize the selected schedule before the temporary vector is destroyed.
+    return find_schedule(static_cast<const std::vector<Schedule>&>(all), name);
 }
 
 inline std::uint64_t parse_seed(const std::string& value) {
