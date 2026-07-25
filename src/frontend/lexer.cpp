@@ -220,6 +220,8 @@ private:
             kind = TokenKind::Catch;
         } else if (text == "throw") {
             kind = TokenKind::Throw;
+        } else if (text == "return") {
+            kind = TokenKind::Return;
         } else if (text == "fn") {
             kind = TokenKind::Fn;
         } else if (text == "if") {

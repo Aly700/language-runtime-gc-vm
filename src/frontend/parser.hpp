@@ -219,6 +219,7 @@ struct Statement {
         Continue,
         Print,
         EphemeronSet,
+        TailCall,
     };
 
     Kind kind{Kind::Let};

@@ -8,6 +8,10 @@
   match the values proven on the caller stack.
 - A return instruction may only return a value whose kind matches the current function's
   declared return kind.
+- A `TailCall` is a terminal direct transition. The verifier must prove that its target
+  needs no captures, its complete return signature exactly matches the current function,
+  and its operand stack contains exactly the conforming outgoing arguments with no other
+  value. It has no ordinary or exceptional successor.
 - Every live VM frame's operand stack and locals are precise mutable roots. Moving
   collection must rewrite references in active and suspended frames before bytecode
   execution resumes.
@@ -16,8 +20,18 @@
   a local reference-capable because it is `Nil` on entry and an object on a backedge while
   still rejecting `LoadLocal` until every incoming path initializes it. The VM asserts
   both operand and local bits at every active-frame instruction boundary.
+- At a TailCall pc, the stack map is deliberately a dying-frame boundary map: outgoing
+  argument bits remain exact roots and every local bit is false. Before the first map
+  assertion or collection at that boundary, the VM must overwrite all dying locals with
+  canonical `nil` and clear the frame closure. No stale slot from the old invocation may
+  be visible to atomic collection, incremental marking, or incremental compaction.
 - Call depth is bounded by an explicit VM limit and must trap deterministically before
-  host stack exhaustion can matter.
+  host stack exhaustion can matter. `Call` and `CallClosure` consume that depth;
+  verifier-accepted `TailCall` replaces the current frame and does not.
+- Tail transfer may install the callee only after any boundary collection has rewritten
+  the outgoing argument slots. Reuse must leave an empty operand stack, a zero pc, a
+  callee-sized `nil`-initialized local vector with parameters in locals `0..N-1`, and no
+  inherited closure or handler state before callee execution.
 - `AllocClosure`, `CallClosure`, and `LoadCapture` may execute only after the verifier has
   proved their module layout, structural function signature, capture arity/types, and
   closure-body capture index. A closure call uses the same frame stack and deterministic
@@ -47,6 +61,9 @@
 - `Throw` consumes only a proven non-nil nominal variant. Verified handler ranges add
   exceptional dataflow edges whose target stack is exactly that one reference; handler
   locals are joined from exceptional predecessors and ordinary flow cannot enter a handler.
+- A TailCall inside an active same-frame try range is invalid. An exception from a
+  tail-called callee therefore unwinds the reused callee frame and may be caught only by
+  an eligible suspended outer frame.
 - Runtime traps are never translated into language exceptions. During iterative unwind,
   the in-flight exception is exactly one mutable `pending_exception_` root. Moving
   collection rewrites it and every surviving frame root before another frame is removed
@@ -237,6 +254,10 @@
 - `throw e;` requires a proven non-nil nominal variant. `try { ... } catch (e: V) { ... }`
   catches exact nominal variant layout `V`; the catch binding is non-nil, immutable, and
   scoped to its handler body. Unmatched exceptions propagate.
+- `return tail f(args);` is the sole explicit tail syntax. It is terminal, valid only
+  inside a function or lambda and outside an active try body, and `f` must be a directly
+  named function whose argument and complete return types match. `return` is reserved;
+  `tail` remains a contextual identifier so legacy uses of that name are unchanged.
 - Structural `fn(T1, ..., Tn) -> R` types must survive the compile boundary in locals,
   parameters, returns, pair fields, record fields, and reference-array elements. Lambda
   captures are immutable creation-time snapshots in deterministic first-use order; later
@@ -309,3 +330,7 @@
 - A test that passes with GC disabled is not sufficient for runtime correctness.
 - Differential fuzz executions compare two independent observables across schedules: the
   canonical returned heap graph/value and the VM output byte log. Both must match exactly.
+- The isolated 32-seed `tailcalls` source corpus runs both observables under all 15
+  schedules and has its own pinned source/outcome snapshots and corpus dump. Its mutants
+  must prove that syntax, direct-target, tail-position, and return-signature gates are
+  non-vacuous without changing any legacy corpus stream.

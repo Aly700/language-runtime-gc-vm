@@ -66,6 +66,8 @@ private:
     void push_frame(const Module& module, std::size_t function_index,
                     std::vector<Value> arguments,
                     std::optional<Value> closure = std::nullopt);
+    void reuse_frame_for_tail_call(const Module& module, Frame& frame,
+                                   std::size_t function_index);
     std::vector<Frame> frames_;
     std::optional<Value> pending_exception_;
     gc::Heap heap_;

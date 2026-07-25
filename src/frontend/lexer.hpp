@@ -68,6 +68,7 @@ enum class TokenKind {
     RBrace,
     LBracket,
     RBracket,
+    Return,
 };
 
 struct Token {

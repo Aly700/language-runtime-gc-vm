@@ -133,6 +133,15 @@ add_executable(lang_iteration38_incremental_compaction_fuzz
 target_link_libraries(
     lang_iteration38_incremental_compaction_fuzz PRIVATE lang_runtime)
 
+add_executable(lang_iteration39_tail_calls
+    tests/iteration39_tail_calls.cpp)
+target_link_libraries(lang_iteration39_tail_calls PRIVATE lang_runtime)
+
+add_executable(lang_iteration39_tail_calls_fuzz
+    tests/iteration39_tail_calls_fuzz.cpp)
+target_link_libraries(
+    lang_iteration39_tail_calls_fuzz PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -181,5 +190,9 @@ add_test(NAME lang_iteration38_incremental_compaction
     COMMAND lang_iteration38_incremental_compaction)
 add_test(NAME lang_iteration38_incremental_compaction_fuzz
     COMMAND lang_iteration38_incremental_compaction_fuzz)
+add_test(NAME lang_iteration39_tail_calls
+    COMMAND lang_iteration39_tail_calls)
+add_test(NAME lang_iteration39_tail_calls_fuzz
+    COMMAND lang_iteration39_tail_calls_fuzz)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

@@ -574,6 +574,7 @@ private:
         if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While) ||
             check(TokenKind::For) || check(TokenKind::Match) || check(TokenKind::Try) ||
             check(TokenKind::Throw) ||
+            check(TokenKind::Return) ||
             check(TokenKind::Break) ||
             check(TokenKind::Continue) || check(TokenKind::Print)) {
             return true;
@@ -646,6 +647,23 @@ private:
             statement.position = previous().position;
             statement.value = parse_expression();
             expect(TokenKind::Semicolon, "expected ';' after throw expression");
+            return statement;
+        }
+        if (match(TokenKind::Return)) {
+            Statement statement;
+            statement.kind = Statement::Kind::TailCall;
+            statement.position = previous().position;
+            const auto tail =
+                expect(TokenKind::Identifier,
+                       "expected contextual keyword 'tail' after 'return'");
+            if (tail.has_value() && tail->text != "tail") {
+                add_diagnostic(
+                    diagnostics_, tail->position,
+                    "expected contextual keyword 'tail' after 'return'");
+            }
+            statement.value = parse_expression();
+            expect(TokenKind::Semicolon,
+                   "expected ';' after tail call");
             return statement;
         }
         if (match(TokenKind::Break)) {
@@ -1398,7 +1416,8 @@ private:
                 check(TokenKind::Fn) ||
                 check(TokenKind::Let) || check(TokenKind::If) ||
                 check(TokenKind::While) || check(TokenKind::For) ||
-                check(TokenKind::Print) || check(TokenKind::RBrace)) {
+                check(TokenKind::Print) || check(TokenKind::Return) ||
+                check(TokenKind::RBrace)) {
                 return;
             }
             ++current_;
