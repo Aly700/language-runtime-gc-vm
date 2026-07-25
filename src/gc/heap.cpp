@@ -1268,6 +1268,9 @@ ObjectId Heap::allocate_object(Object object) {
     }
     validate_descriptor_shape(object, &metrics_);
     const auto required_slots = storage_slot_count(object);
+    metrics_.max_object_storage_slots_allocated =
+        std::max(metrics_.max_object_storage_slots_allocated,
+                 static_cast<std::uint64_t>(required_slots));
     auto base = find_free_storage_run(required_slots);
     if (!base.has_value()) {
         const auto old_size = objects_.size();
@@ -2742,35 +2745,7 @@ std::size_t Heap::incremental_compact_step_impl(
             generation_from(entry.destination_id);
         objects_[entry.destination_slot] = std::move(moved);
 
-        ++metrics_.compaction_objects_copied;
-        const auto copied_bytes = entry.width * kStorageSlotBytes;
-        switch (objects_[entry.destination_slot]->kind) {
-        case ObjectKind::Pair:
-            metrics_.compaction_pair_bytes += copied_bytes;
-            break;
-        case ObjectKind::ScalarArray:
-            metrics_.compaction_scalar_array_bytes += copied_bytes;
-            break;
-        case ObjectKind::RefArray:
-            metrics_.compaction_ref_array_bytes += copied_bytes;
-            break;
-        case ObjectKind::Str:
-            metrics_.compaction_string_bytes += copied_bytes;
-            break;
-        case ObjectKind::Closure:
-            metrics_.compaction_closure_bytes += copied_bytes;
-            break;
-        case ObjectKind::Map:
-            metrics_.compaction_map_bytes += copied_bytes;
-            break;
-        case ObjectKind::WeakRef:
-            metrics_.compaction_weak_ref_bytes += copied_bytes;
-            break;
-        case ObjectKind::Record:
-        case ObjectKind::Variant:
-        case ObjectKind::Ephemeron:
-            break;
-        }
+        record_compaction_copy(*objects_[entry.destination_slot], entry.width);
 
         incremental_compaction_forwarding_[entry.source_slot] =
             entry.destination_id;
@@ -3429,6 +3404,58 @@ void Heap::trace_collection_roots(RootVisitor& visitor, RootProvider* roots,
     }
 }
 
+void Heap::record_compaction_copy(const Object& object,
+                                  std::size_t copied_slots) const {
+    if (copied_slots == 0) {
+        throw std::logic_error(
+            "compaction copy accounting received zero logical slots");
+    }
+
+    ++metrics_.compaction_objects_copied;
+    if (copied_slots <= 8) {
+        metrics_.compaction_slots_copied_1_8 += copied_slots;
+    } else if (copied_slots <= 64) {
+        metrics_.compaction_slots_copied_9_64 += copied_slots;
+    } else if (copied_slots <= 512) {
+        metrics_.compaction_slots_copied_65_512 += copied_slots;
+    } else {
+        metrics_.compaction_slots_copied_gt_512 += copied_slots;
+    }
+
+    const auto copied_bytes = copied_slots * kStorageSlotBytes;
+    switch (object.kind) {
+    case ObjectKind::Pair:
+        metrics_.compaction_pair_bytes += copied_bytes;
+        break;
+    case ObjectKind::ScalarArray:
+        metrics_.compaction_scalar_array_bytes += copied_bytes;
+        break;
+    case ObjectKind::RefArray:
+        metrics_.compaction_ref_array_bytes += copied_bytes;
+        break;
+    case ObjectKind::Str:
+        metrics_.compaction_string_bytes += copied_bytes;
+        break;
+    case ObjectKind::Closure:
+        metrics_.compaction_closure_bytes += copied_bytes;
+        break;
+    case ObjectKind::Map:
+        metrics_.compaction_map_bytes += copied_bytes;
+        break;
+    case ObjectKind::WeakRef:
+        metrics_.compaction_weak_ref_bytes += copied_bytes;
+        break;
+    case ObjectKind::Record:
+        // Record accounting remains absent from the legacy per-kind stream.
+        break;
+    case ObjectKind::Variant:
+        // Variant accounting remains absent from the legacy per-kind stream.
+        break;
+    case ObjectKind::Ephemeron:
+        break;
+    }
+}
+
 Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
     CompactionResult result;
     result.forwarding.resize(objects_.size());
@@ -3460,41 +3487,7 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
         const auto required_slots = storage_slot_count(moved);
         assert(required_slots == width_at_collection_start &&
                "object storage width changed within one collection");
-        ++metrics_.compaction_objects_copied;
-        const auto copied_bytes = required_slots * kStorageSlotBytes;
-        switch (moved.kind) {
-        case ObjectKind::Pair:
-            metrics_.compaction_pair_bytes += copied_bytes;
-            break;
-        case ObjectKind::ScalarArray:
-            metrics_.compaction_scalar_array_bytes += copied_bytes;
-            break;
-        case ObjectKind::RefArray:
-            metrics_.compaction_ref_array_bytes += copied_bytes;
-            break;
-        case ObjectKind::Str:
-            metrics_.compaction_string_bytes += copied_bytes;
-            break;
-        case ObjectKind::Closure:
-            metrics_.compaction_closure_bytes += copied_bytes;
-            break;
-        case ObjectKind::Map:
-            metrics_.compaction_map_bytes += copied_bytes;
-            break;
-        case ObjectKind::WeakRef:
-            metrics_.compaction_weak_ref_bytes += copied_bytes;
-            break;
-        case ObjectKind::Record:
-            // Record accounting is intentionally not appended to the public benchmark
-            // counter stream; legacy workloads must remain byte-identical.
-            break;
-        case ObjectKind::Variant:
-            // Variant accounting is likewise omitted from the legacy public counter
-            // stream while its exact descriptor width still advances the cursor.
-            break;
-        case ObjectKind::Ephemeron:
-            break;
-        }
+        record_compaction_copy(moved, required_slots);
         if (next_live_slot + required_slots > result.objects.size()) {
             throw std::logic_error("compaction cursor exceeded heap storage capacity");
         }

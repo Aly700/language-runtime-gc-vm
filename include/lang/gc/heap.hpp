@@ -72,6 +72,11 @@ struct HeapMetrics {
     std::uint64_t compaction_closure_bytes{0};
     std::uint64_t compaction_map_bytes{0};
     std::uint64_t compaction_weak_ref_bytes{0};
+    std::uint64_t compaction_slots_copied_1_8{0};
+    std::uint64_t compaction_slots_copied_9_64{0};
+    std::uint64_t compaction_slots_copied_65_512{0};
+    std::uint64_t compaction_slots_copied_gt_512{0};
+    std::uint64_t max_object_storage_slots_allocated{0};
     std::uint64_t ephemeron_fixpoint_passes{0};
     std::uint64_t ephemeron_activations{0};
     std::uint64_t incremental_cycles_started{0};
@@ -449,6 +454,8 @@ private:
                                              CollectionKind kind);
     void incremental_write_barrier_before_publish(ObjectId owner, Value value);
     void process_ephemeron_fixpoint(std::vector<ObjectId>& worklist, CollectionKind kind);
+    void record_compaction_copy(const Object& object,
+                                std::size_t copied_slots) const;
     [[nodiscard]] CompactionResult compact_live_objects(CollectionKind kind) const;
     void rewrite_references(const ForwardingTable& forwarding,
                             std::vector<std::optional<Object>>& compacted_objects,
