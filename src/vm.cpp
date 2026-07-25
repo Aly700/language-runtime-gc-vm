@@ -119,6 +119,51 @@ void VM::trace_roots(gc::RootVisitor& visitor) {
     }
 }
 
+RuntimeTrace VM::capture_runtime_trace(
+    const Module& module, std::size_t active_function_index,
+    std::size_t active_pc, RuntimeFailureKind kind,
+    std::optional<std::string> exception_variant) const {
+    RuntimeTrace trace;
+    trace.kind = kind;
+    trace.exception_variant = std::move(exception_variant);
+
+    const auto append_frame = [&](std::size_t function_index,
+                                  std::size_t pc) {
+        RuntimeTraceFrame captured;
+        captured.function_index = function_index;
+        captured.pc = pc;
+        if (function_index < module.functions.size()) {
+            const auto& function = module.functions[function_index];
+            if (!function.debug_name.empty()) {
+                captured.function_name = function.debug_name;
+            }
+            if (pc < function.source_positions.size()) {
+                captured.source_position = function.source_positions[pc];
+            }
+        }
+        trace.frames.push_back(std::move(captured));
+    };
+
+    if (frames_.empty()) {
+        append_frame(active_function_index, active_pc);
+        return trace;
+    }
+
+    bool innermost = true;
+    for (auto frame = frames_.rbegin(); frame != frames_.rend(); ++frame) {
+        if (innermost) {
+            append_frame(active_function_index, active_pc);
+            innermost = false;
+            continue;
+        }
+        // Call and CallClosure advance a caller to its return continuation
+        // before suspension. Diagnostics report the call-site instruction.
+        const auto call_site_pc = frame->pc == 0 ? 0 : frame->pc - 1;
+        append_frame(frame->function_index, call_site_pc);
+    }
+    return trace;
+}
+
 void VM::assert_stack_matches_map(const ModuleVerificationResult& verification,
                                   const Frame& frame) const {
     assert(frame.function_index < verification.functions.size() &&
@@ -227,6 +272,7 @@ void VM::push(Frame& frame, Value value) {
 
 Value VM::execute(const Function& function) {
     output_.clear();
+    last_trap_trace_.reset();
     ++raw_function_executions_;
     Module module;
     module.entry_function = 0;
@@ -304,6 +350,7 @@ void VM::reuse_frame_for_tail_call(const Module& module, Frame& frame,
 
 Value VM::execute(const Module& module) {
     output_.clear();
+    last_trap_trace_.reset();
     ++raw_module_executions_;
     return execute_unverified_module(module);
 }
@@ -323,6 +370,7 @@ Value VM::execute_unverified_module(const Module& module) {
 
 Value VM::execute(const VerifiedModule& module) {
     output_.clear();
+    last_trap_trace_.reset();
     return execute_verified(module.module(), module.verification());
 }
 
@@ -336,14 +384,19 @@ Value VM::execute_verified(const Module& module,
     }
     frames_.clear();
     pending_exception_.reset();
+    last_trap_trace_.reset();
     instructions_executed_ = 0;
     incremental_budget_cursor_ = 0;
     incremental_compaction_budget_cursor_ = 0;
-    push_frame(module, module.entry_function, {});
 
+    std::size_t active_function_index = module.entry_function;
+    std::size_t active_pc = 0;
     try {
+      push_frame(module, module.entry_function, {});
       while (!frames_.empty()) {
         auto& frame = frames_.back();
+        active_function_index = frame.function_index;
+        active_pc = frame.pc;
         const auto& function = module.functions[frame.function_index];
         if (function.code[frame.pc].op == OpCode::TailCall) {
             // TailCall maps describe a dying-frame boundary. The verifier proves that
@@ -797,6 +850,11 @@ Value VM::execute_verified(const Module& module,
             assert(pending_exception_->is_object() &&
                    heap_.TEST_ONLY_is_variant(pending_exception_->as_object()) &&
                    "verifier invariant violated: thrown value must be a variant");
+            // Unwind removes frame objects. Snapshot only copied diagnostic data now,
+            // then publish it only if no language handler accepts the exception.
+            auto uncaught_trace = capture_runtime_trace(
+                module, frame.function_index, frame.pc,
+                RuntimeFailureKind::UncaughtException);
             bool initial = true;
             bool handled = false;
             while (!frames_.empty()) {
@@ -834,6 +892,8 @@ Value VM::execute_verified(const Module& module,
                 const auto name = layout < module.variant_layouts.size()
                                       ? module.variant_layouts[layout].name
                                       : std::string("<invalid>");
+                uncaught_trace.exception_variant = name;
+                last_trap_trace_ = std::move(uncaught_trace);
                 pending_exception_.reset();
                 throw std::runtime_error("uncaught exception " + name);
             }
@@ -1214,6 +1274,11 @@ Value VM::execute_verified(const Module& module,
       }
       return Value::nil();
     } catch (...) {
+        if (!last_trap_trace_.has_value()) {
+            last_trap_trace_ = capture_runtime_trace(
+                module, active_function_index, active_pc,
+                RuntimeFailureKind::Trap);
+        }
         if (heap_.incremental_marking_active()) {
             heap_.finish_incremental_marking();
         }

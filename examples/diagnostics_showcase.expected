@@ -1,0 +1,4 @@
+error: runtime trap at function 1 pc 1: invalid string for i64 conversion
+#0 function=1 name=parse_count pc=1 source=2:3
+#1 function=2 name=load_count pc=1 source=5:3
+#2 function=0 name=<entry> pc=0 source=7:1

@@ -9,6 +9,7 @@
 #include <exception>
 #include <iomanip>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -344,6 +345,7 @@ struct Outcome {
     std::string observable;
     std::string error;
     std::string output;
+    std::optional<lang::RuntimeTrace> trace;
 };
 
 inline std::string output_for(const lang::VM& vm) {
@@ -365,50 +367,58 @@ inline std::string render_output_bytes(std::string_view output) {
 
 inline bool same_observables(const Outcome& baseline, const Outcome& observed) {
     return baseline.observable == observed.observable &&
-           baseline.output == observed.output;
+           baseline.output == observed.output &&
+           baseline.trace == observed.trace;
 }
 
 inline Outcome execute_once(const lang::Function& function, const Schedule& schedule) {
+    lang::VM vm;
     try {
         lang::Module module;
         module.entry_function = 0;
         module.functions.push_back(function);
         auto verified = lang::verify_module(std::move(module));
         if (!verified.has_value()) {
-            return Outcome{false, {}, "bytecode verifier rejected generated function"};
+            return Outcome{
+                false, {}, "bytecode verifier rejected generated function",
+                {}, std::nullopt};
         }
-        lang::VM vm;
         vm.set_gc_stress(schedule.stress);
         const auto value = vm.execute(*verified);
-        return Outcome{true, observable_for(vm, value), {}, output_for(vm)};
+        return Outcome{true, observable_for(vm, value), {}, output_for(vm),
+                       vm.last_trap_trace()};
     } catch (const std::exception& e) {
-        return Outcome{false, {}, e.what()};
+        return Outcome{false, {}, e.what(), {}, vm.last_trap_trace()};
     }
 }
 
 inline Outcome execute_once(const lang::Module& module, const Schedule& schedule) {
+    lang::VM vm;
     try {
         auto verified = lang::verify_module(module);
         if (!verified.has_value()) {
-            return Outcome{false, {}, "bytecode verifier rejected generated module"};
+            return Outcome{
+                false, {}, "bytecode verifier rejected generated module",
+                {}, std::nullopt};
         }
-        lang::VM vm;
         vm.set_gc_stress(schedule.stress);
         const auto value = vm.execute(*verified);
-        return Outcome{true, observable_for(vm, value), {}, output_for(vm)};
+        return Outcome{true, observable_for(vm, value), {}, output_for(vm),
+                       vm.last_trap_trace()};
     } catch (const std::exception& e) {
-        return Outcome{false, {}, e.what()};
+        return Outcome{false, {}, e.what(), {}, vm.last_trap_trace()};
     }
 }
 
 inline Outcome execute_once(const lang::VerifiedModule& module, const Schedule& schedule) {
+    lang::VM vm;
     try {
-        lang::VM vm;
         vm.set_gc_stress(schedule.stress);
         const auto value = vm.execute(module);
-        return Outcome{true, observable_for(vm, value), {}, output_for(vm)};
+        return Outcome{true, observable_for(vm, value), {}, output_for(vm),
+                       vm.last_trap_trace()};
     } catch (const std::exception& e) {
-        return Outcome{false, {}, e.what()};
+        return Outcome{false, {}, e.what(), {}, vm.last_trap_trace()};
     }
 }
 

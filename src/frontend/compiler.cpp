@@ -492,12 +492,14 @@ public:
              std::vector<std::string>& string_constants,
              std::vector<MapLayout>& map_layouts,
              std::vector<EphemeronLayout>& ephemeron_layouts,
+             std::string debug_name,
              std::optional<std::size_t> closure_layout = std::nullopt)
         : string_constants_(string_constants), map_layouts_(map_layouts),
           ephemeron_layouts_(ephemeron_layouts) {
         function_.signature = std::move(signature);
         function_.local_count = local_count;
         function_.closure_layout = closure_layout;
+        function_.debug_name = std::move(debug_name);
     }
 
     Function compile(const std::vector<Statement>& statements, const Expr& result) {
@@ -513,27 +515,57 @@ public:
             // Verifier accommodation: source programs always end in a final expression,
             // and the compiler emits an explicit Return immediately after it so bytecode cannot
             // fall off the end.
+            PositionScope result_position(*this, result.position);
             emit(OpCode::Return, 0);
         }
+        assert(function_.source_positions.size() == function_.code.size() &&
+               "compiler debug table must cover every emitted pc");
         return function_;
     }
 
 private:
+    class PositionScope {
+    public:
+        PositionScope(Compiler& compiler, SourcePosition position)
+            : compiler_(compiler), previous_(compiler.current_position_) {
+            compiler_.current_position_ = position;
+        }
+
+        PositionScope(const PositionScope&) = delete;
+        PositionScope& operator=(const PositionScope&) = delete;
+
+        ~PositionScope() {
+            compiler_.current_position_ = previous_;
+        }
+
+    private:
+        Compiler& compiler_;
+        SourcePosition previous_;
+    };
+
+    std::size_t append_instruction(Instruction instruction) {
+        const auto instruction_pc = function_.code.size();
+        function_.code.push_back(instruction);
+        function_.source_positions.push_back(DebugSourcePosition{
+            current_position_.line, current_position_.column});
+        assert(function_.source_positions.size() == function_.code.size() &&
+               "compiler debug table drifted from emitted bytecode");
+        return instruction_pc;
+    }
+
     std::size_t emit(OpCode op, std::int64_t operand) {
-        function_.code.push_back(Instruction{op, operand});
-        return function_.code.size() - 1;
+        return append_instruction(Instruction{op, operand});
     }
 
     std::size_t emit(OpCode op, std::int64_t operand,
                      std::int64_t operand2) {
-        function_.code.push_back(Instruction{op, operand, operand2});
-        return function_.code.size() - 1;
+        return append_instruction(Instruction{op, operand, operand2});
     }
 
     std::size_t emit(OpCode op, std::int64_t operand,
                      std::int64_t operand2, std::int64_t operand3) {
-        function_.code.push_back(Instruction{op, operand, operand2, operand3});
-        return function_.code.size() - 1;
+        return append_instruction(
+            Instruction{op, operand, operand2, operand3});
     }
 
     void patch(std::size_t instruction, std::size_t target) {
@@ -576,6 +608,7 @@ private:
     }
 
     bool compile_statement(const Statement& statement) {
+        PositionScope statement_position(*this, statement.position);
         switch (statement.kind) {
         case Statement::Kind::Let:
             // Verifier accommodation: every source local is introduced by a top-level
@@ -642,6 +675,8 @@ private:
     void compile_assignment(const Statement& statement) {
         if (statement.target.steps.empty()) {
             compile_expr(*statement.value);
+            PositionScope target_position(*this,
+                                          statement.target.base_position);
             emit(OpCode::StoreLocal, statement.target.local_index);
             return;
         }
@@ -652,11 +687,13 @@ private:
             compile_expr(*final_step.index);
             if (statement.target.receiver_type.kind == TypeSpec::Kind::Map) {
                 compile_expr(*statement.value);
+                PositionScope target_position(*this, final_step.position);
                 emit(OpCode::MapSet, 0);
                 return;
             }
             compile_expr_as_array_storage(*statement.value,
                                           statement.target.element_type);
+            PositionScope target_position(*this, final_step.position);
             emit(is_ref_array_type(statement.target.receiver_type)
                      ? OpCode::RefArraySet
                      : OpCode::ArraySet,
@@ -667,6 +704,7 @@ private:
         // Verifier accommodation: SetLeft/SetRight consumes receiver then value and leaves
         // no stack result, so field-assignment statements compile as stack-neutral blocks.
         compile_expr(*statement.value);
+        PositionScope target_position(*this, final_step.position);
         if (final_step.receiver_type.kind == TypeSpec::Kind::Record) {
             emit(OpCode::RecordSet,
                  static_cast<std::int64_t>(final_step.record_layout_index),
@@ -922,6 +960,7 @@ private:
     }
 
     void compile_expr(const Expr& expression) {
+        PositionScope expression_position(*this, expression.position);
         switch (expression.kind) {
         case Expr::Kind::IntLiteral:
             emit(OpCode::ConstantI64, expression.int_value);
@@ -1018,28 +1057,34 @@ private:
                 compile_expr(*expression.left);
                 compile_expr(*expression.right);
             }
-            if (expression.binary_op == '+') {
-                emit(expression.left->inferred_type.kind == TypeSpec::Kind::Str
-                         ? OpCode::StrConcat
-                         : OpCode::AddI64,
-                     0);
-            } else if (expression.binary_op == '<') {
-                emit(expression.left->inferred_type.kind == TypeSpec::Kind::Str
-                         ? OpCode::StrLt
-                         : OpCode::LessI64,
-                     0);
-            } else if (expression.binary_op == '>' ||
-                       expression.binary_op == 'L' ||
-                       expression.binary_op == 'G') {
-                emit(OpCode::StrLt, 0);
-                if (expression.binary_op == 'L' ||
-                    expression.binary_op == 'G') {
-                    invert_bool_on_stack();
-                }
-            } else {
-                emit(OpCode::StrEq, 0);
-                if (expression.binary_op == '!') {
-                    invert_bool_on_stack();
+            {
+                PositionScope operator_position(
+                    *this, expression.operator_position);
+                if (expression.binary_op == '+') {
+                    emit(expression.left->inferred_type.kind ==
+                                 TypeSpec::Kind::Str
+                             ? OpCode::StrConcat
+                             : OpCode::AddI64,
+                         0);
+                } else if (expression.binary_op == '<') {
+                    emit(expression.left->inferred_type.kind ==
+                                 TypeSpec::Kind::Str
+                             ? OpCode::StrLt
+                             : OpCode::LessI64,
+                         0);
+                } else if (expression.binary_op == '>' ||
+                           expression.binary_op == 'L' ||
+                           expression.binary_op == 'G') {
+                    emit(OpCode::StrLt, 0);
+                    if (expression.binary_op == 'L' ||
+                        expression.binary_op == 'G') {
+                        invert_bool_on_stack();
+                    }
+                } else {
+                    emit(OpCode::StrEq, 0);
+                    if (expression.binary_op == '!') {
+                        invert_bool_on_stack();
+                    }
                 }
             }
             break;
@@ -1298,6 +1343,7 @@ private:
     }
 
     Function function_;
+    SourcePosition current_position_{};
     std::vector<LoopPatchContext*> loop_contexts_;
     std::optional<std::pair<std::size_t, std::size_t>> active_variant_case_;
     std::vector<std::string>& string_constants_;
@@ -1403,6 +1449,7 @@ CompileModuleResult compile_checked_program(const Program& program,
                                                         declaration.return_type),
                                    module.string_constants, module.map_layouts,
                                    module.ephemeron_layouts,
+                                   declaration.name,
                                    declaration.closure_layout_index);
         compiled_functions.push_back(
             function_compiler.compile(declaration.statements, *declaration.result));
@@ -1413,6 +1460,8 @@ CompileModuleResult compile_checked_program(const Program& program,
             signature_from_types(lambda->parameters, lambda->return_type),
             module.string_constants, module.map_layouts,
             module.ephemeron_layouts,
+            "<lambda@" + std::to_string(lambda->position.line) + ":" +
+                std::to_string(lambda->position.column) + ">",
             lambda->closure_layout_index);
         compiled_functions.push_back(
             lambda_compiler.compile(lambda->statements, *lambda->result));
@@ -1423,7 +1472,7 @@ CompileModuleResult compile_checked_program(const Program& program,
     entry_signature.return_type_detail = signature_value_from_type(result_type);
     Compiler entry_compiler(program.entry_local_count, std::move(entry_signature),
                             module.string_constants, module.map_layouts,
-                            module.ephemeron_layouts);
+                            module.ephemeron_layouts, "<entry>");
     module.functions.push_back(entry_compiler.compile(program.statements, *program.result));
     for (auto& function : compiled_functions) {
         module.functions.push_back(std::move(function));

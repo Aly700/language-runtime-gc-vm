@@ -11,6 +11,10 @@ Iteration 44 adds explicit `intern(str) -> str`. A collector-owned weak table re
 canonical immutable string while that object is live, forwards it across every movement
 path, and evicts it without extending liveness.
 
+Iteration 45 adds deterministic runtime diagnostics without changing failure text. Every
+terminal trap or uncaught typed exception leaves an embedder-readable, source-positioned
+innermost-to-outermost frame trace whose plain copied data is not a GC root.
+
 This repository is a correctness-first implementation of a small statically typed
 language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
 checker, bytecode compiler, verifier, and stack VM. The runtime uses a precise moving,
@@ -81,6 +85,36 @@ closure is cleared before scheduled GC work, after which the callee is installed
 same frame. Self and mutual tail recursion therefore do not consume call depth, while
 ordinary calls retain the deterministic depth trap. Tail calls inside an active try
 region are rejected. See [ADR 0016](adr/0016-tail-call-frame-reuse.md).
+
+### Deterministic runtime diagnostics
+
+Frontend-compiled functions carry verifier-inert names and one line/column entry per
+bytecode pc. On a terminal trap, the VM copies the active pc plus every suspended caller's
+call-site pc. On an uncaught typed exception, it snapshots before iterative unwind removes
+the frames and includes the nominal exception variant. Hand-built modules without tables
+still report function index and pc.
+
+The side channel is intentionally separate from exception text and VM output:
+
+```cpp
+lang::VM vm;
+try {
+    (void)vm.execute(*compiled.verified_module);
+} catch (const std::exception&) {
+    if (const auto& trace = vm.last_trap_trace(); trace.has_value()) {
+        for (const auto& frame : trace->frames) {
+            // function_index and pc are always present.
+            // function_name and source_position are optional.
+        }
+    }
+}
+```
+
+Trace types cannot name `Value`, `ObjectId`, or heap state and are absent from root
+tracing. Tail calls expose only the current reused frame, deliberately truncating history
+to preserve constant space. Generic instances retain their mangled concrete name while
+their positions point back into the generic template body. See
+[ADR 0021](adr/0021-deterministic-runtime-diagnostics.md).
 
 ### Capture maps
 
@@ -238,11 +272,11 @@ The language includes:
 - deterministic bounded `print(str)` output captured by the VM rather than written to a
   host stream.
 
-Ten executable programs live in [examples](examples): a named recursive linked list,
+Eleven executable programs live in [examples](examples): a named recursive linked list,
 a capture-snapshot accumulator factory, insertion-order word frequencies, a higher-order
 array pipeline, string/conversion tools, a recursive record showcase, and a recursive
 variant showcase, a generic-function showcase, a recursive generic-type showcase, and
-explicit weak string interning.
+explicit weak string interning, plus an embedder-rendered deterministic failure trace.
 Each `.lang` file has a byte-pinned `.expected` output. `lang_examples` compiles every
 file and runs it under both no stress and maximum combined
 major/minor/allocation/barrier stress.
@@ -260,7 +294,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The acceptance gate contains 49 CTest targets.
+The acceptance gate contains 50 CTest targets.
 
 Run only the executable documentation:
 
@@ -288,11 +322,14 @@ source grammars run under the same 15 schedules:
 - `incremental_compact_1`, `incremental_compact_3_1`
 - `combined_mark_compact`
 
-The two independent observables are the canonical returned value/ID-free deep heap graph
-and the exact VM output bytes. The weak grammar additionally uses schedule-specific
-liveness expectations because clearing is intentionally observable. Generated source and
-bytecode are constructive and deterministic; each grammar has its own corpus dump and an
-embedded pinned representative snapshot.
+Successful executions retain two independent observables: the canonical returned
+value/ID-free deep heap graph and the exact VM output bytes. A deliberately trapping
+execution adds its complete optional runtime trace as a third equality oracle across
+schedules. The weak grammar additionally uses schedule-specific liveness expectations
+because clearing is intentionally observable. Generated source and bytecode are
+constructive and deterministic; each grammar has its own corpus dump and an embedded
+pinned representative snapshot. Iteration 45 adds no grammar, seed, or dump, so all 22
+corpus streams remain byte-identical.
 
 Negative testing applies 89 positioned mutation forms across fixed seed sets, for 1,974
 frontend rejection checks. The operators cover type errors, undefined values, arity and

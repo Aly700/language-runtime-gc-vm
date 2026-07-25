@@ -1,5 +1,7 @@
 #pragma once
 
+#include "lang/runtime_diagnostics.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -338,6 +340,10 @@ struct Function {
     std::uint32_t local_count{0};
     std::optional<std::size_t> closure_layout;
     std::vector<ExceptionHandler> exception_handlers;
+    // Append-only, verifier-inert module metadata. A missing table/name is valid
+    // for hand-built bytecode and falls back to function index plus pc.
+    std::string debug_name;
+    std::vector<DebugSourcePosition> source_positions;
 };
 
 struct Module {
