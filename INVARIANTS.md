@@ -48,6 +48,12 @@
   the exact result from the map layout. Runtime out-of-bounds access traps with the stable
   `map entry index out of bounds` diagnostic; lowered iteration deliberately reaches that
   boundary when the entry count grows after its entry snapshot.
+- `AllocBuilder`, `BuilderAppend`, `BuilderLen`, `BuilderToStr`, and `BuilderClear` may
+  execute only after the verifier proves the distinct Builder receiver kind and, for
+  append, a `Str` operand. Their pre-instruction stack maps keep every Builder and source
+  string operand as a precise mutable root until any collection or growth relocation
+  completes. Scalar source `i64`/`bool` values must first use the existing conversion
+  lowering; the heap append operation never accepts an untyped scalar payload.
 - `AllocRecord`, `RecordGet`, and `RecordSet` may execute only after the verifier has
   proved the module record-layout identity, field bounds, declared-order initializer
   types, receiver identity and non-nil state, and stored-value type. Record signatures
@@ -185,6 +191,13 @@
   marking, forwarding, remembered-set validation, and post-collection validation must not
   interpret it as a reference or rewrite it. Strings expose no payload-store API and have
   no write-barrier path after construction.
+- `Builder` payload elements are mutable raw bytes, not tagged `Value`s. Its descriptor
+  visitor exposes zero strong fields, so even a complete live, dead, stale, or forwarded
+  `ObjectId` bit pattern in the payload may never be traced, retained, forwarded,
+  barriered, or rewritten. Every append and clear must pass through the single heap
+  mutation funnel, which proves `payload.size == logical_length <= capacity` and validates
+  the deterministic capacity ladder after each mutation. No write barrier is needed
+  because the payload cannot publish a reference edge.
 - `Closure` payloads are immutable tagged capture slots plus a raw scalar function index.
   The module verifier derives each layout's capture bitmap from its ordered static capture
   types. The heap descriptor visits exactly bitmap-selected object slots; adjacent scalar
@@ -252,6 +265,19 @@
   all roots, descriptor-declared references, and remembered-set entries before the entry
   is published. The host-side lookup-index capacity is not part of this width and cannot
   affect allocation, movement order, or compaction byte accounting.
+- A Builder's logical storage width is `1 + ceil(capacity / 8)`, independent of its
+  logical length. Capacity starts at eight bytes, doubles deterministically, and saturates
+  only at the `uint32_t` header limit; clear retains capacity. Width-changing append may
+  extend into a free adjacent run or relocate the complete Builder deterministically.
+  Relocation must forward VM and explicit roots, handles, descriptor edges, the remembered
+  set, WeakRef targets/owners, ephemerons, the weak intern table, and any incremental
+  marking worklist exactly as map growth does. An active incremental compaction must finish
+  first with receiver and source `Str` temporarily rooted, and every collection must retain
+  the existing width-stable-within-collection assertion. The old complete ID becomes stale
+  and its old run becomes generation-protected reusable storage.
+- `Builder::to_str` always copies the current logical bytes into a fresh immutable `Str`,
+  including for an empty Builder. The Builder remains usable, and no later Builder mutation
+  may alter or share storage with an earlier snapshot.
 - Every record mutation flows through `Heap::store_record_field`. The funnel validates the
   owner's immutable layout identity, field bounds, bitmap shape, and stored tag; before
   publishing a young object in a reference field of an old record it records the owner in

@@ -31,6 +31,7 @@ constexpr std::uint8_t kMapHashI64Domain = 1;
 constexpr std::uint8_t kMapHashBoolDomain = 2;
 constexpr std::uint8_t kMapHashStringDomain = 3;
 constexpr std::size_t kMapIndexMinimumCapacity = 8;
+constexpr std::uint32_t kBuilderInitialCapacity = 8;
 
 ObjectId make_object_id(std::uint32_t slot, std::uint32_t generation) {
     return (static_cast<ObjectId>(generation) << kGenerationShift) | slot;
@@ -109,6 +110,35 @@ std::size_t find_open_map_bucket(const std::vector<std::size_t>& index,
     throw std::logic_error("map lookup index has no empty bucket");
 }
 
+bool is_builder_capacity(std::uint32_t capacity) {
+    return capacity == std::numeric_limits<std::uint32_t>::max() ||
+           (capacity >= kBuilderInitialCapacity &&
+            (capacity & (capacity - 1)) == 0);
+}
+
+std::uint32_t builder_capacity_for_required(std::uint32_t current,
+                                            std::size_t required) {
+    if (!is_builder_capacity(current)) {
+        throw std::logic_error(
+            "builder growth started outside the deterministic capacity ladder");
+    }
+    if (required > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error(
+            "builder append exceeds object header limit");
+    }
+
+    auto capacity = current;
+    while (required > capacity) {
+        if (capacity >
+            std::numeric_limits<std::uint32_t>::max() / 2) {
+            capacity = std::numeric_limits<std::uint32_t>::max();
+        } else {
+            capacity *= 2;
+        }
+    }
+    return capacity;
+}
+
 std::size_t storage_slot_count(const Object& object) {
     switch (object.kind) {
     case ObjectKind::Pair:
@@ -133,11 +163,20 @@ std::size_t storage_slot_count(const Object& object) {
         return 2 + static_cast<std::size_t>(object.length);
     case ObjectKind::Ephemeron:
         return 1;
+    case ObjectKind::Builder:
+        return 1 + (static_cast<std::size_t>(object.builder_capacity) +
+                    kStorageSlotBytes - 1) /
+                       kStorageSlotBytes;
     }
     throw std::logic_error("unknown object kind");
 }
 
 void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = nullptr) {
+    if (object.kind != ObjectKind::Builder &&
+        (object.builder_capacity != 0 || !object.builder_bytes.empty())) {
+        throw std::logic_error(
+            "non-builder descriptor contains builder payload metadata");
+    }
     if (object.kind != ObjectKind::Map &&
         !object.map_lookup_index.empty()) {
         throw std::logic_error(
@@ -372,6 +411,47 @@ void validate_descriptor_shape(const Object& object, HeapMetrics* metrics = null
         }
         return;
     }
+    case ObjectKind::Builder:
+        if (object.builder_bytes.size() != object.length) {
+            throw std::logic_error(
+                "builder byte payload length disagrees with logical length");
+        }
+        if (object.length > object.builder_capacity) {
+            throw std::logic_error(
+                "builder logical length exceeds deterministic capacity");
+        }
+        if (!is_builder_capacity(object.builder_capacity)) {
+            throw std::logic_error(
+                "builder capacity is outside the deterministic growth ladder");
+        }
+        if (!object.scalar_elements.empty() ||
+            !object.ref_elements.empty() ||
+            !object.string_bytes.empty() ||
+            object.left.tag() != Value::Tag::Nil ||
+            object.right.tag() != Value::Tag::Nil ||
+            object.closure_layout_index != 0 ||
+            object.closure_function_index != 0 ||
+            !object.closure_captures.empty() ||
+            !object.closure_capture_map.empty() ||
+            object.map_layout_index != 0 ||
+            object.map_key_is_ref || object.map_value_is_ref ||
+            !object.map_entries.empty() ||
+            !object.map_lookup_index.empty() ||
+            object.record_layout_index != 0 ||
+            !object.record_fields.empty() ||
+            !object.record_ref_map.empty() ||
+            object.variant_layout_index != 0 ||
+            object.variant_case_index != 0 ||
+            !object.variant_fields.empty() ||
+            !object.variant_case_ref_maps.empty() ||
+            object.weak_target().tag() != Value::Tag::Nil ||
+            object.ephemeron_key().tag() != Value::Tag::Nil ||
+            object.ephemeron_value().tag() != Value::Tag::Nil ||
+            object.ephemeron_value_is_ref()) {
+            throw std::logic_error(
+                "builder descriptor contains non-byte payload metadata");
+        }
+        return;
     }
     throw std::logic_error("unknown object kind");
 }
@@ -443,6 +523,7 @@ void visit_reference_fields(Object& object, Fn&& fn,
         return;
     }
     case ObjectKind::Ephemeron:
+    case ObjectKind::Builder:
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -509,6 +590,7 @@ void visit_reference_fields(const Object& object, Fn&& fn,
         return;
     }
     case ObjectKind::Ephemeron:
+    case ObjectKind::Builder:
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -580,6 +662,7 @@ void visit_reference_fields_for_lifo_marking(const Object& object, Fn&& fn,
         return;
     }
     case ObjectKind::Ephemeron:
+    case ObjectKind::Builder:
         return;
     }
     throw std::logic_error("unknown object kind");
@@ -638,6 +721,8 @@ bool objects_equal(const Object& left, const Object& right) {
            left.scalar_elements == right.scalar_elements &&
            value_vectors_equal(left.ref_elements, right.ref_elements) &&
            left.string_bytes == right.string_bytes &&
+           left.builder_capacity == right.builder_capacity &&
+           left.builder_bytes == right.builder_bytes &&
            left.closure_layout_index == right.closure_layout_index &&
            left.closure_function_index == right.closure_function_index &&
            value_vectors_equal(left.closure_captures,
@@ -710,6 +795,18 @@ Object Object::string(std::span<const std::uint8_t> bytes) {
     object.left = Value::nil();
     object.right = Value::nil();
     object.string_bytes.assign(bytes.begin(), bytes.end());
+    return object;
+}
+
+Object Object::builder() {
+    Object object;
+    object.kind = ObjectKind::Builder;
+    object.length = 0;
+    object.left = Value::nil();
+    object.right = Value::nil();
+    object.builder_capacity = kBuilderInitialCapacity;
+    object.builder_bytes.reserve(kBuilderInitialCapacity);
+    validate_descriptor_shape(object);
     return object;
 }
 
@@ -1046,6 +1143,57 @@ ObjectId Heap::allocate_string(std::span<const std::uint8_t> bytes) {
         id = allocated.as_object();
     }
 
+    return id;
+}
+
+ObjectId Heap::allocate_builder() {
+    if (stress_config_.collect_before_every_allocation) {
+        collect_with_extra_roots({});
+    }
+
+    auto id = allocate_object(Object::builder());
+
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
+
+    return id;
+}
+
+void Heap::builder_append(ObjectId id, Value source) {
+    Value owner = Value::object(id);
+    mutate_builder(owner, &source, BuilderMutation::Append);
+}
+
+void Heap::builder_clear(ObjectId id) {
+    Value owner = Value::object(id);
+    mutate_builder(owner, nullptr, BuilderMutation::Clear);
+}
+
+ObjectId Heap::builder_to_string(Value builder) {
+    require_object_reference_value(builder, "builder to_str receiver");
+    (void)checked_builder(builder.as_object());
+
+    if (incremental_compaction_active_) {
+        std::array<Value*, 1> operand_roots{&builder};
+        finish_incremental_compaction_impl(nullptr, operand_roots);
+    }
+    if (stress_config_.collect_before_every_allocation) {
+        std::array<Value*, 1> operand_roots{&builder};
+        collect_with_extra_roots(operand_roots);
+    }
+
+    const auto bytes = builder_bytes(builder.as_object());
+    auto id = allocate_object(Object::string(bytes));
+    if (stress_config_.collect_after_every_allocation) {
+        Value allocated = Value::object(id);
+        std::array<Value*, 1> allocation_root{&allocated};
+        collect_with_extra_roots(allocation_root);
+        id = allocated.as_object();
+    }
     return id;
 }
 
@@ -1542,6 +1690,24 @@ const Object& Heap::checked_string(ObjectId id) const {
     return object;
 }
 
+const Object& Heap::checked_builder(ObjectId id) const {
+    const auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Builder) {
+        throw std::logic_error("object is not a builder");
+    }
+    validate_descriptor_shape(object, &metrics_);
+    return object;
+}
+
+Object& Heap::checked_builder(ObjectId id) {
+    auto& object = *objects_[checked_slot(id)];
+    if (object.kind != ObjectKind::Builder) {
+        throw std::logic_error("object is not a builder");
+    }
+    validate_descriptor_shape(object, &metrics_);
+    return object;
+}
+
 const Object& Heap::checked_closure(ObjectId id) const {
     const auto& object = *objects_[checked_slot(id)];
     if (object.kind != ObjectKind::Closure) {
@@ -1726,6 +1892,14 @@ std::size_t Heap::string_length(ObjectId id) const {
 
 std::span<const std::uint8_t> Heap::string_bytes(ObjectId id) const {
     return checked_string(id).string_bytes;
+}
+
+std::size_t Heap::builder_length(ObjectId id) const {
+    return checked_builder(id).length;
+}
+
+std::span<const std::uint8_t> Heap::builder_bytes(ObjectId id) const {
+    return checked_builder(id).builder_bytes;
 }
 
 bool Heap::string_equal(ObjectId left, ObjectId right) const {
@@ -2317,6 +2491,226 @@ void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
     if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
         collect_minor();
     }
+}
+
+void Heap::ensure_builder_growth_storage(Value& owner, Value& source,
+                                         std::size_t required_width) {
+    const auto owner_slot = checked_slot(owner.as_object());
+    const auto current_width =
+        storage_slot_count(checked_builder(owner.as_object()));
+    if (required_width <= current_width) {
+        throw std::logic_error(
+            "builder growth did not increase its logical storage width");
+    }
+
+    bool adjacent_run_is_free = true;
+    const auto existing_limit =
+        std::min(objects_.size(), owner_slot + required_width);
+    for (std::size_t slot = owner_slot + current_width;
+         slot < existing_limit; ++slot) {
+        if (!is_storage_slot_free(slot)) {
+            adjacent_run_is_free = false;
+            break;
+        }
+    }
+    if (!adjacent_run_is_free) {
+        relocate_builder_for_growth(owner, source, required_width);
+        return;
+    }
+
+    if (owner_slot + required_width > objects_.size()) {
+        objects_.resize(owner_slot + required_width);
+        generations_.resize(owner_slot + required_width, 0);
+        if (objects_.size() > metrics_.heap_peak_slots) {
+            metrics_.heap_peak_slots = objects_.size();
+        }
+    }
+}
+
+void Heap::relocate_builder_for_growth(Value& owner, Value& source,
+                                       std::size_t required_width) {
+    validate_heap_storage_layout();
+    validate_remembered_set();
+    validate_weak_targets();
+    validate_intern_table();
+    validate_ephemerons();
+
+    const auto old_id = owner.as_object();
+    const auto old_slot = checked_slot(old_id);
+    const auto old_size = objects_.size();
+    if (old_size > std::numeric_limits<std::uint32_t>::max() ||
+        required_width >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) -
+                old_size + 1) {
+        throw std::length_error(
+            "builder growth exceeds heap object slot limit");
+    }
+
+    ForwardingTable forwarding(old_size);
+    for (std::size_t slot = 0; slot < old_size; ++slot) {
+        if (!objects_[slot].has_value()) {
+            continue;
+        }
+        forwarding[slot] = make_object_id(
+            static_cast<std::uint32_t>(slot), generations_[slot]);
+    }
+
+    auto relocated_objects = objects_;
+    auto relocated_generations = generations_;
+    relocated_objects.resize(old_size + required_width);
+    relocated_generations.resize(old_size + required_width, 0);
+    const auto new_slot = old_size;
+    relocated_generations[new_slot] =
+        generation_for_new_base(relocated_generations[new_slot]);
+    const auto new_id = make_object_id(
+        static_cast<std::uint32_t>(new_slot),
+        relocated_generations[new_slot]);
+    forwarding[old_slot] = new_id;
+
+    auto moved = *objects_[old_slot];
+    relocated_objects[old_slot].reset();
+    relocated_objects[new_slot] = std::move(moved);
+
+    const auto rewritten_remembered = rewrite_remembered_set(forwarding);
+    std::array<Value*, 2> growth_roots{&owner, &source};
+    rewrite_references(forwarding, relocated_objects, nullptr, growth_roots);
+    auto rewritten_weak_refs =
+        process_weak_targets(forwarding, relocated_objects, std::nullopt);
+    auto rewritten_intern_table = process_intern_table(forwarding, false);
+    auto rewritten_ephemerons =
+        process_ephemerons(forwarding, relocated_objects);
+    if (incremental_marking_active_) {
+        for (auto& grey : incremental_mark_worklist_) {
+            const auto grey_slot = checked_slot(grey);
+            if (!forwarding[grey_slot].has_value()) {
+                throw std::logic_error(
+                    "incremental grey object missing builder-growth "
+                    "forwarding entry");
+            }
+            grey = *forwarding[grey_slot];
+        }
+    }
+
+    objects_ = std::move(relocated_objects);
+    generations_ = std::move(relocated_generations);
+    remembered_set_ = rewritten_remembered;
+    weak_refs_ = std::move(rewritten_weak_refs);
+    intern_table_ = std::move(rewritten_intern_table);
+    ephemerons_ = std::move(rewritten_ephemerons);
+    ++metrics_.objects_moved;
+    if (objects_.size() > metrics_.heap_peak_slots) {
+        metrics_.heap_peak_slots = objects_.size();
+    }
+
+    validate_heap_storage_layout();
+    validate_remembered_set();
+    validate_weak_targets();
+    validate_intern_table();
+    validate_ephemerons();
+}
+
+void Heap::mutate_builder(Value& owner, Value* source,
+                          BuilderMutation mutation) {
+    require_object_reference_value(owner, "builder mutation receiver");
+    owner = canonicalize_incremental_compaction_read(owner);
+
+    if (mutation == BuilderMutation::Clear) {
+        if (source != nullptr) {
+            throw std::logic_error(
+                "builder clear received an unexpected operand");
+        }
+        auto& builder = checked_builder(owner.as_object());
+        builder.builder_bytes.clear();
+        builder.length = 0;
+        validate_descriptor_shape(builder, &metrics_);
+
+        if (incremental_compaction_active_) {
+            auto& shadow =
+                incremental_compaction_shadow_object(owner.as_object());
+            if (shadow.kind != ObjectKind::Builder ||
+                shadow.builder_capacity != builder.builder_capacity) {
+                throw std::logic_error(
+                    "incremental compaction builder shadow shape drifted");
+            }
+            shadow.builder_bytes.clear();
+            shadow.length = 0;
+            validate_descriptor_shape(shadow, &metrics_);
+        }
+        validate_heap_storage_layout();
+        return;
+    }
+
+    if (source == nullptr) {
+        throw std::logic_error(
+            "builder append omitted its string operand");
+    }
+    require_object_reference_value(*source, "builder append operand");
+    *source = canonicalize_incremental_compaction_read(*source);
+
+    const auto source_length =
+        static_cast<std::size_t>(checked_string(source->as_object()).length);
+    const auto& before = checked_builder(owner.as_object());
+    if (source_length >
+        static_cast<std::size_t>(
+            std::numeric_limits<std::uint32_t>::max()) -
+            before.length) {
+        throw std::length_error(
+            "builder append exceeds object header limit");
+    }
+    auto required =
+        static_cast<std::size_t>(before.length) + source_length;
+
+    if (required > before.builder_capacity) {
+        if (incremental_compaction_active_) {
+            std::array<Value*, 2> growth_roots{&owner, source};
+            finish_incremental_compaction_impl(nullptr, growth_roots);
+        }
+
+        const auto& relocated_source =
+            checked_string(source->as_object());
+        auto& relocated_builder =
+            checked_builder(owner.as_object());
+        required = static_cast<std::size_t>(relocated_builder.length) +
+                   relocated_source.length;
+        const auto grown_capacity = builder_capacity_for_required(
+            relocated_builder.builder_capacity, required);
+        const auto required_width =
+            1 + (static_cast<std::size_t>(grown_capacity) +
+                 kStorageSlotBytes - 1) /
+                    kStorageSlotBytes;
+
+        ensure_builder_growth_storage(owner, *source, required_width);
+        auto& grown = checked_builder(owner.as_object());
+        grown.builder_bytes.reserve(grown_capacity);
+        grown.builder_capacity = grown_capacity;
+        metrics_.max_object_storage_slots_allocated =
+            std::max(metrics_.max_object_storage_slots_allocated,
+                     static_cast<std::uint64_t>(required_width));
+        validate_descriptor_shape(grown, &metrics_);
+    }
+
+    auto& builder = checked_builder(owner.as_object());
+    const auto appended =
+        checked_string(source->as_object()).string_bytes;
+    builder.builder_bytes.insert(builder.builder_bytes.end(),
+                                 appended.begin(), appended.end());
+    builder.length = static_cast<std::uint32_t>(required);
+    validate_descriptor_shape(builder, &metrics_);
+
+    if (incremental_compaction_active_) {
+        auto& shadow =
+            incremental_compaction_shadow_object(owner.as_object());
+        if (shadow.kind != ObjectKind::Builder ||
+            shadow.builder_capacity != builder.builder_capacity) {
+            throw std::logic_error(
+                "incremental compaction builder shadow shape drifted");
+        }
+        shadow.builder_bytes = builder.builder_bytes;
+        shadow.length = builder.length;
+        validate_descriptor_shape(shadow, &metrics_);
+    }
+
+    validate_heap_storage_layout();
 }
 
 void Heap::store_ref_array_element(ObjectId id, std::size_t index, Value value) {
@@ -3557,6 +3951,10 @@ void Heap::record_compaction_copy(const Object& object,
         break;
     case ObjectKind::Ephemeron:
         break;
+    case ObjectKind::Builder:
+        // Builder accounting remains in the total and width-bucket counters;
+        // legacy per-kind counter output stays append-only.
+        break;
     }
 }
 
@@ -4075,6 +4473,23 @@ bool Heap::TEST_ONLY_is_variant(ObjectId id) const {
 
 bool Heap::TEST_ONLY_is_ephemeron(ObjectId id) const {
     return object(id).kind == ObjectKind::Ephemeron;
+}
+
+bool Heap::TEST_ONLY_is_builder(ObjectId id) const {
+    return object(id).kind == ObjectKind::Builder;
+}
+
+std::size_t Heap::TEST_ONLY_builder_capacity(ObjectId id) const {
+    return checked_builder(id).builder_capacity;
+}
+
+void Heap::TEST_ONLY_corrupt_builder_shape(ObjectId id) {
+    auto& object = checked_builder(id);
+    if (object.length == std::numeric_limits<std::uint32_t>::max()) {
+        throw std::logic_error(
+            "test-only builder corruption cannot increment length");
+    }
+    ++object.length;
 }
 
 void Heap::TEST_ONLY_skip_next_write_barrier_for_barrier_validator() {

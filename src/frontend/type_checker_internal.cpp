@@ -101,7 +101,8 @@ bool is_reference_array_element_type(const TypeSpec& type) {
            type.kind == TypeSpec::Kind::Array || type.kind == TypeSpec::Kind::Str ||
            type.kind == TypeSpec::Kind::Function || type.kind == TypeSpec::Kind::Map ||
            type.kind == TypeSpec::Kind::Weak ||
-           type.kind == TypeSpec::Kind::Ephemeron;
+           type.kind == TypeSpec::Kind::Ephemeron ||
+           type.kind == TypeSpec::Kind::Builder;
 }
 
 bool is_object_type(const TypeSpec& type) {
@@ -118,7 +119,8 @@ bool is_weak_target_type(const TypeSpec& type) {
            type.kind == TypeSpec::Kind::Function ||
            type.kind == TypeSpec::Kind::Map ||
            type.kind == TypeSpec::Kind::Weak ||
-           type.kind == TypeSpec::Kind::Ephemeron;
+           type.kind == TypeSpec::Kind::Ephemeron ||
+           type.kind == TypeSpec::Kind::Builder;
 }
 
 bool is_valid_map_key_type(const TypeSpec& type) {
@@ -417,6 +419,8 @@ private:
             case Statement::Kind::Continue:
             case Statement::Kind::Print:
             case Statement::Kind::EphemeronSet:
+            case Statement::Kind::BuilderAppend:
+            case Statement::Kind::BuilderClear:
             case Statement::Kind::TailCall:
                 break;
             }
@@ -1556,6 +1560,7 @@ private:
         if (target.kind == TypeSpec::Kind::Int64 ||
             target.kind == TypeSpec::Kind::Bool ||
             target.kind == TypeSpec::Kind::Str ||
+            target.kind == TypeSpec::Kind::Builder ||
             target.kind == TypeSpec::Kind::Function) {
             return !value.includes_nil && value.type == target;
         }
@@ -1662,8 +1667,60 @@ private:
             }
             return true;
         }
+        case Statement::Kind::BuilderAppend:
+        case Statement::Kind::BuilderClear:
+            check_builder_mutation(statement, state);
+            return true;
         }
         return true;
+    }
+
+    void check_builder_mutation(Statement& statement, FlowState& state) {
+        const auto receiver = check_expr(*statement.initializer, state);
+        std::vector<TypedValue> arguments;
+        arguments.reserve(statement.arguments.size());
+        for (auto& argument : statement.arguments) {
+            arguments.push_back(check_expr(*argument, state));
+        }
+
+        const bool append =
+            statement.kind == Statement::Kind::BuilderAppend;
+        const auto* method = append ? "append" : "clear";
+        const std::size_t expected = append ? 1 : 0;
+        if (statement.arguments.size() != expected) {
+            diagnose(statement.position,
+                     std::string(method) + " expects exactly " +
+                         std::to_string(expected) +
+                         (expected == 1 ? " argument" : " arguments"));
+        }
+
+        if (!is_invalid(receiver.type) &&
+            receiver.type.kind != TypeSpec::Kind::Builder) {
+            diagnose(statement.position,
+                     std::string(method) +
+                         " requires builder receiver");
+        } else if (receiver.type.kind == TypeSpec::Kind::Builder &&
+                   receiver.includes_nil) {
+            diagnose(statement.position,
+                     std::string(method) +
+                         " requires non-nil builder receiver");
+        }
+
+        if (!append || arguments.size() != 1 ||
+            is_invalid(arguments.front().type)) {
+            return;
+        }
+        const auto& argument = arguments.front();
+        if (argument.type.kind != TypeSpec::Kind::Str &&
+            argument.type.kind != TypeSpec::Kind::Int64 &&
+            argument.type.kind != TypeSpec::Kind::Bool) {
+            diagnose(statement.arguments.front()->position,
+                     "builder append accepts str, i64, or bool");
+        } else if (argument.type.kind == TypeSpec::Kind::Str &&
+                   argument.includes_nil) {
+            diagnose(statement.arguments.front()->position,
+                     "builder append requires non-nil str");
+        }
     }
 
     bool check_try_catch(Statement& statement, FlowState& state) {
@@ -2557,6 +2614,10 @@ private:
         case Expr::Kind::EphemeronKey:
         case Expr::Kind::EphemeronValue:
             return check_ephemeron_get(expression, state);
+        case Expr::Kind::BuilderConstruct:
+            return check_builder_construct(expression, state);
+        case Expr::Kind::BuilderToStr:
+            return check_builder_to_str(expression, state);
         case Expr::Kind::ToStr:
         case Expr::Kind::ToI64:
             return check_conversion(expression, state);
@@ -3075,6 +3136,43 @@ private:
         return annotate(expression, std::move(result));
     }
 
+    TypedValue check_builder_construct(Expr& expression, FlowState& state) {
+        for (auto& argument : expression.arguments) {
+            (void)check_expr(*argument, state);
+        }
+        if (!expression.arguments.empty()) {
+            diagnose(expression.position,
+                     "builder expects exactly 0 arguments");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, value_from_type(builder_type()));
+    }
+
+    TypedValue check_builder_to_str(Expr& expression, FlowState& state) {
+        const auto receiver = check_expr(*expression.receiver, state);
+        for (auto& argument : expression.arguments) {
+            (void)check_expr(*argument, state);
+        }
+        if (!expression.arguments.empty()) {
+            diagnose(expression.position,
+                     "to_str expects exactly 0 arguments");
+            return annotate(expression, invalid_value());
+        }
+        if (!is_invalid(receiver.type) &&
+            receiver.type.kind != TypeSpec::Kind::Builder) {
+            diagnose(expression.position,
+                     "to_str requires builder receiver");
+            return annotate(expression, invalid_value());
+        }
+        if (receiver.type.kind == TypeSpec::Kind::Builder &&
+            receiver.includes_nil) {
+            diagnose(expression.position,
+                     "to_str requires non-nil builder receiver");
+            return annotate(expression, invalid_value());
+        }
+        return annotate(expression, scalar_value(str_type()));
+    }
+
     TypedValue check_conversion(Expr& expression, FlowState& state) {
         const auto operand = check_expr(*expression.receiver, state);
         if (is_invalid(operand.type)) {
@@ -3185,9 +3283,11 @@ private:
         if (!is_invalid(receiver.type) &&
             receiver.type.kind != TypeSpec::Kind::Str &&
             receiver.type.kind != TypeSpec::Kind::Map &&
+            receiver.type.kind != TypeSpec::Kind::Builder &&
             (receiver.type.kind != TypeSpec::Kind::Array ||
              receiver.type.element == nullptr)) {
-            diagnose(expression.position, "len requires array, str, or map");
+            diagnose(expression.position,
+                     "len requires array, str, map, or builder");
             return annotate(expression, invalid_value());
         }
         return annotate(expression, scalar_value(int64_type()));
@@ -3427,9 +3527,11 @@ private:
             if (!is_invalid(receiver.type) &&
                 receiver.type.kind != TypeSpec::Kind::Str &&
                 receiver.type.kind != TypeSpec::Kind::Map &&
+                receiver.type.kind != TypeSpec::Kind::Builder &&
                 (receiver.type.kind != TypeSpec::Kind::Array ||
                  receiver.type.element == nullptr)) {
-                diagnose(expression.position, "len requires array, str, or map");
+                diagnose(expression.position,
+                         "len requires array, str, map, or builder");
                 return annotate(expression, invalid_value());
             }
             return annotate(expression, scalar_value(int64_type()));
@@ -3605,6 +3707,7 @@ private:
         case TypeSpec::Kind::Int64:
         case TypeSpec::Kind::Bool:
         case TypeSpec::Kind::Str:
+        case TypeSpec::Kind::Builder:
         case TypeSpec::Kind::Named:
         case TypeSpec::Kind::Record:
         case TypeSpec::Kind::Variant:

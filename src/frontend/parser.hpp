@@ -22,6 +22,7 @@ struct TypeSpec {
         Map,
         Weak,
         Ephemeron,
+        Builder,
         TypeParameter,
         Named,
         Record,
@@ -85,6 +86,7 @@ TypeSpec function_type(std::vector<TypeSpec> parameters, TypeSpec result);
 TypeSpec map_type(TypeSpec key, TypeSpec value);
 TypeSpec weak_type(TypeSpec target);
 TypeSpec ephemeron_type(TypeSpec key, TypeSpec value);
+TypeSpec builder_type();
 TypeSpec type_parameter_type(std::string name, std::size_t index,
                              SourcePosition position);
 
@@ -125,6 +127,8 @@ struct Expr {
         EphemeronConstruct,
         EphemeronKey,
         EphemeronValue,
+        BuilderConstruct,
+        BuilderToStr,
         ToStr,
         ToI64,
         Intern,
@@ -235,6 +239,8 @@ struct Statement {
         Continue,
         Print,
         EphemeronSet,
+        BuilderAppend,
+        BuilderClear,
         TailCall,
     };
 
@@ -247,6 +253,7 @@ struct Statement {
     std::unique_ptr<Expr> initializer;
     LValue target;
     std::unique_ptr<Expr> value;
+    std::vector<std::unique_ptr<Expr>> arguments;
     std::unique_ptr<Expr> condition;
     std::vector<Statement> then_branch;
     std::vector<Statement> else_branch;

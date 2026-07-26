@@ -10,7 +10,21 @@
 
 namespace lang::frontend {
 
-enum class Type { Int64, Bool, Pair, Array, Str, Function, Map, Weak, Invalid, Record, Variant, Ephemeron };
+enum class Type {
+    Int64,
+    Bool,
+    Pair,
+    Array,
+    Str,
+    Function,
+    Map,
+    Weak,
+    Invalid,
+    Record,
+    Variant,
+    Ephemeron,
+    Builder,
+};
 
 struct SourcePosition {
     std::size_t offset{0};

@@ -109,6 +109,7 @@ enum class ObjectKind {
     Record,
     Variant,
     Ephemeron,
+    Builder,
 };
 
 struct MapEntry {
@@ -133,6 +134,7 @@ struct Object {
                           std::vector<Value> fields,
                           std::vector<std::vector<bool>> case_ref_maps);
     static Object ephemeron(Value key, Value value, bool value_is_ref);
+    static Object builder();
 
     [[nodiscard]] Value weak_target() const { return weak_target_; }
     [[nodiscard]] Value ephemeron_key() const { return ephemeron_key_; }
@@ -148,6 +150,8 @@ struct Object {
     std::vector<std::int64_t> scalar_elements;
     std::vector<Value> ref_elements;
     std::vector<std::uint8_t> string_bytes;
+    std::uint32_t builder_capacity{0};
+    std::vector<std::uint8_t> builder_bytes;
     std::uint32_t closure_layout_index{0};
     std::uint32_t closure_function_index{0};
     std::vector<Value> closure_captures;
@@ -223,6 +227,10 @@ public:
                           bool value_is_ref);
     ObjectId allocate_weak(Value target);
     ObjectId allocate_ephemeron(Value key, Value value, bool value_is_ref);
+    ObjectId allocate_builder();
+    void builder_append(ObjectId id, Value source);
+    void builder_clear(ObjectId id);
+    ObjectId builder_to_string(Value builder);
     ObjectId allocate_record(std::size_t layout_index,
                              std::vector<Value> fields,
                              std::vector<bool> ref_map);
@@ -274,6 +282,9 @@ public:
     void ref_array_set(ObjectId id, std::size_t index, Value value);
     [[nodiscard]] std::size_t string_length(ObjectId id) const;
     [[nodiscard]] std::span<const std::uint8_t> string_bytes(ObjectId id) const;
+    [[nodiscard]] std::size_t builder_length(ObjectId id) const;
+    [[nodiscard]] std::span<const std::uint8_t>
+    builder_bytes(ObjectId id) const;
     [[nodiscard]] bool string_equal(ObjectId left, ObjectId right) const;
     [[nodiscard]] std::uint8_t string_index(ObjectId id, std::size_t index) const;
     [[nodiscard]] std::size_t closure_layout_index(ObjectId id) const;
@@ -315,6 +326,10 @@ public:
     [[nodiscard]] bool TEST_ONLY_is_record(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_variant(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_ephemeron(ObjectId id) const;
+    [[nodiscard]] bool TEST_ONLY_is_builder(ObjectId id) const;
+    [[nodiscard]] std::size_t
+    TEST_ONLY_builder_capacity(ObjectId id) const;
+    void TEST_ONLY_corrupt_builder_shape(ObjectId id);
     [[nodiscard]] std::size_t TEST_ONLY_remembered_set_size() const {
         return remembered_set_.size();
     }
@@ -354,6 +369,7 @@ private:
     class PartialForwardingVisitor;
     class ValidatingVisitor;
     enum class PairField { Left, Right };
+    enum class BuilderMutation { Append, Clear };
     enum class CollectionKind { Major, Minor };
     using ForwardingTable = std::vector<std::optional<ObjectId>>;
 
@@ -403,6 +419,8 @@ private:
     [[nodiscard]] const Object& checked_variant(ObjectId id) const;
     [[nodiscard]] const Object& checked_ephemeron(ObjectId id) const;
     [[nodiscard]] Object& checked_ephemeron(ObjectId id);
+    [[nodiscard]] const Object& checked_builder(ObjectId id) const;
+    [[nodiscard]] Object& checked_builder(ObjectId id);
     void register_handle_root(Value* slot);
     void deregister_handle_root(Value* slot) noexcept;
     void move_handle_root(Value* from, Value* to) noexcept;
@@ -442,6 +460,12 @@ private:
     void store_map_entry(ObjectId id, Value key, Value value);
     void store_record_field(ObjectId id, std::size_t index, Value value);
     void store_ephemeron_value(ObjectId id, Value value);
+    void mutate_builder(Value& owner, Value* source,
+                        BuilderMutation mutation);
+    void ensure_builder_growth_storage(Value& owner, Value& source,
+                                       std::size_t required_width);
+    void relocate_builder_for_growth(Value& owner, Value& source,
+                                     std::size_t required_width);
     void ensure_map_growth_storage(Value& owner, Value& key, Value& value,
                                    std::size_t required_width);
     void relocate_map_for_growth(Value& owner, Value& key, Value& value,

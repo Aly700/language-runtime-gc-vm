@@ -76,6 +76,11 @@ enum class OpCode {
     TailCall,
     StrIntern,
     I64Abs,
+    AllocBuilder,
+    BuilderAppend,
+    BuilderLen,
+    BuilderToStr,
+    BuilderClear,
 };
 
 struct Instruction {
@@ -98,6 +103,7 @@ enum class ValueKind {
     Record,
     Variant,
     Ephemeron,
+    Builder,
 };
 
 struct SignatureValue {
@@ -266,7 +272,8 @@ inline bool signature_value_is_reference(const SignatureValue& value) {
            value.kind == ValueKind::Str || value.kind == ValueKind::Function ||
            value.kind == ValueKind::Map || value.kind == ValueKind::Weak ||
            value.kind == ValueKind::Record || value.kind == ValueKind::Variant ||
-           value.kind == ValueKind::Ephemeron;
+           value.kind == ValueKind::Ephemeron ||
+           value.kind == ValueKind::Builder;
 }
 
 struct NamedTypeSignature {
@@ -475,6 +482,8 @@ enum class VerifierReason {
     BadTailCallArgKind,         // TailCall argument violates the callee parameter type.
     StrInternRequiresStr,       // StrIntern operand is not a string.
     I64AbsRequiresI64,          // I64Abs operand is not an i64.
+    BuilderOperationOnNonBuilder, // Builder operation receiver is not a Builder.
+    BuilderAppendRequiresStr,   // BuilderAppend value operand is not a Str.
 };
 
 struct VerifierDiagnostic {

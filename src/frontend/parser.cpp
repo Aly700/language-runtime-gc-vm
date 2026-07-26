@@ -19,6 +19,7 @@ TypeSpec int64_type() { return type_with_kind(TypeSpec::Kind::Int64); }
 TypeSpec bool_type() { return type_with_kind(TypeSpec::Kind::Bool); }
 TypeSpec str_type() { return type_with_kind(TypeSpec::Kind::Str); }
 TypeSpec pair_type() { return type_with_kind(TypeSpec::Kind::Pair); }
+TypeSpec builder_type() { return type_with_kind(TypeSpec::Kind::Builder); }
 TypeSpec nil_type() { return type_with_kind(TypeSpec::Kind::Nil); }
 TypeSpec invalid_type() { return type_with_kind(TypeSpec::Kind::Invalid); }
 
@@ -221,6 +222,8 @@ Type public_type(const TypeSpec& type) {
         return Type::Weak;
     case TypeSpec::Kind::Ephemeron:
         return Type::Ephemeron;
+    case TypeSpec::Kind::Builder:
+        return Type::Builder;
     case TypeSpec::Kind::TypeParameter:
         return Type::Invalid;
     case TypeSpec::Kind::Named:
@@ -284,6 +287,8 @@ std::string type_name(const TypeSpec& type) {
                    ? "ephemeron<invalid, invalid>"
                    : "ephemeron<" + type_name(*type.key) + ", " +
                          type_name(*type.value) + ">";
+    case TypeSpec::Kind::Builder:
+        return "builder";
     case TypeSpec::Kind::TypeParameter:
         return type.name;
     case TypeSpec::Kind::Named:
@@ -752,7 +757,8 @@ private:
             check(TokenKind::Continue) || check(TokenKind::Print)) {
             return true;
         }
-        return assignment_ahead() || ephemeron_set_ahead();
+        return assignment_ahead() || ephemeron_set_ahead() ||
+               builder_mutation_ahead();
     }
 
     [[nodiscard]] bool label_prefix_ahead() const {
@@ -767,6 +773,16 @@ private:
                tokens_[current_ + 1].kind == TokenKind::Dot &&
                tokens_[current_ + 2].kind == TokenKind::Identifier &&
                tokens_[current_ + 2].text == "set_value" &&
+               tokens_[current_ + 3].kind == TokenKind::LParen;
+    }
+
+    [[nodiscard]] bool builder_mutation_ahead() const {
+        return current_ + 3 < tokens_.size() &&
+               tokens_[current_].kind == TokenKind::Identifier &&
+               tokens_[current_ + 1].kind == TokenKind::Dot &&
+               tokens_[current_ + 2].kind == TokenKind::Identifier &&
+               (tokens_[current_ + 2].text == "append" ||
+                tokens_[current_ + 2].text == "clear") &&
                tokens_[current_ + 3].kind == TokenKind::LParen;
     }
 
@@ -894,6 +910,34 @@ private:
             expect(TokenKind::Semicolon, "expected ';' after set_value");
             return statement;
         }
+        if (builder_mutation_ahead()) {
+            Statement statement;
+            statement.kind = tokens_[current_ + 2].text == "append"
+                                 ? Statement::Kind::BuilderAppend
+                                 : Statement::Kind::BuilderClear;
+            statement.position = peek().position;
+            auto receiver = std::make_unique<Expr>();
+            receiver->kind = Expr::Kind::Variable;
+            receiver->position = peek().position;
+            receiver->name = peek().text;
+            ++current_;
+            statement.initializer = std::move(receiver);
+            expect(TokenKind::Dot, "expected '.' before builder mutation");
+            const auto method = peek().text;
+            ++current_;
+            expect(TokenKind::LParen,
+                   "expected '(' after '" + method + "'");
+            if (!check(TokenKind::RParen)) {
+                do {
+                    statement.arguments.push_back(parse_expression());
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::RParen,
+                   "expected ')' after " + method + " arguments");
+            expect(TokenKind::Semicolon,
+                   "expected ';' after " + method);
+            return statement;
+        }
         if (assignment_ahead()) {
             return parse_assignment();
         }
@@ -942,6 +986,11 @@ private:
         }
         if (match(TokenKind::Str)) {
             auto type = str_type();
+            type.position = previous().position;
+            return type;
+        }
+        if (match(TokenKind::Builder)) {
+            auto type = builder_type();
             type.position = previous().position;
             return type;
         }
@@ -1383,6 +1432,23 @@ private:
                     expect(TokenKind::LParen, "expected '(' after ephemeron getter");
                     expect(TokenKind::RParen, "ephemeron getter takes no arguments");
                     expression = std::move(node);
+                } else if (check(TokenKind::ToStr) &&
+                           check_next(TokenKind::LParen)) {
+                    auto node = std::make_unique<Expr>();
+                    node->kind = Expr::Kind::BuilderToStr;
+                    node->position = peek().position;
+                    node->receiver = std::move(expression);
+                    ++current_;
+                    expect(TokenKind::LParen,
+                           "expected '(' after 'to_str'");
+                    if (!check(TokenKind::RParen)) {
+                        do {
+                            node->arguments.push_back(parse_expression());
+                        } while (match(TokenKind::Comma));
+                    }
+                    expect(TokenKind::RParen,
+                           "expected ')' after to_str arguments");
+                    expression = std::move(node);
                 } else if (check(TokenKind::Identifier) && peek().text == "sub" &&
                            check_next(TokenKind::LParen)) {
                     auto node = std::make_unique<Expr>();
@@ -1572,6 +1638,20 @@ private:
             expect(TokenKind::Comma, "expected ',' between ephemeron key and value");
             node->right = parse_expression();
             expect(TokenKind::RParen, "expected ')' after ephemeron value");
+            return node;
+        }
+        if (match(TokenKind::Builder)) {
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::BuilderConstruct;
+            node->position = previous().position;
+            expect(TokenKind::LParen, "expected '(' after 'builder'");
+            if (!check(TokenKind::RParen)) {
+                do {
+                    node->arguments.push_back(parse_expression());
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::RParen,
+                   "expected ')' after builder arguments");
             return node;
         }
         if (match(TokenKind::Intern)) {

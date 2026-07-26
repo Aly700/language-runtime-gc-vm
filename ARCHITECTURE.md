@@ -1,5 +1,11 @@
 # Architecture — Language Runtime
 
+Iteration 47 adds `builder`, a mutable GC-opaque byte buffer for amortized-linear
+incremental string construction. Capacity starts at eight bytes and doubles
+deterministically; growth either extends an adjacent run or uses the complete Map-growth
+forwarding path. `to_str()` always copies into a fresh immutable `Str`, preserving the
+copy-not-view rule. See [ADR-0023](adr/0023-string-builder.md).
+
 Iteration 45 adds deterministic runtime diagnostics as a side channel. Frontend functions
 carry append-only names and per-pc line/column tables; terminal traps and uncaught typed
 exceptions copy the complete normalized frame stack before cleanup. The trace contains no
@@ -421,6 +427,12 @@ guard traps before attempting to negate `INT64_MIN`.
   capture slots. Its header retains the validated module layout identity and heap-side
   capture-map metadata; its logical storage width is one function-index slot plus N capture
   slots. No closure capture setter exists.
+- `Builder` is variable-width mutable scalar storage with a `uint32_t` logical length,
+  a deterministic `uint32_t` capacity, and raw byte payload. Its logical width is
+  `1 + ceil(capacity / 8)`. The visitor scans zero fields, while shape validation ties
+  payload byte count to logical length and capacity. Capacity starts at eight, doubles
+  with a saturating final step, and is deliberately absent from source observables and
+  canonical graph rendering.
 - `Map` is variable-width mutable storage with ordered tagged `(key, value)` entries and a
   retained verified layout identity. The ordered vector remains the sole payload,
   positional-access, tracing, and iteration authority. A private deterministic
@@ -444,7 +456,10 @@ guard traps before attempting to negate `INT64_MIN`.
   roots, descriptor fields, remembered-set edges, or ephemerons.
 - All strong heap tracing is descriptor-driven. The descriptor visitor scans `Pair`'s two
   tagged fields, scans every `RefArray` element, and scans zero `ScalarArray` payload slots.
-  It also scans zero `Str` payload slots. For `Closure`, it consults the capture map and
+  It also scans zero `Str` or `Builder` payload slots. Builder bytes remain opaque even
+  when eight consecutive bytes equal a complete current or stale `ObjectId`; growth
+  forwarding rewrites the Builder owner, never its byte contents. For `Closure`, it
+  consults the capture map and
   visits exactly the statically reference-typed capture slots. Raw scalar elements, scalar
   closure captures, and string bytes are never marked, forwarded, validated as references,
   or entered into remembered-set logic.
@@ -479,6 +494,13 @@ guard traps before attempting to negate `INT64_MIN`.
   `ArraySet` writes raw scalar payload and therefore does not run the write barrier.
   Strings expose only construction and const byte access; there is no string write barrier
   because no post-construction payload mutation exists.
+  Builder append and clear expose no direct payload reference. Both enter
+  `Heap::mutate_builder`, which validates shape, finishes incremental compaction before a
+  width change with receiver/source roots installed, grows storage, publishes bytes, and
+  synchronizes a fixed-width incremental-compaction shadow. Because those bytes cannot
+  encode an edge, the funnel has no generational or incremental write barrier.
+  `Builder::to_str` reacquires its operand after any collection and copies current logical
+  bytes into a new `Str`; no snapshot aliases Builder capacity.
   Closures likewise expose only construction and const capture access. Their only possible
   old-to-young edge is collector-created during promotion. The generic descriptor-driven
   promotion path records those closure edges and any promotion-created record or variant
@@ -505,7 +527,9 @@ guard traps before attempting to negate `INT64_MIN`.
   `incremental_1` and `incremental_3_1` preserve the marking-only paths;
   `incremental_compact_1` and `incremental_compact_3_1` establish liveness atomically and
   move incrementally. `combined_mark_compact` transfers the final marking remark into
-  compaction. Map growth and allocation finish compaction before changing layout; VM
+  compaction. Map growth, Builder width growth, and allocation finish compaction before
+  changing layout. Builder growth temporarily roots both receiver and appended `Str`;
+  fixed-width append/clear instead update the active compaction shadow in place. VM
   execution finishes either active phase before returning or propagating a trap.
 - Differential fuzz outcomes retain both the canonical return value/heap graph and the
   exact output bytes. Every schedule comparison checks both fields. Iteration 29 owns a
@@ -565,9 +589,18 @@ guard traps before attempting to negate `INT64_MIN`.
 - Iteration 46 adds the isolated pinned `ergonomics` grammar without changing `loops` or
   another legacy stream. Its 32 seeds exercise two- and three-deep labeled range, array,
   map, and while control plus all seven built-ins. Each seed compares non-empty graph and
-  output oracles across all 15 schedules and runs 18 positioned rejection mutants. The
+  output oracles across all 15 schedules and runs 18 positioned rejection mutants. Its
   representative source, outcome, and full corpus FNV-1a values are
   `3513356585459432607`, `11394261262610471186`, and `7085578191262596976`.
+- Iteration 47 adds the isolated pinned `builder` grammar. Its 32 seeds construct one
+  aliased Builder through function parameters, closure captures, record fields, map
+  values, and `weak<builder>`, exercise append/clear/snapshot/length, and force geometric
+  growth. Every seed compares a canonical returned graph containing Builder bytes plus
+  exact printed Builder-produced strings across all 15 schedules, then runs eight
+  positioned rejection mutants. Capacity is omitted from the graph because it is not a
+  language observable. Source, outcome, and corpus FNV-1a pins are
+  `10719162047016123221`, `3422408984983186133`, and
+  `1386632754159073109`.
 
 ## Performance measurement
 
@@ -739,6 +772,12 @@ Compiler accommodations for verifier strictness:
   emits `PushStr`; checked concat/equality/length/index constructs emit `StrConcat`,
   `StrEq`, `StrLen`, and `StrIndex`. `ValueKind::Str` remains distinct from pairs and
   arrays, while verifier stack maps mark it with the same precise object-reference bit.
+- Builders: `builder()` emits `AllocBuilder`; statement-only append and clear emit
+  `BuilderAppend` and `BuilderClear`; `.len` and `.to_str()` emit `BuilderLen` and
+  `BuilderToStr`. The frontend converts `i64` and `bool` append operands with the existing
+  `I64ToStr`/`BoolToStr` operations, leaving one exact heap mutation signature
+  `builder, str -> ()`. `ValueKind::Builder` stays distinct from every other reference
+  kind while using the same precise root bit.
 - Recursive named pairs: the compiler emits the module named-type table before compiling
   signatures, lowers named references to table indices, emits `Nil` for `nil`, and emits
   `IsNil` for nil checks. The type checker and verifier both refine only a checked local,
@@ -835,8 +874,10 @@ Collection is mark, forward, rewrite-strong, process-weak, install, validate:
 5. The weak phase walks exact collector-owned weak structures in deterministic slot
    order. Dead WeakRef owners are pruned; live WeakRef targets forward or clear to
    canonical `Nil`. Intern canonicals with forwarding entries are rewritten and entries
-   without forwarding are evicted. Neither path marks a target. Map-growth relocation
-   invokes the same forwarding hooks, with no clearing because all objects are live.
+   without forwarding are evicted. Neither path marks a target. Map-growth and blocked
+   Builder-growth relocation invoke the same root, descriptor, remembered-set, weak,
+   ephemeron, intern-table, handle, and incremental-worklist forwarding hooks, with no
+   clearing because all objects are live.
 6. After installation, validation walks all roots and all descriptor-declared live-object
    reference slots, checks that every object reference resolves through the current
    generation table, verifies storage runs, and separately proves WeakRef-registry
@@ -1042,8 +1083,8 @@ remembered-set entries.
 
 - Stack height is invariant at a merge; different heights reject immediately to protect
   stack-depth safety.
-- Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `RefArray`, `Str`, `Function`,
-  `Map`, `Record`, `Variant`, `Nil`, and `Poison`; recursive named values use `Object` with an
+- Stack value kinds are `Int64`, `Bool`, `Object`, `Array`, `RefArray`, `Str`, `Builder`,
+  `Function`, `Map`, `Record`, `Variant`, `Nil`, and `Poison`; recursive named values use `Object` with an
   explicit nullable bit, while records and variants use distinct kinds with exact nominal
   layout identity and nullable state.
 - Equal scalar/string kinds join to themselves; structural function values join only when

@@ -254,6 +254,8 @@ private:
             kind = TokenKind::Weak;
         } else if (text == "ephemeron") {
             kind = TokenKind::Ephemeron;
+        } else if (text == "builder") {
+            kind = TokenKind::Builder;
         } else if (text == "print") {
             kind = TokenKind::Print;
         } else if (text == "to_str") {

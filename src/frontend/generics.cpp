@@ -114,6 +114,10 @@ Statement clone_statement(const Statement& source,
     if (source.value != nullptr) {
         result.value = clone_expr(*source.value, arguments);
     }
+    result.arguments.reserve(source.arguments.size());
+    for (const auto& argument : source.arguments) {
+        result.arguments.push_back(clone_expr(*argument, arguments));
+    }
     if (source.condition != nullptr) {
         result.condition = clone_expr(*source.condition, arguments);
     }
@@ -255,6 +259,9 @@ void append_key(std::string& out, const TypeSpec& type) {
     case TypeSpec::Kind::Str:
         out += "S";
         return;
+    case TypeSpec::Kind::Builder:
+        out += "U";
+        return;
     case TypeSpec::Kind::Pair:
         if (!type.has_pair_fields()) {
             out += "P0";
@@ -372,6 +379,9 @@ void collect_statement_lambdas(
     }
     if (statement.value != nullptr) {
         collect_expr_lambdas(*statement.value, lambdas);
+    }
+    for (auto& argument : statement.arguments) {
+        collect_expr_lambdas(*argument, lambdas);
     }
     if (statement.condition != nullptr) {
         collect_expr_lambdas(*statement.condition, lambdas);

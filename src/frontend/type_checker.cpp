@@ -30,6 +30,8 @@ const char* type_name(Type type) {
         return "weak";
     case Type::Ephemeron:
         return "ephemeron";
+    case Type::Builder:
+        return "builder";
     case Type::Record:
         return "record";
     case Type::Variant:

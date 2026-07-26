@@ -38,6 +38,7 @@ enum class TokenKind {
     Map,
     Weak,
     Ephemeron,
+    Builder,
     Print,
     ToStr,
     ToI64,
