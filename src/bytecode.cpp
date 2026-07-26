@@ -32,6 +32,7 @@ enum class AbstractKind {
     Record,
     Variant,
     Ephemeron,
+    Builder,
     Nil,
     Poison,
 };
@@ -207,6 +208,16 @@ const char* op_name(OpCode op) {
         return "StrIntern";
     case OpCode::I64Abs:
         return "I64Abs";
+    case OpCode::AllocBuilder:
+        return "AllocBuilder";
+    case OpCode::BuilderAppend:
+        return "BuilderAppend";
+    case OpCode::BuilderLen:
+        return "BuilderLen";
+    case OpCode::BuilderToStr:
+        return "BuilderToStr";
+    case OpCode::BuilderClear:
+        return "BuilderClear";
     }
     return "<invalid>";
 }
@@ -237,6 +248,8 @@ const char* value_kind_name(ValueKind kind) {
         return "Variant";
     case ValueKind::Ephemeron:
         return "Ephemeron";
+    case ValueKind::Builder:
+        return "Builder";
     }
     return "<invalid>";
 }
@@ -269,6 +282,8 @@ const char* abstract_kind_name(AbstractKind kind) {
         return "Variant";
     case AbstractKind::Ephemeron:
         return "Ephemeron";
+    case AbstractKind::Builder:
+        return "Builder";
     case AbstractKind::Nil:
         return "Nil";
     case AbstractKind::Poison:
@@ -305,6 +320,9 @@ AbstractValue bool_value() { return value_with_kind(AbstractKind::Bool); }
 AbstractValue array_value() { return value_with_kind(AbstractKind::Array); }
 AbstractValue ref_array_value() { return value_with_kind(AbstractKind::RefArray); }
 AbstractValue str_value() { return value_with_kind(AbstractKind::Str); }
+AbstractValue builder_value() {
+    return value_with_kind(AbstractKind::Builder);
+}
 
 AbstractValue map_value(SignatureValue signature) {
     AbstractValue value;
@@ -469,6 +487,8 @@ AbstractKind abstract_kind(ValueKind kind) {
         return AbstractKind::Variant;
     case ValueKind::Ephemeron:
         return AbstractKind::Ephemeron;
+    case ValueKind::Builder:
+        return AbstractKind::Builder;
     }
     return AbstractKind::Poison;
 }
@@ -543,7 +563,8 @@ bool is_reference_kind(AbstractKind kind) {
            kind == AbstractKind::Function || kind == AbstractKind::Map ||
            kind == AbstractKind::Weak || kind == AbstractKind::MaybeReference ||
            kind == AbstractKind::Record || kind == AbstractKind::Variant ||
-           kind == AbstractKind::Ephemeron;
+           kind == AbstractKind::Ephemeron ||
+           kind == AbstractKind::Builder;
 }
 
 SignatureValue parameter_signature(const FunctionSignature& signature,
@@ -2335,6 +2356,62 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         return push_fallthrough_or_report(
             pc, function, function_index, std::move(state), successors,
             diagnostics);
+    case OpCode::AllocBuilder:
+        state.stack.push_back(builder_value());
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
+    case OpCode::BuilderAppend:
+        if (!pop_expect_or_report(
+                state, diagnostics, function, function_index, pc,
+                AbstractKind::Str, VerifierReason::StackUnderflow,
+                VerifierReason::BuilderAppendRequiresStr,
+                "builder append value") ||
+            !pop_expect_or_report(
+                state, diagnostics, function, function_index, pc,
+                AbstractKind::Builder, VerifierReason::StackUnderflow,
+                VerifierReason::BuilderOperationOnNonBuilder,
+                "builder receiver")) {
+            return false;
+        }
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
+    case OpCode::BuilderLen:
+        if (!pop_expect_or_report(
+                state, diagnostics, function, function_index, pc,
+                AbstractKind::Builder, VerifierReason::StackUnderflow,
+                VerifierReason::BuilderOperationOnNonBuilder,
+                "builder receiver")) {
+            return false;
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
+    case OpCode::BuilderToStr:
+        if (!pop_expect_or_report(
+                state, diagnostics, function, function_index, pc,
+                AbstractKind::Builder, VerifierReason::StackUnderflow,
+                VerifierReason::BuilderOperationOnNonBuilder,
+                "builder receiver")) {
+            return false;
+        }
+        state.stack.push_back(str_value());
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
+    case OpCode::BuilderClear:
+        if (!pop_expect_or_report(
+                state, diagnostics, function, function_index, pc,
+                AbstractKind::Builder, VerifierReason::StackUnderflow,
+                VerifierReason::BuilderOperationOnNonBuilder,
+                "builder receiver")) {
+            return false;
+        }
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
     case OpCode::LessI64:
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64, VerifierReason::StackUnderflow,
@@ -3741,6 +3818,10 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "StrInternRequiresStr";
     case VerifierReason::I64AbsRequiresI64:
         return "I64AbsRequiresI64";
+    case VerifierReason::BuilderOperationOnNonBuilder:
+        return "BuilderOperationOnNonBuilder";
+    case VerifierReason::BuilderAppendRequiresStr:
+        return "BuilderAppendRequiresStr";
     }
     return "<unknown>";
 }

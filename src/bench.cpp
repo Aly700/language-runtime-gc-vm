@@ -267,12 +267,31 @@ std::uint64_t verified_stack_map_count(const lang::Module& module) {
     return count;
 }
 
-CounterSnapshot run_module(const lang::VerifiedModule& module, lang::gc::StressConfig stress,
-                           CounterSnapshot base) {
+CounterSnapshot run_module(
+    const lang::VerifiedModule& module, lang::gc::StressConfig stress,
+    CounterSnapshot base,
+    const std::optional<std::string>& expected_string_output = std::nullopt) {
     lang::VM vm;
     vm.set_gc_stress(stress);
     const auto result = vm.execute(module);
-    (void)result;
+    if (expected_string_output.has_value()) {
+        if (!result.is_object() ||
+            !vm.heap().TEST_ONLY_is_string(result.as_object())) {
+            throw std::runtime_error(
+                "string construction benchmark returned a non-string");
+        }
+        const auto result_bytes =
+            vm.heap().string_bytes(result.as_object());
+        const std::string actual_result(result_bytes.begin(),
+                                        result_bytes.end());
+        const std::string actual_output(vm.output().begin(),
+                                        vm.output().end());
+        if (actual_result != *expected_string_output ||
+            actual_output != *expected_string_output + "\n") {
+            throw std::runtime_error(
+                "string construction benchmark output mismatch");
+        }
+    }
 
     const auto metrics = vm.metrics();
     if (metrics.raw_module_executions != 0 || metrics.raw_function_executions != 0) {
@@ -455,6 +474,37 @@ std::string string_heavy_source(std::size_t iterations, std::uint64_t seed) {
     out << "  i = i + 1;\n";
     out << "}\n";
     out << "score\n";
+    return out.str();
+}
+
+std::string strconcat_loop_source(std::size_t iterations,
+                                  std::string_view chunk) {
+    std::ostringstream out;
+    out << "let chunk: str = \"" << chunk << "\";\n";
+    out << "let result: str = \"\";\n";
+    out << "let i: i64 = 0;\n";
+    out << "while i < " << iterations << " {\n";
+    out << "  result = result + chunk;\n";
+    out << "  i = i + 1;\n";
+    out << "}\n";
+    out << "print(result);\n";
+    out << "result\n";
+    return out.str();
+}
+
+std::string builder_loop_source(std::size_t iterations,
+                                std::string_view chunk) {
+    std::ostringstream out;
+    out << "let chunk: str = \"" << chunk << "\";\n";
+    out << "let result: builder = builder();\n";
+    out << "let i: i64 = 0;\n";
+    out << "while i < " << iterations << " {\n";
+    out << "  result.append(chunk);\n";
+    out << "  i = i + 1;\n";
+    out << "}\n";
+    out << "let built: str = result.to_str();\n";
+    out << "print(built);\n";
+    out << "built\n";
     return out.str();
 }
 
@@ -729,12 +779,19 @@ lang::Module weak_heavy_module(std::size_t major_rounds,
 
 Workload source_runtime_workload(std::string name, std::uint64_t seed, std::string source,
                                  lang::gc::StressConfig stress,
-                                 std::string description) {
+                                 std::string description,
+                                 std::optional<std::string>
+                                     expected_string_output = std::nullopt) {
     auto module =
         std::make_shared<const lang::VerifiedModule>(compile_module_or_throw(source));
     const auto base = module_base_counters(module->module(), source.size());
-    return Workload{std::move(name), seed, std::move(description),
-                    [module, stress, base] { return run_module(*module, stress, base); }};
+    return Workload{
+        std::move(name), seed, std::move(description),
+        [module, stress, base,
+         expected_string_output = std::move(expected_string_output)] {
+            return run_module(*module, stress, base,
+                              expected_string_output);
+        }};
 }
 
 Workload module_runtime_workload(std::string name, std::uint64_t seed, lang::Module module,
@@ -999,6 +1056,17 @@ std::vector<Workload> build_workloads(bool smoke) {
     const auto weak_minor_rounds = smoke ? 1 : 16;
     const std::size_t weak_minor_interval = 128;
     const auto mixed_iterations = smoke ? 10 : 160;
+    const auto string_build_iterations = smoke ? 8 : 64;
+    constexpr std::string_view string_build_chunk =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    std::string expected_string_build_output;
+    expected_string_build_output.reserve(
+        string_build_iterations * string_build_chunk.size());
+    for (std::size_t iteration = 0;
+         iteration < string_build_iterations; ++iteration) {
+        expected_string_build_output.append(string_build_chunk);
+    }
 
     lang::gc::StressConfig alloc_stress;
     alloc_stress.collect_minor_every_n_instructions = 97;
@@ -1081,6 +1149,20 @@ std::vector<Workload> build_workloads(bool smoke) {
         mixed_graph_source(mixed_iterations, 0xA11D'600Dull), mixed_stress,
         "pairs, arrays, strings, closures, maps, and weak refs interleaved in one graph"));
     workloads.push_back(large_object_pressure_workload(smoke));
+    workloads.push_back(source_runtime_workload(
+        "strconcat_loop", 0xB017'0047ull,
+        strconcat_loop_source(string_build_iterations,
+                              string_build_chunk),
+        {},
+        "repeated immutable StrConcat builds and prints an identical fixed byte stream",
+        expected_string_build_output));
+    workloads.push_back(source_runtime_workload(
+        "builder_loop", 0xB017'0047ull,
+        builder_loop_source(string_build_iterations,
+                            string_build_chunk),
+        {},
+        "one mutable Builder appends, snapshots, and prints the identical fixed byte stream",
+        expected_string_build_output));
     return workloads;
 }
 

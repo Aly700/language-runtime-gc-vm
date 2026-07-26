@@ -180,6 +180,21 @@ adds no reference edge, and cannot change the ADR-0007 mutation-during-iteration
 Every mutation and collection validates exact index/vector coherence. See
 [ADR 0017](adr/0017-deterministic-content-hashed-map-index.md).
 
+### Mutable string construction
+
+`builder` is a mutable, growable raw-byte object for incremental construction. Fresh
+capacity is eight bytes and doubles deterministically. Growth claims adjacent logical
+slots when possible; otherwise it relocates with the complete Map-growth forwarding
+discipline, including roots, handles, descriptor fields, remembered entries, weak and
+ephemeron state, intern canonicals, and an incremental marking worklist. Builder bytes
+are GC-opaque and never interpreted as object IDs, so append and clear need no write
+barrier.
+
+`b.to_str()` always copies current logical bytes into a fresh immutable `Str`; the Builder
+remains usable and later mutation cannot change the snapshot. `i64` and `bool` append use
+the existing exact string conversions. See
+[ADR 0023](adr/0023-string-builder.md).
+
 ### Explicit weak string interning
 
 `intern(s)` is verifier-checked as `str -> str` and keeps its operand as a precise root
@@ -259,7 +274,7 @@ counts["gc"]
 
 The language includes:
 
-- `i64`, `bool`, immutable byte `str`, typed and opaque pairs, nullable named recursive
+- `i64`, `bool`, immutable byte `str`, mutable byte `builder`, typed and opaque pairs, nullable named recursive
   pair types, nominal recursive records with ordered mutable fields, nominal recursive
   variants with immutable tagged cases and exhaustive matching, plus generic templates
   for all three named declaration forms; scalar/reference arrays, insertion-order maps,
@@ -275,18 +290,21 @@ The language includes:
 - string concat, equality, byte indexing, byte length, copying `sub`, unsigned byte-wise
   ordering, explicit `to_str`/`to_i64` conversions, and explicit weak `intern(str)`
   canonicalization;
+- `builder()` with statement-only `.append(str|i64|bool)` and `.clear()`, read-only
+  `.len`, and copying `.to_str()` snapshots; Builders are ordinary aliases that may be
+  passed, captured, stored in reference-typed containers, or targeted by `weak<builder>`;
 - `abs(i64)`, `min(i64, i64)`, `max(i64, i64)`, plus string `.contains`,
   `.index_of`, `.starts_with`, and `.ends_with`; absent `index_of` returns `-1`, while
   `abs(INT64_MIN)` traps deterministically;
 - deterministic bounded `print(str)` output captured by the VM rather than written to a
   host stream.
 
-Twelve executable programs live in [examples](examples): a named recursive linked list,
+Thirteen executable programs live in [examples](examples): a named recursive linked list,
 a capture-snapshot accumulator factory, insertion-order word frequencies, a higher-order
 array pipeline, string/conversion tools, a labeled-loop/built-in ergonomics showcase, a
 recursive record showcase, a recursive variant showcase, a generic-function showcase, a
-recursive generic-type showcase, explicit weak string interning, plus an
-embedder-rendered deterministic failure trace.
+recursive generic-type showcase, explicit weak string interning, a mutable string-builder
+showcase with immutable snapshots, plus an embedder-rendered deterministic failure trace.
 Each `.lang` file has a byte-pinned `.expected` output. `lang_examples` compiles every
 file and runs it under both no stress and maximum combined
 major/minor/allocation/barrier stress.
@@ -304,7 +322,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The acceptance gate contains 50 CTest targets.
+The acceptance gate contains 54 CTest targets.
 
 Run only the executable documentation:
 
@@ -317,7 +335,9 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 23 isolated deterministic positive corpora. The additive `ergonomics`
+The suite has 24 isolated deterministic positive corpora. Iteration 47 adds only the
+`builder` stream; all 23 pre-Iteration-47 streams retain their exact generators, pins, and
+bytes. The additive `ergonomics`
 stream is isolated, and all 22 pre-iteration-46 source/bytecode streams remain
 byte-identical. Shared
 source grammars run under the same 15 schedules:
@@ -339,13 +359,14 @@ execution adds its complete optional runtime trace as a third equality oracle ac
 schedules. The weak grammar additionally uses schedule-specific liveness expectations
 because clearing is intentionally observable. Generated source and bytecode are
 constructive and deterministic; each grammar has its own corpus dump and an embedded
-pinned representative snapshot. Iteration 46 changes no existing grammar, seed, dump, or
+pinned representative snapshot. Iteration 47 changes no existing grammar, seed, dump, or
 outcome pin.
 
-Negative testing applies 107 positioned mutation forms across fixed seed sets, for 2,550
+Negative testing applies 115 positioned mutation forms across fixed seed sets, for 2,806
 frontend rejection checks. The operators cover type errors, undefined values, arity and
 return mismatches, missing nil refinement, invalid container operations, closure misuse,
-map key/value errors, weak-target errors, loop-control errors, conversion errors, and
+map key/value errors, weak-target errors, Builder receiver/append/arity errors,
+loop-control errors, conversion errors, and
 substring/ordering and nominal-record errors, plus invalid tail position/targets, generic
 inference and concrete instantiation, unbound generic type parameters, growing type
 recursion, nominal separation, payload typing, and generic-variant exhaustiveness.
@@ -370,6 +391,8 @@ directly to see their per-corpus summaries:
 ./build/lang_iteration41_generics_fuzz
 ./build/lang_iteration42_generic_types_fuzz
 ./build/lang_iteration44_string_interning_fuzz
+./build/lang_iteration46_ergonomics_fuzz
+./build/lang_iteration47_string_builder_fuzz
 ```
 
 ### Replay by grammar
@@ -401,6 +424,7 @@ Use one of the schedule names above.
 | source `generic-types` | 32 | `./build/lang_iteration42_generic_types_fuzz --grammar generic-types --seed N --schedule NAME` | `./build/lang_iteration42_generic_types_fuzz --grammar generic-types --seed N --mutant 0..11` |
 | source `interning` | 32 | `./build/lang_iteration44_string_interning_fuzz --grammar interning --seed N --schedule NAME` | `./build/lang_iteration44_string_interning_fuzz --grammar interning --seed N --mutant 0..3` |
 | source `ergonomics` | 32 | `./build/lang_iteration46_ergonomics_fuzz --grammar ergonomics --seed N --schedule NAME` | `./build/lang_iteration46_ergonomics_fuzz --grammar ergonomics --seed N --mutant 0..17` |
+| source `builder` | 32 | `./build/lang_iteration47_string_builder_fuzz --grammar builder --seed N --schedule NAME` | `./build/lang_iteration47_string_builder_fuzz --grammar builder --seed N --mutant 0..7` |
 
 For example:
 
@@ -435,6 +459,7 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration42_generic_types_fuzz --dump-corpus generic-types
 ./build/lang_iteration44_string_interning_fuzz --dump-corpus interning
 ./build/lang_iteration46_ergonomics_fuzz --dump-corpus ergonomics
+./build/lang_iteration47_string_builder_fuzz --dump-corpus builder
 ```
 
 The isolated `tailcalls` dump is pinned at SHA-256
@@ -447,6 +472,13 @@ full corpus dump are pinned with 64-bit FNV-1a values
 `17523492481946191324`, `385766377391366824`, and
 `2340986442596112348`. Its 32 seeds compare both non-empty oracles across all 15
 schedules, and four mutants prove the exact builtin type gate.
+
+The isolated `builder` representative source, representative graph/output outcome, and
+full corpus dump are pinned with 64-bit FNV-1a values
+`10719162047016123221`, `3422408984983186133`, and
+`1386632754159073109`. Its 32 seeds compare canonical graphs containing aliased Builder
+bytes and exact Builder-produced output across all 15 schedules; eight mutants prove the
+receiver, arity, constructor, and supported-append-type gates.
 
 The additive `ergonomics` representative source, graph/output outcome, and full corpus
 dump are pinned with 64-bit FNV-1a values `3513356585459432607`,
@@ -477,6 +509,8 @@ measurements:
 ./build/lang_bench --counters-only
 ./build/lang_bench --repetitions 7
 ./build/lang_bench --bench map_lookup_heavy --repetitions 7
+./build/lang_bench --bench strconcat_loop --repetitions 7
+./build/lang_bench --bench builder_loop --repetitions 7
 ./build/lang_bench --smoke --repetitions 1
 ```
 
@@ -503,11 +537,22 @@ comparisons from 982,336 to 8,069 (99.2%) and its seven-run median from 278.967 
 Timings remain informational; the exact counters, host context, and corpus proof are in
 [docs/perf-baseline.md](docs/perf-baseline.md).
 
+Iteration 47 appends a paired 8 KiB construction workload after every established
+benchmark. Both paths print and return byte-identical output from 64 fixed 128-byte
+chunks. On the assertions-enabled host, `strconcat_loop` used 66 allocations, 33,362
+peak slots, 567,995,444 occupancy-header examinations, and a 1,861.537 ms seven-run
+median. `builder_loop` used 3 allocations, 2,067 peak slots, 2,119,005 examinations, and
+an 8.431 ms median (220.8x). Layout validation amplifies the measured ratio, so timings
+remain informational; the exact output check and deterministic work counters are the
+portable evidence.
+
 ## Limitations and deferred work
 
 - Strings are immutable byte sequences, not Unicode text. Interning is explicit and weak;
   there is no mutation, implicit literal interning, interpolation, rope, cached hash, or
   substring-view representation; `sub` copies.
+- Builders append bytes and snapshot by copying; they do not insert, delete, shrink,
+  expose capacity, or replace immutable `Str` semantics.
 - Maps have deterministic expected-O(1) content-hashed lookup and insertion-order
   iteration, but no deletion. Tombstones, shrink policy, and structural hash caching are
   deferred.

@@ -307,6 +307,19 @@ inline std::string canonical_object_graph(const lang::gc::Heap& heap,
             }
             break;
         }
+        case lang::gc::ObjectKind::Builder: {
+            const auto bytes = heap.builder_bytes(order[i]);
+            rendered << "builder[" << bytes.size() << "](";
+            for (std::size_t byte = 0; byte < bytes.size(); ++byte) {
+                if (byte != 0) {
+                    rendered << " ";
+                }
+                rendered << std::hex << std::setfill('0') << std::setw(2)
+                         << static_cast<unsigned>(bytes[byte]) << std::dec;
+            }
+            rendered << ")";
+            break;
+        }
         }
         objects.push_back(rendered.str());
     }

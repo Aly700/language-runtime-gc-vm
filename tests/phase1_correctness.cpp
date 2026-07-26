@@ -141,6 +141,16 @@ const char* op_name(lang::OpCode op) {
         return "StrIntern";
     case lang::OpCode::I64Abs:
         return "I64Abs";
+    case lang::OpCode::AllocBuilder:
+        return "AllocBuilder";
+    case lang::OpCode::BuilderAppend:
+        return "BuilderAppend";
+    case lang::OpCode::BuilderLen:
+        return "BuilderLen";
+    case lang::OpCode::BuilderToStr:
+        return "BuilderToStr";
+    case lang::OpCode::BuilderClear:
+        return "BuilderClear";
     }
     return "<unknown>";
 }

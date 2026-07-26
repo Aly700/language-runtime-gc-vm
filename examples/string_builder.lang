@@ -1,0 +1,39 @@
+record Draft {
+  buffer: builder,
+  frozen: str
+}
+
+fn extend(target: builder, part: str) -> str {
+  target.append(part);
+  target.to_str()
+}
+
+let buffer: builder = builder();
+buffer.append("answer=");
+buffer.append(42);
+buffer.append(",");
+buffer.append(true);
+let frozen: str = buffer.to_str();
+let draft: Draft = Draft { buffer: buffer, frozen: frozen };
+
+let table: map<i64, builder> = map<i64, builder>();
+table[1] = draft.buffer;
+let mapped: str = extend(table[1], ";map");
+
+let shared: builder = draft.buffer;
+let render: fn(str) -> str = fn(part: str) -> str {
+  shared.append(part);
+  shared.to_str()
+};
+let captured: str = render(";capture");
+
+print(frozen);
+print(mapped);
+print(captured);
+print(to_str(shared.len));
+
+shared.clear();
+shared.append("reused");
+print(draft.frozen);
+print(shared.to_str());
+draft

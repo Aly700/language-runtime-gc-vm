@@ -712,3 +712,97 @@ After gate 2, all 21 pre-existing pinned corpus streams were regenerated and mat
 their Iteration-42 SHA-256 values byte for byte (21/21). No LOS corpus was added because
 the admission decision is NO-GO. `git diff --check` is clean, and the Iteration-43
 working tree remains deliberately uncommitted.
+
+## Iteration 47: Mutable Builder versus Immutable Concat (2026-07-26)
+
+Iteration 47 closes the quadratic prefix-copy gap without changing immutable `Str`
+semantics. Two workloads are appended after every established benchmark:
+
+| bench | seed | shape |
+| --- | ---: | --- |
+| `strconcat_loop` | 2,954,297,415 (`0xB0170047`) | Reassign `result = result + chunk` for 64 fixed 128-byte chunks, then print and return the 8 KiB `Str`. |
+| `builder_loop` | 2,954,297,415 (`0xB0170047`) | Append the same 64 chunks to one Builder, copy one final snapshot, then print and return the same 8 KiB `Str`. |
+
+The benchmark harness validates the complete returned bytes and exact output channel
+(`expected + "\n"`) on every run. A timing result is therefore admitted only if both
+paths construct byte-identical output.
+
+An initial draft used 512 sixteen-byte chunks for the same 8 KiB result. It was rejected:
+the immutable path retained 512 progressively wider logical objects without collection
+and spent more than a minute in the assertions-enabled descriptor-slot scanner. That
+shape measured a known storage-model validation amplification more than an ordinary
+construction workload. The accepted 64-by-128-byte shape preserves the same output and a
+32x cumulative prefix-copy ratio while completing repeatably.
+
+Reproduction:
+
+```bash
+build/lang_bench --smoke --bench strconcat_loop --counters-only
+build/lang_bench --smoke --bench builder_loop --counters-only
+build/lang_bench --bench strconcat_loop --counters-only
+build/lang_bench --bench builder_loop --counters-only
+build/lang_bench --bench strconcat_loop --repetitions 7
+build/lang_bench --bench builder_loop --repetitions 7
+```
+
+### Deterministic work
+
+| measure | `strconcat_loop` | `builder_loop` | Builder change |
+| --- | ---: | ---: | ---: |
+| instructions | 846 | 785 | -7.2% |
+| allocations | 66 | 3 | -95.5% |
+| heap peak / final capacity slots | 33,362 / 33,362 | 2,067 / 2,067 | -93.8% peak |
+| live objects at return | 66 | 3 | -95.5% |
+| allocation candidate slots | 2,145 | 3 | -99.9% |
+| storage-occupancy headers examined | 567,995,444 | 2,119,005 | -99.6% |
+| maximum single-object width | 1,025 | 1,025 | identical final 8 KiB width |
+| major / minor collections | 0 / 0 | 0 / 0 | identical |
+| moved objects / barriers | 0 / 0 | 0 / 0 | identical |
+
+The Builder allocates the chunk literal, one Builder, and one immutable final snapshot.
+The concat loop allocates the literal, empty seed, and 64 progressively wider immutable
+results. Builder capacity reaches 8,192 bytes through the fixed doubling ladder; its
+logical heap and final snapshot together explain the 2,067-slot peak.
+
+### Informational wall time
+
+The assertions-enabled seven-repetition medians on the same development host were:
+
+| bench | median ms | relative |
+| --- | ---: | ---: |
+| `strconcat_loop` | 1,861.537 | 1.0x |
+| `builder_loop` | 8.431 | 220.8x faster |
+
+This is a decisive result for the requested workload, but the ratio is not presented as a
+production throughput guarantee. Full heap-layout validation on every relevant operation
+amplifies the immutable path's much larger retained slot population. The portable
+justification is semantic plus deterministic: 63 fewer allocations, geometric capacity,
+one final copy, 93.8% fewer peak slots, and exact identical output. No timing value is a
+correctness threshold.
+
+The two workloads are strictly additive and remain last in workload order so the complete
+pre-Iteration-47 benchmark counter stream can be filtered and compared byte for byte.
+After the zero-warning all-target rebuild, removing only lines whose bench is
+`strconcat_loop` or `builder_loop` reproduced the exact lead-captured SHA-256:
+
+```text
+fc9d553d51cbbdb5e735e454984264d49add07b0b47223b92deb41b0faf59377
+```
+
+All 23 pre-Iteration-47 corpus dumps were also regenerated and matched their pinned
+SHA-256 values byte for byte (23/23). The new Builder grammar is additive and retains its
+own independent FNV source/outcome/corpus pin under ADR-0023.
+
+### Final verification
+
+The exact full command
+`cmake -S . -B build && cmake --build build && ctest --test-dir build
+--output-on-failure` passed twice from the final working tree:
+
+| gate | tally | failures | compiler warnings | CTest real time |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 54/54 | 0 | 0 | 133.52 s |
+| 2 | 54/54 | 0 | 0 | 128.26 s |
+
+`git diff --check` is clean, and the Iteration-47 working tree remains deliberately
+uncommitted.

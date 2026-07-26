@@ -171,6 +171,8 @@ const char* value_kind_name(lang::ValueKind kind) {
         return "nil";
     case lang::ValueKind::Str:
         return "str";
+    case lang::ValueKind::Builder:
+        return "builder";
     case lang::ValueKind::Function:
         return "function";
     case lang::ValueKind::Map:
@@ -295,6 +297,7 @@ Kind kind_from_value_kind(lang::ValueKind kind) {
     case lang::ValueKind::Record:
     case lang::ValueKind::Variant:
     case lang::ValueKind::Ephemeron:
+    case lang::ValueKind::Builder:
         break;
     }
     throw std::logic_error("fuzzer generator does not emit nil values");

@@ -688,6 +688,61 @@ Value VM::execute_verified(const Module& module,
             ++frame.pc;
             break;
         }
+        case OpCode::AllocBuilder:
+            push(frame, Value::object(heap_.allocate_builder()));
+            ++frame.pc;
+            break;
+        case OpCode::BuilderAppend: {
+            assert(frame.stack.size() >= 2 &&
+                   "verifier invariant violated: BuilderAppend requires two operands");
+            const auto receiver = frame.stack[frame.stack.size() - 2];
+            const auto source = frame.stack.back();
+            assert(receiver.is_object() &&
+                   heap_.TEST_ONLY_is_builder(receiver.as_object()) &&
+                   "verifier invariant violated: BuilderAppend receiver must be Builder");
+            assert(source.is_object() &&
+                   heap_.TEST_ONLY_is_string(source.as_object()) &&
+                   "verifier invariant violated: BuilderAppend source must be Str");
+            heap_.builder_append(receiver.as_object(), source);
+            (void)pop(frame);
+            (void)pop(frame);
+            ++frame.pc;
+            break;
+        }
+        case OpCode::BuilderLen: {
+            const auto receiver = pop(frame);
+            assert(receiver.is_object() &&
+                   heap_.TEST_ONLY_is_builder(receiver.as_object()) &&
+                   "verifier invariant violated: BuilderLen receiver must be Builder");
+            const auto length = heap_.builder_length(receiver.as_object());
+            assert(length <= static_cast<std::size_t>(
+                                 std::numeric_limits<std::int64_t>::max()) &&
+                   "Builder header length must fit in i64");
+            push(frame, Value::int64(static_cast<std::int64_t>(length)));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::BuilderToStr: {
+            assert(!frame.stack.empty() && frame.stack.back().is_object() &&
+                   heap_.TEST_ONLY_is_builder(
+                       frame.stack.back().as_object()) &&
+                   "verifier invariant violated: BuilderToStr receiver must be Builder");
+            const auto result = heap_.builder_to_string(frame.stack.back());
+            (void)pop(frame);
+            push(frame, Value::object(result));
+            ++frame.pc;
+            break;
+        }
+        case OpCode::BuilderClear: {
+            assert(!frame.stack.empty() && frame.stack.back().is_object() &&
+                   heap_.TEST_ONLY_is_builder(
+                       frame.stack.back().as_object()) &&
+                   "verifier invariant violated: BuilderClear receiver must be Builder");
+            heap_.builder_clear(frame.stack.back().as_object());
+            (void)pop(frame);
+            ++frame.pc;
+            break;
+        }
         case OpCode::LessI64: {
             const auto rhs_value = pop(frame);
             const auto lhs_value = pop(frame);

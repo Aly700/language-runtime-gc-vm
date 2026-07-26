@@ -36,6 +36,8 @@ ValueKind bytecode_kind(const TypeSpec& type) {
         return ValueKind::Weak;
     case TypeSpec::Kind::Ephemeron:
         return ValueKind::Ephemeron;
+    case TypeSpec::Kind::Builder:
+        return ValueKind::Builder;
     case TypeSpec::Kind::TypeParameter:
         assert(false &&
                "type parameter reached concrete bytecode lowering");
@@ -221,6 +223,8 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
         case Statement::Kind::Assign:
         case Statement::Kind::Print:
         case Statement::Kind::EphemeronSet:
+        case Statement::Kind::BuilderAppend:
+        case Statement::Kind::BuilderClear:
             break;
         }
     }
@@ -346,6 +350,13 @@ bool add_statement_array_counts(const Statement& statement,
         add_expr_array_counts(*statement.initializer, counts);
         add_expr_array_counts(*statement.value, counts);
         return true;
+    case Statement::Kind::BuilderAppend:
+    case Statement::Kind::BuilderClear:
+        add_expr_array_counts(*statement.initializer, counts);
+        for (const auto& argument : statement.arguments) {
+            add_expr_array_counts(*argument, counts);
+        }
+        return true;
     }
     return true;
 }
@@ -358,6 +369,7 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::NilLiteral:
     case Expr::Kind::Variable:
     case Expr::Kind::MapEmpty:
+    case Expr::Kind::BuilderConstruct:
         return;
     case Expr::Kind::Lambda:
         assert(expression.lambda != nullptr);
@@ -440,6 +452,7 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
     case Expr::Kind::WeakGet:
     case Expr::Kind::EphemeronKey:
     case Expr::Kind::EphemeronValue:
+    case Expr::Kind::BuilderToStr:
     case Expr::Kind::ToStr:
     case Expr::Kind::ToI64:
     case Expr::Kind::Intern:
@@ -731,6 +744,26 @@ private:
             compile_expr(*statement.initializer);
             compile_expr(*statement.value);
             emit(OpCode::EphemeronSetValue, 0);
+            return true;
+        case Statement::Kind::BuilderAppend:
+            assert(statement.arguments.size() == 1 &&
+                   "type-checked builder append must have one argument");
+            compile_expr(*statement.initializer);
+            compile_expr(*statement.arguments.front());
+            if (statement.arguments.front()->inferred_type.kind ==
+                TypeSpec::Kind::Int64) {
+                emit(OpCode::I64ToStr, 0);
+            } else if (statement.arguments.front()->inferred_type.kind ==
+                       TypeSpec::Kind::Bool) {
+                emit(OpCode::BoolToStr, 0);
+            }
+            emit(OpCode::BuilderAppend, 0);
+            return true;
+        case Statement::Kind::BuilderClear:
+            assert(statement.arguments.empty() &&
+                   "type-checked builder clear must have no arguments");
+            compile_expr(*statement.initializer);
+            emit(OpCode::BuilderClear, 0);
             return true;
         }
         return true;
@@ -1047,6 +1080,11 @@ private:
         case Expr::Kind::NilLiteral:
             emit(OpCode::Nil, 0);
             break;
+        case Expr::Kind::BuilderConstruct:
+            assert(expression.arguments.empty() &&
+                   "type-checked builder constructor must have no arguments");
+            emit(OpCode::AllocBuilder, 0);
+            break;
         case Expr::Kind::Variable:
             if (expression.is_capture) {
                 emit(OpCode::LoadCapture,
@@ -1098,6 +1136,9 @@ private:
             } else if (expression.receiver->inferred_type.kind ==
                        TypeSpec::Kind::Map) {
                 emit(OpCode::MapLen, 0);
+            } else if (expression.receiver->inferred_type.kind ==
+                       TypeSpec::Kind::Builder) {
+                emit(OpCode::BuilderLen, 0);
             } else {
                 emit(OpCode::ArrayLen, 0);
             }
@@ -1185,6 +1226,9 @@ private:
                 } else if (expression.receiver->inferred_type.kind ==
                            TypeSpec::Kind::Map) {
                     emit(OpCode::MapLen, 0);
+                } else if (expression.receiver->inferred_type.kind ==
+                           TypeSpec::Kind::Builder) {
+                    emit(OpCode::BuilderLen, 0);
                 } else {
                     emit(OpCode::ArrayLen, 0);
                 }
@@ -1245,6 +1289,12 @@ private:
         case Expr::Kind::EphemeronValue:
             compile_expr(*expression.receiver);
             emit(OpCode::EphemeronValue, 0);
+            break;
+        case Expr::Kind::BuilderToStr:
+            assert(expression.arguments.empty() &&
+                   "type-checked builder to_str must have no arguments");
+            compile_expr(*expression.receiver);
+            emit(OpCode::BuilderToStr, 0);
             break;
         case Expr::Kind::ToStr:
             compile_expr(*expression.receiver);
