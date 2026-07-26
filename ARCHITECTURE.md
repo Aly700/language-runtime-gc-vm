@@ -6,6 +6,12 @@ exceptions copy the complete normalized frame stack before cleanup. The trace co
 heap value or object ID, so it is GC-neutral, and existing exception/output bytes remain
 unchanged. See [ADR-0021](adr/0021-deterministic-runtime-diagnostics.md).
 
+Iteration 46 adds labeled `while`/`for-in` control and seven core built-ins. Labels remain
+pure frontend flow and ordinary jump patching across nesting levels. `min`, `max`, and
+byte-string search synthesize existing instructions; only checked scalar `I64Abs` extends
+the append-only opcode tail. No heap or collector path changes. See
+[ADR-0022](adr/0022-ergonomics-lowering.md).
+
 Iteration 44 adds explicit `intern(str) -> str` through append-only `StrIntern` and a
 collector-owned weak intern table. Equal bytes share one canonical object while that
 canonical is live, but table entries never extend liveness. Content-derived FNV lookup,
@@ -107,11 +113,17 @@ The source language is intentionally small:
   `.has(key)`, and `.len`.
 - `if condition { ... } else { ... }`, `while condition { ... }`, and three `for-in`
   forms are statements. Unlabeled `break;` and `continue;` bind the nearest enclosing
-  loop. Arrays use `for value in array`, maps use
+  loop. `name: while ...` and `name: for ...` declare callable-local labels;
+  `break name;` and `continue name;` target an active lexically enclosing loop. Arrays use
+  `for value in array`, maps use
   `for key, value in map`, and half-open integer ranges use `for i in lo..hi`.
 - `print(e);` is a statement for `str` expressions. `to_str(x)` converts an `i64` or
   `bool` to canonical text, `to_i64(s)` parses a canonical decimal `str` or traps, and
   `intern(s)` returns the weakly held canonical object for equal immutable bytes.
+- `abs(i64)`, `min(i64, i64)`, and `max(i64, i64)` provide scalar selection;
+  `abs(INT64_MIN)` traps. String methods `.contains(str)`, `.index_of(str)`,
+  `.starts_with(str)`, and `.ends_with(str)` use byte semantics; `index_of` returns `-1`
+  when absent.
 - Function declarations use `fn name(a: i64, b: pair<i64, pair>) -> pair<i64, bool> { ... }`.
   Function bodies have the same shape as the top level: statements followed by a final
   expression.
@@ -289,7 +301,19 @@ in a body snapshot that iteration's value. `break` jumps to the first post-loop
 instruction. `continue` jumps to the while condition header or, for every for-in form, the
 hidden-index increment preamble; map continue therefore returns through the entry-count
 mutation check. Literal-true while loops omit a verifier-visible false edge. Labeled loop
-control remains deferred.
+contexts use unique active names. A labeled break or continue may cross inner loops, but
+its ordinary jump remains in the selected outer patch context; selected for-in continues
+still reach that loop's own increment preamble. Callable label inventories distinguish
+unknown names from declared-but-non-enclosing names, and lookup never crosses a function
+or lambda boundary.
+
+Core built-ins preserve one-time left-to-right operand evaluation. `min` and `max` store
+both scalar operands in compiler temporaries and select with `LessI64` plus ordinary
+jumps. String searches store receiver and argument in precise-root locals, then lower to
+fixed-size length guards and bounded index loops using `StrSub`/`StrEq`; empty needles
+match at byte index zero and `index_of` returns `-1` when absent. The sole new runtime
+instruction is append-only `I64Abs`, whose verifier transfer is `i64 -> i64` and whose VM
+guard traps before attempting to negate `INT64_MIN`.
 
 ## Runtime scaffold
 
@@ -538,6 +562,12 @@ control remains deferred.
   trapping executions additionally require complete trace equality. A focused matrix
   covers ten trap families for all 15 schedules without adding or changing a corpus
   generator, source dump, outcome pin, or benchmark counter.
+- Iteration 46 adds the isolated pinned `ergonomics` grammar without changing `loops` or
+  another legacy stream. Its 32 seeds exercise two- and three-deep labeled range, array,
+  map, and while control plus all seven built-ins. Each seed compares non-empty graph and
+  output oracles across all 15 schedules and runs 18 positioned rejection mutants. The
+  representative source, outcome, and full corpus FNV-1a values are
+  `3513356585459432607`, `11394261262610471186`, and `7085578191262596976`.
 
 ## Performance measurement
 
@@ -724,11 +754,17 @@ Compiler accommodations for verifier strictness:
   Compilation allocates hidden index, bound, and container locals after source locals;
   emits comparisons, local operations, jumps, existing array/map operations, plus the two
   positional map accessors; and returns only the verifier-produced `VerifiedModule`.
-- Loop control: the type checker sends body fallthrough and continue states to the loop
-  header fixed point and sends break states to the post-loop join. The compiler patches
-  ordinary jumps through nearest-loop contexts. For-in continue always reaches the hidden
-  increment before the header; break reaches the post-loop pc. Every target is still
-  checked by the verifier's ordinary worklist joins and receives a generated exact map.
+- Loop control: the type checker sends body fallthrough and continue states to the
+  selected loop fixed point and sends break states to that loop's post-loop join.
+  Optional labels resolve by reverse lexical search through callable-local contexts;
+  active names cannot shadow. The compiler patches ordinary jumps through the same
+  selected contexts. For-in continue always reaches the selected loop's hidden increment
+  before the header; break reaches its post-loop pc. Every target remains checked by the
+  verifier's ordinary worklist joins and receives a generated exact map.
+- Ergonomic built-ins: `min`, `max`, and all string-search control flow are frontend
+  lowering. Search receiver/argument temporaries are ordinary precise roots at every
+  candidate substring allocation. Append-only `I64Abs` consumes and produces only scalar
+  `Int64`, guards the signed minimum before negation, and has no heap/collector effect.
 
 ## Design bias
 

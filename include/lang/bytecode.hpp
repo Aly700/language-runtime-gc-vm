@@ -75,6 +75,7 @@ enum class OpCode {
     EphemeronSetValue,
     TailCall,
     StrIntern,
+    I64Abs,
 };
 
 struct Instruction {
@@ -473,6 +474,7 @@ enum class VerifierReason {
     TailCallStackShapeMismatch, // TailCall stack contains values beyond its arguments.
     BadTailCallArgKind,         // TailCall argument violates the callee parameter type.
     StrInternRequiresStr,       // StrIntern operand is not a string.
+    I64AbsRequiresI64,          // I64Abs operand is not an i64.
 };
 
 struct VerifierDiagnostic {

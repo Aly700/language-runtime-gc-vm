@@ -1,0 +1,8 @@
+labeled_hits=1
+abs=42
+min=-3
+max=7
+contains=true
+index_of=1
+starts_with=true
+ends_with=true

@@ -186,6 +186,16 @@ add_executable(lang_iteration45_runtime_diagnostics
 target_link_libraries(
     lang_iteration45_runtime_diagnostics PRIVATE lang_runtime)
 
+add_executable(lang_iteration46_ergonomics
+    tests/iteration46_ergonomics.cpp)
+target_link_libraries(
+    lang_iteration46_ergonomics PRIVATE lang_runtime)
+
+add_executable(lang_iteration46_ergonomics_fuzz
+    tests/iteration46_ergonomics_fuzz.cpp)
+target_link_libraries(
+    lang_iteration46_ergonomics_fuzz PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -256,5 +266,9 @@ add_test(NAME lang_iteration44_string_interning_fuzz
     COMMAND lang_iteration44_string_interning_fuzz)
 add_test(NAME lang_iteration45_runtime_diagnostics
     COMMAND lang_iteration45_runtime_diagnostics)
+add_test(NAME lang_iteration46_ergonomics
+    COMMAND lang_iteration46_ergonomics)
+add_test(NAME lang_iteration46_ergonomics_fuzz
+    COMMAND lang_iteration46_ergonomics_fuzz)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

@@ -205,6 +205,8 @@ const char* op_name(OpCode op) {
         return "TailCall";
     case OpCode::StrIntern:
         return "StrIntern";
+    case OpCode::I64Abs:
+        return "I64Abs";
     }
     return "<invalid>";
 }
@@ -2321,6 +2323,18 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         state.stack.push_back(int64_value());
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    case OpCode::I64Abs:
+        if (!pop_expect_or_report(
+                state, diagnostics, function, function_index, pc,
+                AbstractKind::Int64, VerifierReason::StackUnderflow,
+                VerifierReason::I64AbsRequiresI64,
+                "absolute-value operand")) {
+            return false;
+        }
+        state.stack.push_back(int64_value());
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
     case OpCode::LessI64:
         if (!pop_expect_or_report(state, diagnostics, function, function_index, pc,
                                   AbstractKind::Int64, VerifierReason::StackUnderflow,
@@ -3725,6 +3739,8 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "BadTailCallArgKind";
     case VerifierReason::StrInternRequiresStr:
         return "StrInternRequiresStr";
+    case VerifierReason::I64AbsRequiresI64:
+        return "I64AbsRequiresI64";
     }
     return "<unknown>";
 }

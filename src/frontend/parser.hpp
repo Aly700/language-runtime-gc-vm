@@ -128,6 +128,13 @@ struct Expr {
         ToStr,
         ToI64,
         Intern,
+        Abs,
+        Min,
+        Max,
+        StrContains,
+        StrIndexOf,
+        StrStartsWith,
+        StrEndsWith,
     };
 
     Kind kind{Kind::IntLiteral};
@@ -247,6 +254,10 @@ struct Statement {
     std::vector<std::string> loop_names;
     std::vector<SourcePosition> loop_name_positions;
     std::vector<std::uint32_t> loop_local_indices;
+    std::string loop_label;
+    SourcePosition loop_label_position;
+    std::string loop_control_label;
+    SourcePosition loop_control_label_position;
     std::unique_ptr<Expr> iterable;
     std::unique_ptr<Expr> range_upper;
     bool loop_locals_allocated{false};

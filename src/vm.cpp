@@ -675,6 +675,19 @@ Value VM::execute_verified(const Module& module,
             ++frame.pc;
             break;
         }
+        case OpCode::I64Abs: {
+            const auto value = pop(frame);
+            assert(value.tag() == Value::Tag::Int64 &&
+                   "verifier invariant violated: I64Abs operand must be i64");
+            const auto integer = value.as_i64();
+            if (integer == std::numeric_limits<std::int64_t>::min()) {
+                throw runtime_trap(frame.function_index, frame.pc,
+                                   "absolute value overflow");
+            }
+            push(frame, Value::int64(integer < 0 ? -integer : integer));
+            ++frame.pc;
+            break;
+        }
         case OpCode::LessI64: {
             const auto rhs_value = pop(frame);
             const auto lhs_value = pop(frame);

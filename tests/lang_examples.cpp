@@ -13,7 +13,7 @@
 
 namespace {
 
-constexpr std::array<const char*, 11> kExamples{
+constexpr std::array<const char*, 12> kExamples{
     "linked_list",
     "capture_accumulator",
     "word_frequency",
@@ -25,6 +25,7 @@ constexpr std::array<const char*, 11> kExamples{
     "generic_types_showcase",
     "string_interning",
     "diagnostics_showcase",
+    "ergonomics_showcase",
 };
 
 std::string read_file(const std::string& path) {
