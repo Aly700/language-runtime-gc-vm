@@ -741,6 +741,9 @@ private:
     }
 
     [[nodiscard]] bool starts_statement() const {
+        if (label_prefix_ahead()) {
+            return true;
+        }
         if (check(TokenKind::Let) || check(TokenKind::If) || check(TokenKind::While) ||
             check(TokenKind::For) || check(TokenKind::Match) || check(TokenKind::Try) ||
             check(TokenKind::Throw) ||
@@ -750,6 +753,12 @@ private:
             return true;
         }
         return assignment_ahead() || ephemeron_set_ahead();
+    }
+
+    [[nodiscard]] bool label_prefix_ahead() const {
+        return current_ + 1 < tokens_.size() &&
+               tokens_[current_].kind == TokenKind::Identifier &&
+               tokens_[current_ + 1].kind == TokenKind::Colon;
     }
 
     [[nodiscard]] bool ephemeron_set_ahead() const {
@@ -793,6 +802,26 @@ private:
     }
 
     std::optional<Statement> parse_statement() {
+        if (label_prefix_ahead()) {
+            const auto label = peek();
+            ++current_;
+            ++current_;
+            std::optional<Statement> statement;
+            if (match(TokenKind::While)) {
+                statement = parse_while(previous(), true);
+            } else if (match(TokenKind::For)) {
+                statement = parse_for_in(previous(), true);
+            } else {
+                add_diagnostic(diagnostics_, label.position,
+                               "loop label must precede 'while' or 'for'");
+                return std::nullopt;
+            }
+            if (statement.has_value()) {
+                statement->loop_label = label.text;
+                statement->loop_label_position = label.position;
+            }
+            return statement;
+        }
         if (match(TokenKind::Let)) {
             return parse_let(previous());
         }
@@ -1027,16 +1056,23 @@ private:
         return statement;
     }
 
-    std::optional<Statement> parse_while(const Token& while_token) {
+    std::optional<Statement> parse_while(const Token& while_token,
+                                         bool labeled = false) {
         Statement statement;
         statement.kind = Statement::Kind::While;
         statement.position = while_token.position;
+        const bool previous_record_literal_mode = allow_record_literal_;
+        if (labeled) {
+            allow_record_literal_ = false;
+        }
         statement.condition = parse_expression();
+        allow_record_literal_ = previous_record_literal_mode;
         statement.body = parse_block("expected '{' before while body");
         return statement;
     }
 
-    std::optional<Statement> parse_for_in(const Token& for_token) {
+    std::optional<Statement> parse_for_in(const Token& for_token,
+                                          bool labeled = false) {
         Statement statement;
         statement.kind = Statement::Kind::ForIn;
         statement.position = for_token.position;
@@ -1056,10 +1092,15 @@ private:
             }
         }
         expect(TokenKind::In, "expected 'in' after loop variable");
+        const bool previous_record_literal_mode = allow_record_literal_;
+        if (labeled) {
+            allow_record_literal_ = false;
+        }
         statement.iterable = parse_expression();
         if (match(TokenKind::DotDot)) {
             statement.range_upper = parse_expression();
         }
+        allow_record_literal_ = previous_record_literal_mode;
         statement.body = parse_block("expected '{' before for-in body");
         return statement;
     }
@@ -1145,6 +1186,10 @@ private:
         Statement statement;
         statement.kind = kind;
         statement.position = keyword.position;
+        if (match(TokenKind::Identifier)) {
+            statement.loop_control_label = previous().text;
+            statement.loop_control_label_position = previous().position;
+        }
         expect(TokenKind::Semicolon, semicolon_message);
         return statement;
     }
@@ -1353,6 +1398,37 @@ private:
                     }
                     expect(TokenKind::RParen, "expected ')' after sub arguments");
                     expression = std::move(node);
+                } else if (
+                    check(TokenKind::Identifier) &&
+                    (peek().text == "contains" ||
+                     peek().text == "index_of" ||
+                     peek().text == "starts_with" ||
+                     peek().text == "ends_with") &&
+                    check_next(TokenKind::LParen)) {
+                    auto node = std::make_unique<Expr>();
+                    if (peek().text == "contains") {
+                        node->kind = Expr::Kind::StrContains;
+                    } else if (peek().text == "index_of") {
+                        node->kind = Expr::Kind::StrIndexOf;
+                    } else if (peek().text == "starts_with") {
+                        node->kind = Expr::Kind::StrStartsWith;
+                    } else {
+                        node->kind = Expr::Kind::StrEndsWith;
+                    }
+                    node->position = peek().position;
+                    node->receiver = std::move(expression);
+                    const auto method = peek().text;
+                    ++current_;
+                    expect(TokenKind::LParen,
+                           "expected '(' after '" + method + "'");
+                    if (!check(TokenKind::RParen)) {
+                        do {
+                            node->arguments.push_back(parse_expression());
+                        } while (match(TokenKind::Comma));
+                    }
+                    expect(TokenKind::RParen,
+                           "expected ')' after " + method + " arguments");
+                    expression = std::move(node);
                 } else if (match(TokenKind::Identifier)) {
                     auto node = std::make_unique<Expr>();
                     node->kind = Expr::Kind::Field;
@@ -1505,6 +1581,27 @@ private:
             expect(TokenKind::LParen, "expected '(' after 'intern'");
             node->receiver = parse_expression();
             expect(TokenKind::RParen, "expected ')' after intern operand");
+            return node;
+        }
+        if (match(TokenKind::Abs) || match(TokenKind::Min) ||
+            match(TokenKind::Max)) {
+            const auto token = previous();
+            auto node = std::make_unique<Expr>();
+            node->kind = token.kind == TokenKind::Abs
+                             ? Expr::Kind::Abs
+                             : (token.kind == TokenKind::Min
+                                    ? Expr::Kind::Min
+                                    : Expr::Kind::Max);
+            node->position = token.position;
+            expect(TokenKind::LParen,
+                   "expected '(' after '" + token.text + "'");
+            if (!check(TokenKind::RParen)) {
+                do {
+                    node->arguments.push_back(parse_expression());
+                } while (match(TokenKind::Comma));
+            }
+            expect(TokenKind::RParen,
+                   "expected ')' after " + token.text + " arguments");
             return node;
         }
         if (match(TokenKind::ToStr) || match(TokenKind::ToI64)) {

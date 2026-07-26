@@ -1,0 +1,28 @@
+let words: [str] = ["alpha", "runtime", "omega"];
+let labeled_hits: i64 = 0;
+outer: for word in words {
+  inner: for attempt in 0..3 {
+    if word.contains("time") {
+      labeled_hits = labeled_hits + 1;
+      break outer;
+    } else {
+      continue outer;
+    }
+  }
+}
+let absolute: i64 = abs(-42);
+let smaller: i64 = min(7, -3);
+let larger: i64 = max(7, -3);
+let contains: bool = "banana".contains("ana");
+let index: i64 = "banana".index_of("ana");
+let starts: bool = "bytecode".starts_with("byte");
+let ends: bool = "collector".ends_with("tor");
+print("labeled_hits=" + to_str(labeled_hits));
+print("abs=" + to_str(absolute));
+print("min=" + to_str(smaller));
+print("max=" + to_str(larger));
+print("contains=" + to_str(contains));
+print("index_of=" + to_str(index));
+print("starts_with=" + to_str(starts));
+print("ends_with=" + to_str(ends));
+labeled_hits + absolute + smaller + larger + index

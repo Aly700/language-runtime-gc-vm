@@ -15,6 +15,10 @@ Iteration 45 adds deterministic runtime diagnostics without changing failure tex
 terminal trap or uncaught typed exception leaves an embedder-readable, source-positioned
 innermost-to-outermost frame trace whose plain copied data is not a GC root.
 
+Iteration 46 adds callable-local labeled loops plus `abs`, `min`, `max`, and four
+byte-string search methods. Multi-level control remains ordinary verifier-checked jumps;
+all built-ins except checked scalar `I64Abs` are pure frontend lowering.
+
 This repository is a correctness-first implementation of a small statically typed
 language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
 checker, bytecode compiler, verifier, and stack VM. The runtime uses a precise moving,
@@ -266,17 +270,23 @@ The language includes:
   constant-frame self and mutual recursion;
 - local, pair-field, record-field, array-element, and map-entry assignment;
 - `if`/`else`, `while`, array/map/range `for-in`, and nearest-loop `break`/`continue`;
+- labels such as `outer: while ...` and `outer: for ...`, targeted by
+  `break outer;` or `continue outer;`, with duplicate active names rejected;
 - string concat, equality, byte indexing, byte length, copying `sub`, unsigned byte-wise
   ordering, explicit `to_str`/`to_i64` conversions, and explicit weak `intern(str)`
   canonicalization;
+- `abs(i64)`, `min(i64, i64)`, `max(i64, i64)`, plus string `.contains`,
+  `.index_of`, `.starts_with`, and `.ends_with`; absent `index_of` returns `-1`, while
+  `abs(INT64_MIN)` traps deterministically;
 - deterministic bounded `print(str)` output captured by the VM rather than written to a
   host stream.
 
-Eleven executable programs live in [examples](examples): a named recursive linked list,
+Twelve executable programs live in [examples](examples): a named recursive linked list,
 a capture-snapshot accumulator factory, insertion-order word frequencies, a higher-order
-array pipeline, string/conversion tools, a recursive record showcase, and a recursive
-variant showcase, a generic-function showcase, a recursive generic-type showcase, and
-explicit weak string interning, plus an embedder-rendered deterministic failure trace.
+array pipeline, string/conversion tools, a labeled-loop/built-in ergonomics showcase, a
+recursive record showcase, a recursive variant showcase, a generic-function showcase, a
+recursive generic-type showcase, explicit weak string interning, plus an
+embedder-rendered deterministic failure trace.
 Each `.lang` file has a byte-pinned `.expected` output. `lang_examples` compiles every
 file and runs it under both no stress and maximum combined
 major/minor/allocation/barrier stress.
@@ -307,8 +317,9 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 22 isolated deterministic positive corpora. The new `interning` stream is
-isolated, and all 21 legacy source/bytecode streams remain byte-identical. Shared
+The suite has 23 isolated deterministic positive corpora. The additive `ergonomics`
+stream is isolated, and all 22 pre-iteration-46 source/bytecode streams remain
+byte-identical. Shared
 source grammars run under the same 15 schedules:
 
 - `no_stress`
@@ -328,10 +339,10 @@ execution adds its complete optional runtime trace as a third equality oracle ac
 schedules. The weak grammar additionally uses schedule-specific liveness expectations
 because clearing is intentionally observable. Generated source and bytecode are
 constructive and deterministic; each grammar has its own corpus dump and an embedded
-pinned representative snapshot. Iteration 45 adds no grammar, seed, or dump, so all 22
-corpus streams remain byte-identical.
+pinned representative snapshot. Iteration 46 changes no existing grammar, seed, dump, or
+outcome pin.
 
-Negative testing applies 89 positioned mutation forms across fixed seed sets, for 1,974
+Negative testing applies 107 positioned mutation forms across fixed seed sets, for 2,550
 frontend rejection checks. The operators cover type errors, undefined values, arity and
 return mismatches, missing nil refinement, invalid container operations, closure misuse,
 map key/value errors, weak-target errors, loop-control errors, conversion errors, and
@@ -389,6 +400,7 @@ Use one of the schedule names above.
 | source `generics` | 32 | `./build/lang_iteration41_generics_fuzz --grammar generics --seed N --schedule NAME` | `./build/lang_iteration41_generics_fuzz --grammar generics --seed N --mutant 0..11` |
 | source `generic-types` | 32 | `./build/lang_iteration42_generic_types_fuzz --grammar generic-types --seed N --schedule NAME` | `./build/lang_iteration42_generic_types_fuzz --grammar generic-types --seed N --mutant 0..11` |
 | source `interning` | 32 | `./build/lang_iteration44_string_interning_fuzz --grammar interning --seed N --schedule NAME` | `./build/lang_iteration44_string_interning_fuzz --grammar interning --seed N --mutant 0..3` |
+| source `ergonomics` | 32 | `./build/lang_iteration46_ergonomics_fuzz --grammar ergonomics --seed N --schedule NAME` | `./build/lang_iteration46_ergonomics_fuzz --grammar ergonomics --seed N --mutant 0..17` |
 
 For example:
 
@@ -422,6 +434,7 @@ Dump every deterministic corpus for byte-identity checks:
 ./build/lang_iteration41_generics_fuzz --dump-corpus generics
 ./build/lang_iteration42_generic_types_fuzz --dump-corpus generic-types
 ./build/lang_iteration44_string_interning_fuzz --dump-corpus interning
+./build/lang_iteration46_ergonomics_fuzz --dump-corpus ergonomics
 ```
 
 The isolated `tailcalls` dump is pinned at SHA-256
@@ -434,6 +447,12 @@ full corpus dump are pinned with 64-bit FNV-1a values
 `17523492481946191324`, `385766377391366824`, and
 `2340986442596112348`. Its 32 seeds compare both non-empty oracles across all 15
 schedules, and four mutants prove the exact builtin type gate.
+
+The additive `ergonomics` representative source, graph/output outcome, and full corpus
+dump are pinned with 64-bit FNV-1a values `3513356585459432607`,
+`11394261262610471186`, and `7085578191262596976`. Its 32 seeds exercise labeled loops
+at two and three depths plus all seven built-ins across all 15 schedules; 18 mutants per
+seed prove label resolution and builtin arity/type rejection.
 
 The isolated `generics` dump is pinned at SHA-256
 `8885efba70fb5788ae1486efd05453c46bf3a3e782bab73e801279b6778b350e`.
@@ -502,8 +521,10 @@ Timings remain informational; the exact counters, host context, and corpus proof
 - Weak-keyed maps, finalizers, callback-driven general object resurrection, mutable weak
   targets, and user-visible finalization ordering are not implemented. ADR-0020's narrow
   reuse of a still-physical immutable weak-only string is the sole resurrection case.
-- Loop control is unlabeled. Labeled loops and labeled `break`/`continue` require a label
-  namespace and explicit target-resolution rules.
+- Labels are loop-only, callable-local, and cannot shadow an active label; there are no
+  labeled blocks or cross-callable transfers.
+- String search currently lowers through copying `sub` candidates rather than a dedicated
+  search opcode or substring views.
 - Blocks are statements rather than expressions, and `let` declarations are limited to a
   function or program body rather than nested blocks.
 - The repository exposes an embeddable compiler/runtime API and tests, not a command-line

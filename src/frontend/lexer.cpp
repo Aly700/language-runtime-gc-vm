@@ -262,6 +262,12 @@ private:
             kind = TokenKind::ToI64;
         } else if (text == "intern") {
             kind = TokenKind::Intern;
+        } else if (text == "abs") {
+            kind = TokenKind::Abs;
+        } else if (text == "min") {
+            kind = TokenKind::Min;
+        } else if (text == "max") {
+            kind = TokenKind::Max;
         } else if (text == "i64") {
             kind = TokenKind::I64;
         } else if (text == "bool") {

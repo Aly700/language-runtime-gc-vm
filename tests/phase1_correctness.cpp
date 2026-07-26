@@ -139,6 +139,8 @@ const char* op_name(lang::OpCode op) {
         return "TailCall";
     case lang::OpCode::StrIntern:
         return "StrIntern";
+    case lang::OpCode::I64Abs:
+        return "I64Abs";
     }
     return "<unknown>";
 }

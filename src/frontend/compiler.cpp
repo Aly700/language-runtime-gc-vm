@@ -134,7 +134,9 @@ bool add_statement_array_counts(const Statement& statement,
                                 ArrayOpcodeCounts& counts);
 
 std::pair<bool, bool> block_fallthrough_and_current_break(
-    const std::vector<Statement>& statements) {
+    const std::vector<Statement>& statements,
+    const std::string& current_loop_label,
+    bool unlabeled_targets_current = true) {
     bool falls_through = true;
     bool has_break = false;
     for (const auto& statement : statements) {
@@ -143,7 +145,11 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
         }
         switch (statement.kind) {
         case Statement::Kind::Break:
-            has_break = true;
+            has_break =
+                has_break ||
+                (unlabeled_targets_current &&
+                 statement.loop_control_label.empty()) ||
+                statement.loop_control_label == current_loop_label;
             falls_through = false;
             break;
         case Statement::Kind::Continue:
@@ -151,9 +157,13 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
             break;
         case Statement::Kind::If: {
             const auto then_flow =
-                block_fallthrough_and_current_break(statement.then_branch);
+                block_fallthrough_and_current_break(
+                    statement.then_branch, current_loop_label,
+                    unlabeled_targets_current);
             const auto else_flow =
-                block_fallthrough_and_current_break(statement.else_branch);
+                block_fallthrough_and_current_break(
+                    statement.else_branch, current_loop_label,
+                    unlabeled_targets_current);
             has_break = has_break || then_flow.second || else_flow.second;
             falls_through = then_flow.first || else_flow.first;
             break;
@@ -161,7 +171,9 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
         case Statement::Kind::Match: {
             bool arm_falls = false;
             for (const auto& arm : statement.match_arms) {
-                const auto flow = block_fallthrough_and_current_break(arm.body);
+                const auto flow = block_fallthrough_and_current_break(
+                    arm.body, current_loop_label,
+                    unlabeled_targets_current);
                 has_break = has_break || flow.second;
                 arm_falls = arm_falls || flow.first;
             }
@@ -169,10 +181,36 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
             break;
         }
         case Statement::Kind::TryCatch: {
-            const auto try_flow = block_fallthrough_and_current_break(statement.body);
-            const auto catch_flow = block_fallthrough_and_current_break(statement.catch_body);
+            const auto try_flow = block_fallthrough_and_current_break(
+                statement.body, current_loop_label,
+                unlabeled_targets_current);
+            const auto catch_flow = block_fallthrough_and_current_break(
+                statement.catch_body, current_loop_label,
+                unlabeled_targets_current);
             has_break = has_break || try_flow.second || catch_flow.second;
             falls_through = try_flow.first || catch_flow.first;
+            break;
+        }
+        case Statement::Kind::While: {
+            const auto local_flow =
+                block_fallthrough_and_current_break(
+                    statement.body, statement.loop_label);
+            const auto selected_flow =
+                block_fallthrough_and_current_break(
+                    statement.body, current_loop_label, false);
+            has_break = has_break || selected_flow.second;
+            const bool condition_is_true_literal =
+                statement.condition->kind == Expr::Kind::BoolLiteral &&
+                statement.condition->bool_value;
+            falls_through =
+                !condition_is_true_literal || local_flow.second;
+            break;
+        }
+        case Statement::Kind::ForIn: {
+            const auto selected_flow =
+                block_fallthrough_and_current_break(
+                    statement.body, current_loop_label, false);
+            has_break = has_break || selected_flow.second;
             break;
         }
         case Statement::Kind::Throw:
@@ -181,8 +219,6 @@ std::pair<bool, bool> block_fallthrough_and_current_break(
             break;
         case Statement::Kind::Let:
         case Statement::Kind::Assign:
-        case Statement::Kind::While:
-        case Statement::Kind::ForIn:
         case Statement::Kind::Print:
         case Statement::Kind::EphemeronSet:
             break;
@@ -263,7 +299,9 @@ bool add_statement_array_counts(const Statement& statement,
         (void)add_block_array_counts(statement.body, counts);
         return statement.condition->kind != Expr::Kind::BoolLiteral ||
                !statement.condition->bool_value ||
-               block_fallthrough_and_current_break(statement.body).second;
+               block_fallthrough_and_current_break(
+                   statement.body, statement.loop_label)
+                   .second;
     case Statement::Kind::ForIn:
         add_expr_array_counts(*statement.iterable, counts);
         if (statement.range_upper != nullptr) {
@@ -380,7 +418,18 @@ void add_expr_array_counts(const Expr& expression, ArrayOpcodeCounts& counts) {
         add_expr_array_counts(*expression.receiver, counts);
         return;
     case Expr::Kind::StrSub:
+    case Expr::Kind::StrContains:
+    case Expr::Kind::StrIndexOf:
+    case Expr::Kind::StrStartsWith:
+    case Expr::Kind::StrEndsWith:
         add_expr_array_counts(*expression.receiver, counts);
+        for (const auto& argument : expression.arguments) {
+            add_expr_array_counts(*argument, counts);
+        }
+        return;
+    case Expr::Kind::Abs:
+    case Expr::Kind::Min:
+    case Expr::Kind::Max:
         for (const auto& argument : expression.arguments) {
             add_expr_array_counts(*argument, counts);
         }
@@ -594,6 +643,7 @@ private:
     struct LoopPatchContext {
         std::vector<std::size_t> breaks;
         std::vector<std::size_t> continues;
+        std::string label;
     };
 
     bool compile_block(const std::vector<Statement>& statements) {
@@ -651,11 +701,25 @@ private:
         case Statement::Kind::Continue: {
             assert(!loop_contexts_.empty() &&
                    "type checker must reject loop control outside loops");
+            LoopPatchContext* selected = loop_contexts_.back();
+            if (!statement.loop_control_label.empty()) {
+                selected = nullptr;
+                for (auto context = loop_contexts_.rbegin();
+                     context != loop_contexts_.rend(); ++context) {
+                    if ((*context)->label ==
+                        statement.loop_control_label) {
+                        selected = *context;
+                        break;
+                    }
+                }
+                assert(selected != nullptr &&
+                       "type checker must resolve labeled loop control");
+            }
             const auto jump = emit(OpCode::Jump, -1);
             if (statement.kind == Statement::Kind::Break) {
-                loop_contexts_.back()->breaks.push_back(jump);
+                selected->breaks.push_back(jump);
             } else {
-                loop_contexts_.back()->continues.push_back(jump);
+                selected->continues.push_back(jump);
             }
             return false;
         }
@@ -817,6 +881,7 @@ private:
             jump_to_exit = emit(OpCode::JumpIfFalse, -1);
         }
         LoopPatchContext loop;
+        loop.label = statement.loop_label;
         loop_contexts_.push_back(&loop);
         const bool body_falls = compile_block(statement.body);
         loop_contexts_.pop_back();
@@ -867,6 +932,7 @@ private:
             emit(OpCode::LoadLocal, index);
             emit(OpCode::StoreLocal, statement.loop_local_indices[0]);
             LoopPatchContext loop;
+            loop.label = statement.loop_label;
             loop_contexts_.push_back(&loop);
             const bool body_falls = compile_block(statement.body);
             loop_contexts_.pop_back();
@@ -941,6 +1007,7 @@ private:
             emit(OpCode::StoreLocal, statement.loop_local_indices[0]);
         }
         LoopPatchContext loop;
+        loop.label = statement.loop_label;
         loop_contexts_.push_back(&loop);
         const bool body_falls = compile_block(statement.body);
         loop_contexts_.pop_back();
@@ -1042,6 +1109,22 @@ private:
             compile_expr(*expression.arguments[0]);
             compile_expr(*expression.arguments[1]);
             emit(OpCode::StrSub, 0);
+            break;
+        case Expr::Kind::StrContains:
+        case Expr::Kind::StrIndexOf:
+        case Expr::Kind::StrStartsWith:
+        case Expr::Kind::StrEndsWith:
+            compile_string_search(expression);
+            break;
+        case Expr::Kind::Abs:
+            assert(expression.arguments.size() == 1 &&
+                   "type-checked abs must have exactly one argument");
+            compile_expr(*expression.arguments.front());
+            emit(OpCode::I64Abs, 0);
+            break;
+        case Expr::Kind::Min:
+        case Expr::Kind::Max:
+            compile_min_max(expression);
             break;
         case Expr::Kind::Binary:
             if (expression.binary_op == '>' || expression.binary_op == 'L') {
@@ -1178,6 +1261,174 @@ private:
             compile_expr(*expression.receiver);
             emit(OpCode::StrIntern, 0);
             break;
+        }
+    }
+
+    void compile_min_max(const Expr& expression) {
+        assert(expression.arguments.size() == 2 &&
+               "type-checked min/max must have exactly two arguments");
+        const auto left = allocate_temp_local();
+        const auto right = allocate_temp_local();
+        compile_expr(*expression.arguments[0]);
+        emit(OpCode::StoreLocal, left);
+        compile_expr(*expression.arguments[1]);
+        emit(OpCode::StoreLocal, right);
+
+        emit(OpCode::LoadLocal, left);
+        emit(OpCode::LoadLocal, right);
+        emit(OpCode::LessI64, 0);
+        const auto select_false = emit(OpCode::JumpIfFalse, -1);
+        emit(OpCode::LoadLocal,
+             expression.kind == Expr::Kind::Min ? left : right);
+        const auto finish = emit(OpCode::Jump, -1);
+        patch(select_false, pc());
+        emit(OpCode::LoadLocal,
+             expression.kind == Expr::Kind::Min ? right : left);
+        patch(finish, pc());
+    }
+
+    void emit_string_search_operands(const Expr& expression,
+                                     std::uint32_t receiver,
+                                     std::uint32_t needle,
+                                     std::uint32_t receiver_length,
+                                     std::uint32_t needle_length,
+                                     std::uint32_t index) {
+        assert(expression.arguments.size() == 1 &&
+               "type-checked string search must have one argument");
+        compile_expr(*expression.receiver);
+        emit(OpCode::StoreLocal, receiver);
+        compile_expr(*expression.arguments.front());
+        emit(OpCode::StoreLocal, needle);
+        emit(OpCode::LoadLocal, receiver);
+        emit(OpCode::StrLen, 0);
+        emit(OpCode::StoreLocal, receiver_length);
+        emit(OpCode::LoadLocal, needle);
+        emit(OpCode::StrLen, 0);
+        emit(OpCode::StoreLocal, needle_length);
+        emit(OpCode::ConstantI64, 0);
+        emit(OpCode::StoreLocal, index);
+    }
+
+    void emit_candidate_substring(std::uint32_t receiver,
+                                  std::uint32_t needle,
+                                  std::uint32_t needle_length,
+                                  std::uint32_t index) {
+        emit(OpCode::LoadLocal, receiver);
+        emit(OpCode::LoadLocal, index);
+        emit(OpCode::LoadLocal, index);
+        emit(OpCode::LoadLocal, needle_length);
+        emit(OpCode::AddI64, 0);
+        emit(OpCode::StrSub, 0);
+        emit(OpCode::LoadLocal, needle);
+        emit(OpCode::StrEq, 0);
+    }
+
+    void compile_contains_or_index_of(
+        const Expr& expression, std::uint32_t receiver,
+        std::uint32_t needle, std::uint32_t receiver_length,
+        std::uint32_t needle_length, std::uint32_t index) {
+        const auto header = pc();
+        emit(OpCode::LoadLocal, receiver_length);
+        emit(OpCode::LoadLocal, index);
+        emit(OpCode::LoadLocal, needle_length);
+        emit(OpCode::AddI64, 0);
+        emit(OpCode::LessI64, 0);
+        const auto candidate = emit(OpCode::JumpIfFalse, -1);
+        if (expression.kind == Expr::Kind::StrIndexOf) {
+            emit(OpCode::ConstantI64, -1);
+        } else {
+            compile_bool_literal(false);
+        }
+        const auto absent_finish = emit(OpCode::Jump, -1);
+
+        patch(candidate, pc());
+        emit_candidate_substring(receiver, needle, needle_length, index);
+        const auto no_match = emit(OpCode::JumpIfFalse, -1);
+        if (expression.kind == Expr::Kind::StrIndexOf) {
+            emit(OpCode::LoadLocal, index);
+        } else {
+            compile_bool_literal(true);
+        }
+        const auto match_finish = emit(OpCode::Jump, -1);
+
+        patch(no_match, pc());
+        emit_increment_local(index);
+        emit(OpCode::Jump, static_cast<std::int64_t>(header));
+        const auto finish = pc();
+        patch(absent_finish, finish);
+        patch(match_finish, finish);
+    }
+
+    void compile_starts_with(std::uint32_t receiver,
+                             std::uint32_t needle,
+                             std::uint32_t receiver_length,
+                             std::uint32_t needle_length,
+                             std::uint32_t index) {
+        emit(OpCode::LoadLocal, receiver_length);
+        emit(OpCode::LoadLocal, needle_length);
+        emit(OpCode::LessI64, 0);
+        const auto candidate = emit(OpCode::JumpIfFalse, -1);
+        compile_bool_literal(false);
+        const auto finish = emit(OpCode::Jump, -1);
+        patch(candidate, pc());
+        emit_candidate_substring(receiver, needle, needle_length, index);
+        patch(finish, pc());
+    }
+
+    void compile_ends_with(std::uint32_t receiver,
+                           std::uint32_t needle,
+                           std::uint32_t receiver_length,
+                           std::uint32_t needle_length,
+                           std::uint32_t index) {
+        emit(OpCode::LoadLocal, receiver_length);
+        emit(OpCode::LoadLocal, needle_length);
+        emit(OpCode::LessI64, 0);
+        const auto search = emit(OpCode::JumpIfFalse, -1);
+        compile_bool_literal(false);
+        const auto too_long_finish = emit(OpCode::Jump, -1);
+
+        patch(search, pc());
+        const auto header = pc();
+        emit(OpCode::LoadLocal, index);
+        emit(OpCode::LoadLocal, needle_length);
+        emit(OpCode::AddI64, 0);
+        emit(OpCode::LoadLocal, receiver_length);
+        emit(OpCode::LessI64, 0);
+        const auto candidate = emit(OpCode::JumpIfFalse, -1);
+        emit_increment_local(index);
+        emit(OpCode::Jump, static_cast<std::int64_t>(header));
+
+        patch(candidate, pc());
+        emit_candidate_substring(receiver, needle, needle_length, index);
+        patch(too_long_finish, pc());
+    }
+
+    void compile_string_search(const Expr& expression) {
+        const auto receiver = allocate_temp_local();
+        const auto needle = allocate_temp_local();
+        const auto receiver_length = allocate_temp_local();
+        const auto needle_length = allocate_temp_local();
+        const auto index = allocate_temp_local();
+        emit_string_search_operands(
+            expression, receiver, needle, receiver_length, needle_length,
+            index);
+        switch (expression.kind) {
+        case Expr::Kind::StrContains:
+        case Expr::Kind::StrIndexOf:
+            compile_contains_or_index_of(
+                expression, receiver, needle, receiver_length,
+                needle_length, index);
+            return;
+        case Expr::Kind::StrStartsWith:
+            compile_starts_with(receiver, needle, receiver_length,
+                                needle_length, index);
+            return;
+        case Expr::Kind::StrEndsWith:
+            compile_ends_with(receiver, needle, receiver_length,
+                              needle_length, index);
+            return;
+        default:
+            assert(false && "expected string search expression kind");
         }
     }
 

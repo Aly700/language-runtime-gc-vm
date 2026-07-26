@@ -319,7 +319,9 @@ public:
 
         LocalContext entry_context;
         auto* previous_local_context = local_context_;
+        auto previous_loop_labels = std::move(callable_loop_labels_);
         local_context_ = &entry_context;
+        callable_loop_labels_ = collect_loop_labels(program.statements);
         state_ = initial_state();
         (void)check_block(program.statements, state_, true);
         const auto result = check_expr(*program.result, state_);
@@ -336,6 +338,7 @@ public:
         }
         program.entry_local_count =
             static_cast<std::uint32_t>(entry_context.prototypes.size());
+        callable_loop_labels_ = std::move(previous_loop_labels);
         local_context_ = previous_local_context;
 
         materialize_generic_nominal_instances(program);
@@ -378,7 +381,54 @@ private:
     struct LoopFlowContext {
         std::vector<FlowState> break_states;
         std::vector<FlowState> continue_states;
+        std::string label;
     };
+
+    static void collect_loop_labels(const std::vector<Statement>& statements,
+                                    std::set<std::string>& labels) {
+        for (const auto& statement : statements) {
+            if ((statement.kind == Statement::Kind::While ||
+                 statement.kind == Statement::Kind::ForIn) &&
+                !statement.loop_label.empty()) {
+                labels.insert(statement.loop_label);
+            }
+            switch (statement.kind) {
+            case Statement::Kind::If:
+                collect_loop_labels(statement.then_branch, labels);
+                collect_loop_labels(statement.else_branch, labels);
+                break;
+            case Statement::Kind::While:
+            case Statement::Kind::ForIn:
+                collect_loop_labels(statement.body, labels);
+                break;
+            case Statement::Kind::Match:
+                for (const auto& arm : statement.match_arms) {
+                    collect_loop_labels(arm.body, labels);
+                }
+                break;
+            case Statement::Kind::TryCatch:
+                collect_loop_labels(statement.body, labels);
+                collect_loop_labels(statement.catch_body, labels);
+                break;
+            case Statement::Kind::Let:
+            case Statement::Kind::Assign:
+            case Statement::Kind::Throw:
+            case Statement::Kind::Break:
+            case Statement::Kind::Continue:
+            case Statement::Kind::Print:
+            case Statement::Kind::EphemeronSet:
+            case Statement::Kind::TailCall:
+                break;
+            }
+        }
+    }
+
+    static std::set<std::string> collect_loop_labels(
+        const std::vector<Statement>& statements) {
+        std::set<std::string> labels;
+        collect_loop_labels(statements, labels);
+        return labels;
+    }
 
     FlowState initial_state() const {
         FlowState state;
@@ -693,6 +743,7 @@ private:
         const auto* previous_return_type = current_return_type_;
         auto* previous_capture_context = capture_context_;
         auto previous_loop_contexts = std::move(loop_contexts_);
+        auto previous_loop_labels = std::move(callable_loop_labels_);
         const auto previous_try_depth = active_try_depth_;
         const auto previous_instantiation_depth =
             current_instantiation_depth_;
@@ -700,6 +751,7 @@ private:
         current_return_type_ = &function.return_type;
         capture_context_ = nullptr;
         loop_contexts_.clear();
+        callable_loop_labels_ = collect_loop_labels(function.statements);
         active_try_depth_ = 0;
         current_instantiation_depth_ = instantiation_depth;
         FlowState state = initial_state();
@@ -728,6 +780,7 @@ private:
         current_instantiation_depth_ =
             previous_instantiation_depth;
         active_try_depth_ = previous_try_depth;
+        callable_loop_labels_ = std::move(previous_loop_labels);
         loop_contexts_ = std::move(previous_loop_contexts);
         capture_context_ = previous_capture_context;
         current_return_type_ = previous_return_type;
@@ -1641,12 +1694,35 @@ private:
         caught.includes_nil = false;
         catch_state.locals[statement.catch_local_index].value = std::move(caught);
         catch_state.locals[statement.catch_local_index].immutable_match_binding = true;
+        std::vector<std::pair<std::size_t, std::size_t>> outer_transition_counts;
+        outer_transition_counts.reserve(loop_contexts_.size());
+        for (const auto* context : loop_contexts_) {
+            outer_transition_counts.emplace_back(context->break_states.size(),
+                                                 context->continue_states.size());
+        }
         const bool catch_falls = check_block(statement.catch_body, catch_state, false);
-        sync_locals(catch_state);
-        catch_state.locals[statement.catch_local_index].name =
-            hidden_match_local_name(statement.catch_local_index);
-        catch_state.locals[statement.catch_local_index].initialized = false;
-        catch_state.locals[statement.catch_local_index].immutable_match_binding = false;
+        const auto deactivate_catch_binding = [&](FlowState& flow_state) {
+            sync_locals(flow_state);
+            auto& local = flow_state.locals[statement.catch_local_index];
+            local.name = hidden_match_local_name(statement.catch_local_index);
+            local.initialized = false;
+            local.immutable_match_binding = false;
+        };
+        deactivate_catch_binding(catch_state);
+        for (std::size_t context_index = 0;
+             context_index < loop_contexts_.size(); ++context_index) {
+            auto& context = *loop_contexts_[context_index];
+            const auto [break_count, continue_count] =
+                outer_transition_counts[context_index];
+            for (std::size_t index = break_count;
+                 index < context.break_states.size(); ++index) {
+                deactivate_catch_binding(context.break_states[index]);
+            }
+            for (std::size_t index = continue_count;
+                 index < context.continue_states.size(); ++index) {
+                deactivate_catch_binding(context.continue_states[index]);
+            }
+        }
         sync_locals(try_state);
         sync_locals(catch_state);
         if (try_falls && catch_falls) state = join_states(try_state, catch_state);
@@ -1669,20 +1745,64 @@ private:
 
     bool check_loop_control(const Statement& statement,
                             const FlowState& state) {
-        if (loop_contexts_.empty()) {
+        LoopFlowContext* selected = nullptr;
+        if (statement.loop_control_label.empty()) {
+            if (!loop_contexts_.empty()) {
+                selected = loop_contexts_.back();
+            }
+        } else {
+            for (auto context = loop_contexts_.rbegin();
+                 context != loop_contexts_.rend(); ++context) {
+                if ((*context)->label == statement.loop_control_label) {
+                    selected = *context;
+                    break;
+                }
+            }
+        }
+        if (selected == nullptr && statement.loop_control_label.empty()) {
             diagnose(statement.position,
                      statement.kind == Statement::Kind::Break
                          ? "'break' is only allowed inside a loop"
                          : "'continue' is only allowed inside a loop");
             return true;
         }
-        auto& context = *loop_contexts_.back();
+        if (selected == nullptr) {
+            if (callable_loop_labels_.contains(
+                    statement.loop_control_label)) {
+                diagnose(
+                    statement.loop_control_label_position,
+                    "loop label '" + statement.loop_control_label +
+                        "' does not lexically enclose this " +
+                        (statement.kind == Statement::Kind::Break
+                             ? "break"
+                             : "continue"));
+            } else {
+                diagnose(statement.loop_control_label_position,
+                         "unknown loop label '" +
+                             statement.loop_control_label + "'");
+            }
+            return true;
+        }
         if (statement.kind == Statement::Kind::Break) {
-            context.break_states.push_back(state);
+            selected->break_states.push_back(state);
         } else {
-            context.continue_states.push_back(state);
+            selected->continue_states.push_back(state);
         }
         return false;
+    }
+
+    void check_loop_label(const Statement& statement) {
+        if (statement.loop_label.empty()) {
+            return;
+        }
+        for (const auto* context : loop_contexts_) {
+            if (context->label == statement.loop_label) {
+                diagnose(statement.loop_label_position,
+                         "loop label '" + statement.loop_label +
+                             "' duplicates an active loop label");
+                return;
+            }
+        }
     }
 
     void check_let(Statement& statement, FlowState& state, bool allow_let) {
@@ -2076,6 +2196,7 @@ private:
     }
 
     bool check_while(Statement& statement, FlowState& state) {
+        check_loop_label(statement);
         FlowState head = state;
         for (std::size_t iteration = 0; iteration < max_loop_iterations(state); ++iteration) {
             auto body_input = head;
@@ -2086,6 +2207,7 @@ private:
 
             auto body_output = body_input;
             LoopFlowContext loop;
+            loop.label = statement.loop_label;
             loop_contexts_.push_back(&loop);
             const bool body_falls =
                 check_block(statement.body, body_output, false);
@@ -2189,6 +2311,7 @@ private:
     }
 
     void check_for_in(Statement& statement, FlowState& state) {
+        check_loop_label(statement);
         const auto iterable = check_expr(*statement.iterable, state);
         std::vector<TypeSpec> variable_types;
         std::vector<TypedValue> variable_values;
@@ -2289,11 +2412,33 @@ private:
              iteration < max_loop_iterations(state); ++iteration) {
             auto body_output = head;
             activate_loop_locals(statement, body_output, variable_values);
+            std::vector<std::pair<std::size_t, std::size_t>>
+                outer_loop_sizes;
+            outer_loop_sizes.reserve(loop_contexts_.size());
+            for (const auto* context : loop_contexts_) {
+                outer_loop_sizes.push_back(
+                    {context->break_states.size(),
+                     context->continue_states.size()});
+            }
             LoopFlowContext loop;
+            loop.label = statement.loop_label;
             loop_contexts_.push_back(&loop);
             const bool body_falls =
                 check_block(statement.body, body_output, false);
             loop_contexts_.pop_back();
+            for (std::size_t i = 0; i < loop_contexts_.size(); ++i) {
+                auto& context = *loop_contexts_[i];
+                for (std::size_t j = outer_loop_sizes[i].first;
+                     j < context.break_states.size(); ++j) {
+                    deactivate_loop_locals(statement,
+                                           context.break_states[j]);
+                }
+                for (std::size_t j = outer_loop_sizes[i].second;
+                     j < context.continue_states.size(); ++j) {
+                    deactivate_loop_locals(statement,
+                                           context.continue_states[j]);
+                }
+            }
             if (body_falls) {
                 deactivate_loop_locals(statement, body_output);
             }
@@ -2384,6 +2529,11 @@ private:
             return check_array_len(expression, state);
         case Expr::Kind::StrSub:
             return check_str_sub(expression, state);
+        case Expr::Kind::StrContains:
+        case Expr::Kind::StrIndexOf:
+        case Expr::Kind::StrStartsWith:
+        case Expr::Kind::StrEndsWith:
+            return check_string_search(expression, state);
         case Expr::Kind::Binary:
             return check_binary(expression, state);
         case Expr::Kind::Field:
@@ -2412,6 +2562,10 @@ private:
             return check_conversion(expression, state);
         case Expr::Kind::Intern:
             return check_intern(expression, state);
+        case Expr::Kind::Abs:
+        case Expr::Kind::Min:
+        case Expr::Kind::Max:
+            return check_integer_builtin(expression, state);
         }
         return annotate(expression, invalid_value());
     }
@@ -2511,9 +2665,12 @@ private:
         auto* previous_context = capture_context_;
         capture_context_ = &context;
         auto outer_loop_contexts = std::move(loop_contexts_);
+        auto outer_loop_labels = std::move(callable_loop_labels_);
         loop_contexts_.clear();
+        callable_loop_labels_ = collect_loop_labels(lambda.statements);
         (void)check_block(lambda.statements, state, true);
         const auto result = check_expr(*lambda.result, state);
+        callable_loop_labels_ = std::move(outer_loop_labels);
         loop_contexts_ = std::move(outer_loop_contexts);
         capture_context_ = previous_context;
 
@@ -3144,6 +3301,98 @@ private:
         }
         return annotate(expression,
                         valid ? scalar_value(str_type()) : invalid_value());
+    }
+
+    static const char* integer_builtin_name(Expr::Kind kind) {
+        switch (kind) {
+        case Expr::Kind::Abs:
+            return "abs";
+        case Expr::Kind::Min:
+            return "min";
+        case Expr::Kind::Max:
+            return "max";
+        default:
+            assert(false && "expected integer builtin expression kind");
+            return "<invalid>";
+        }
+    }
+
+    TypedValue check_integer_builtin(Expr& expression, FlowState& state) {
+        const auto* name = integer_builtin_name(expression.kind);
+        const std::size_t expected =
+            expression.kind == Expr::Kind::Abs ? 1 : 2;
+        if (expression.arguments.size() != expected) {
+            diagnose(expression.position,
+                     std::string(name) + " expects exactly " +
+                         std::to_string(expected) +
+                         (expected == 1 ? " argument" : " arguments"));
+            return annotate(expression, invalid_value());
+        }
+        bool valid = true;
+        for (auto& argument : expression.arguments) {
+            const auto value = check_expr(*argument, state);
+            if (!is_invalid(value.type) && value.type != int64_type()) {
+                diagnose(argument->position,
+                         std::string(name) + " argument expects i64");
+                valid = false;
+            }
+        }
+        return annotate(expression,
+                        valid ? scalar_value(int64_type()) : invalid_value());
+    }
+
+    static const char* string_search_name(Expr::Kind kind) {
+        switch (kind) {
+        case Expr::Kind::StrContains:
+            return "contains";
+        case Expr::Kind::StrIndexOf:
+            return "index_of";
+        case Expr::Kind::StrStartsWith:
+            return "starts_with";
+        case Expr::Kind::StrEndsWith:
+            return "ends_with";
+        default:
+            assert(false && "expected string search expression kind");
+            return "<invalid>";
+        }
+    }
+
+    TypedValue check_string_search(Expr& expression, FlowState& state) {
+        const auto receiver = check_expr(*expression.receiver, state);
+        const auto* name = string_search_name(expression.kind);
+        if (expression.arguments.size() != 1) {
+            diagnose(expression.position,
+                     std::string(name) +
+                         " expects exactly 1 argument");
+            return annotate(expression, invalid_value());
+        }
+        const auto argument = check_expr(*expression.arguments.front(), state);
+        bool valid = true;
+        if (!is_invalid(receiver.type) && receiver.type != str_type()) {
+            diagnose(expression.position,
+                     std::string(name) + " requires str receiver");
+            valid = false;
+        } else if (receiver.type == str_type() && receiver.includes_nil) {
+            diagnose(expression.position,
+                     std::string(name) +
+                         " requires non-nil str receiver");
+            valid = false;
+        }
+        if (!is_invalid(argument.type) && argument.type != str_type()) {
+            diagnose(expression.arguments.front()->position,
+                     std::string(name) + " argument expects str");
+            valid = false;
+        } else if (argument.type == str_type() && argument.includes_nil) {
+            diagnose(expression.arguments.front()->position,
+                     std::string(name) +
+                         " argument requires non-nil str");
+            valid = false;
+        }
+        const auto result_type =
+            expression.kind == Expr::Kind::StrIndexOf ? int64_type()
+                                                      : bool_type();
+        return annotate(expression,
+                        valid ? scalar_value(result_type) : invalid_value());
     }
 
     TypedValue check_is_nil(Expr& expression, FlowState& state) {
@@ -3813,6 +4062,7 @@ private:
     const TypeSpec* current_return_type_{nullptr};
     std::size_t active_try_depth_{0};
     std::vector<LoopFlowContext*> loop_contexts_;
+    std::set<std::string> callable_loop_labels_;
     std::vector<Diagnostic> diagnostics_;
 };
 
