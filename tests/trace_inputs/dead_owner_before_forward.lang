@@ -1,0 +1,15 @@
+fn make() -> pair<i64, i64> {
+  let hole: pair<i64, i64> = pair(9, 9);
+  let child: pair<i64, i64> = pair(1, 2);
+  let doomed: pair<pair<i64, i64>, pair<i64, i64>> = pair(child, child);
+  child
+}
+
+let kept: pair<i64, i64> = make();
+let index: i64 = 0;
+let noise: pair<i64, i64> = pair(0, 0);
+while index < 4 {
+  noise = pair(index, index);
+  index = index + 1;
+}
+kept

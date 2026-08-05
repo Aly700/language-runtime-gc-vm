@@ -231,6 +231,10 @@ target_compile_options(trace_transparency PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(
     trace_transparency PRIVATE LANG_EXAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
 
+add_executable(trace_writer_run_metrics tests/trace_writer_run_metrics.cpp)
+target_link_libraries(trace_writer_run_metrics PRIVATE lang_runtime)
+target_compile_options(trace_writer_run_metrics PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 add_test(NAME lang_smoke COMMAND lang_smoke)
 add_test(NAME lang_phase1_correctness COMMAND lang_phase1_correctness)
@@ -305,3 +309,106 @@ add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)
 add_test(NAME trace_determinism COMMAND trace_determinism)
 add_test(NAME trace_transparency COMMAND trace_transparency)
+add_test(NAME trace_writer_run_metrics COMMAND trace_writer_run_metrics)
+
+if(BUILD_TESTING)
+find_program(
+    LANG_TRACE_PYTHON3_EXECUTABLE
+    NAMES python3
+    PATHS ENV PATH
+    NO_DEFAULT_PATH)
+if(NOT LANG_TRACE_PYTHON3_EXECUTABLE)
+    message(FATAL_ERROR
+        "python3 is required for trace conservation tests; add python3 to PATH")
+endif()
+
+set(
+    TRACE_CONSERVATION_CHECKER
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/trace_conservation_check.py")
+set(
+    TRACE_CONSERVATION_SELFTEST
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/trace_conservation_selftest.py")
+set(
+    TRACE_CONSERVATION_ARTIFACT_ROOT
+    "${CMAKE_CURRENT_BINARY_DIR}/Testing/Temporary/trace_conservation")
+set(TRACE_CONSERVATION_SNAPSHOT_INTERVAL 64)
+
+function(add_trace_conservation_case case_name source_path schedule_name)
+    set(
+        bundle_directory
+        "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/${case_name}")
+    set(fixture_name "trace_conservation_fixture_${case_name}")
+    set(generate_test "trace_conservation_generate_${case_name}")
+    set(check_test "trace_conservation_check_${case_name}")
+
+    add_test(
+        NAME "${generate_test}"
+        COMMAND lang_trace
+            "${CMAKE_CURRENT_SOURCE_DIR}/${source_path}"
+            --schedule "${schedule_name}"
+            --out "${bundle_directory}"
+            --snapshot-interval "${TRACE_CONSERVATION_SNAPSHOT_INTERVAL}")
+    set_tests_properties(
+        "${generate_test}"
+        PROPERTIES FIXTURES_SETUP "${fixture_name}")
+
+    add_test(
+        NAME "${check_test}"
+        COMMAND "${LANG_TRACE_PYTHON3_EXECUTABLE}"
+            "${TRACE_CONSERVATION_CHECKER}"
+            "${bundle_directory}")
+    set_tests_properties(
+        "${check_test}"
+        PROPERTIES
+            FIXTURES_REQUIRED "${fixture_name}"
+            PASS_REGULAR_EXPRESSION "OK events=.*snapshots_verified=")
+endfunction()
+
+add_trace_conservation_case(
+    string_builder_combined_mark_compact
+    examples/string_builder.lang
+    combined_mark_compact)
+add_trace_conservation_case(
+    string_builder_incremental_compact_1
+    examples/string_builder.lang
+    incremental_compact_1)
+add_trace_conservation_case(
+    records_showcase_combined_mark_compact
+    examples/records_showcase.lang
+    combined_mark_compact)
+add_trace_conservation_case(
+    records_showcase_incremental_compact_1
+    examples/records_showcase.lang
+    incremental_compact_1)
+add_trace_conservation_case(
+    string_interning_combined_mark_compact
+    examples/string_interning.lang
+    combined_mark_compact)
+add_trace_conservation_case(
+    dead_owner_major_every_1
+    tests/trace_inputs/dead_owner_before_forward.lang
+    major_every_1)
+add_trace_conservation_case(
+    ephemeron_clear_major_every_1
+    tests/trace_inputs/ephemeron_clear_before_forward.lang
+    major_every_1)
+add_trace_conservation_case(
+    forward_then_update_incremental_1
+    tests/trace_inputs/forward_then_update.lang
+    incremental_1)
+
+add_test(
+    NAME trace_conservation_selftest
+    COMMAND "${LANG_TRACE_PYTHON3_EXECUTABLE}"
+        "${TRACE_CONSERVATION_SELFTEST}"
+        "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/string_builder_combined_mark_compact"
+        "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/records_showcase_combined_mark_compact"
+        "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/string_interning_combined_mark_compact"
+        "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/forward_then_update_incremental_1")
+set_tests_properties(
+    trace_conservation_selftest
+    PROPERTIES
+        FIXTURES_REQUIRED
+            "trace_conservation_fixture_string_builder_combined_mark_compact;trace_conservation_fixture_records_showcase_combined_mark_compact;trace_conservation_fixture_string_interning_combined_mark_compact;trace_conservation_fixture_forward_then_update_incremental_1"
+        PASS_REGULAR_EXPRESSION "SELFTEST OK corruptions=31")
+endif()

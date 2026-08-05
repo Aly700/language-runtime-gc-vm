@@ -97,6 +97,72 @@ std::uint32_t trace_slot(ObjectId id) {
     return static_cast<std::uint32_t>(id & 0xffff'ffffull);
 }
 
+std::string_view trace_collection_kind_label(TraceCollectionKind kind) {
+    switch (kind) {
+    case TraceCollectionKind::Major:
+        return "major";
+    case TraceCollectionKind::Minor:
+        return "minor";
+    }
+    throw std::logic_error("unknown trace collection kind");
+}
+
+std::string_view trace_move_cause_label(TraceMoveCause cause) {
+    switch (cause) {
+    case TraceMoveCause::AtomicMajor:
+        return "atomic_major";
+    case TraceMoveCause::AtomicMinor:
+        return "atomic_minor";
+    case TraceMoveCause::IncrementalDeathAccounting:
+        return "incremental_death_accounting";
+    case TraceMoveCause::IncrementalCompactionStep:
+        return "incremental_compaction_step";
+    case TraceMoveCause::IncrementalCompactionFinalize:
+        return "incremental_compaction_finalize";
+    case TraceMoveCause::IncrementalMarkCompact:
+        return "incremental_mark_compact";
+    case TraceMoveCause::MapGrowth:
+        return "map_growth";
+    case TraceMoveCause::BuilderGrowth:
+        return "builder_growth";
+    }
+    throw std::logic_error("unknown trace move cause");
+}
+
+std::string_view trace_move_kind_label(TraceMoveKind kind) {
+    switch (kind) {
+    case TraceMoveKind::Compaction:
+        return "compaction";
+    case TraceMoveKind::Growth:
+        return "growth";
+    }
+    throw std::logic_error("unknown trace move kind");
+}
+
+std::string_view trace_forward_kind_label(TraceForwardKind kind) {
+    switch (kind) {
+    case TraceForwardKind::Heap:
+        return "heap";
+    case TraceForwardKind::Root:
+        return "root";
+    case TraceForwardKind::Registry:
+        return "registry";
+    }
+    throw std::logic_error("unknown trace forward kind");
+}
+
+std::size_t trace_forward_kind_index(TraceForwardKind kind) {
+    switch (kind) {
+    case TraceForwardKind::Heap:
+        return 0;
+    case TraceForwardKind::Root:
+        return 1;
+    case TraceForwardKind::Registry:
+        return 2;
+    }
+    throw std::logic_error("unknown trace forward kind");
+}
+
 struct EventFields {
     std::optional<ObjectId> id;
     std::optional<std::uint64_t> size;
@@ -110,6 +176,16 @@ struct EventFields {
 } // namespace
 
 struct JsonlTraceWriter::Impl {
+    struct ActiveCollection {
+        std::uint64_t id{0};
+        TraceCollectionKind kind{TraceCollectionKind::Major};
+    };
+
+    struct ActiveMove {
+        std::uint64_t id{0};
+        TraceMoveCause cause{TraceMoveCause::AtomicMajor};
+    };
+
     explicit Impl(std::filesystem::path directory, std::size_t interval)
         : output_directory(std::move(directory)), snapshot_interval(interval) {
         if (snapshot_interval == 0) {
@@ -137,15 +213,6 @@ struct JsonlTraceWriter::Impl {
         logical_objects = heap.trace_snapshot();
         peak_live_bytes = std::max(
             peak_live_bytes, live_bytes(logical_objects));
-    }
-
-    void sample_heap(const gc::Heap& heap) {
-        const auto objects = heap.trace_snapshot();
-        peak_live_bytes = std::max(
-            peak_live_bytes, live_bytes(objects));
-        if (collection_depth == 0) {
-            logical_objects = objects;
-        }
     }
 
     void write_snapshot() {
@@ -178,12 +245,8 @@ struct JsonlTraceWriter::Impl {
     }
 
     template <typename AdditiveWriter>
-    void write_event(const gc::Heap& heap, std::string_view kind,
-                     const EventFields& fields,
-                     AdditiveWriter&& write_additive) {
-        if (collection_depth == 0) {
-            synchronize_heap(heap);
-        }
+    void write_event_raw(std::string_view kind, const EventFields& fields,
+                         AdditiveWriter&& write_additive) {
         if (seq != 0 && seq % snapshot_interval == 0 &&
             last_periodic_snapshot_seq != seq) {
             write_snapshot();
@@ -257,6 +320,54 @@ struct JsonlTraceWriter::Impl {
         ensure_writable();
     }
 
+    void reconcile_heap(const gc::Heap& heap, bool mutator_side) {
+        const auto physical_objects = heap.trace_snapshot();
+        peak_live_bytes = std::max(
+            peak_live_bytes, live_bytes(physical_objects));
+        if (physical_objects.size() != logical_objects.size()) {
+            throw std::logic_error(
+                "trace mirror object count changed without a lifecycle event");
+        }
+        for (std::size_t index = 0; index < physical_objects.size(); ++index) {
+            const auto& physical = physical_objects[index];
+            auto& logical = logical_objects[index];
+            if (physical.id != logical.id || physical.kind != logical.kind ||
+                physical.generation != logical.generation) {
+                throw std::logic_error(
+                    "trace mirror identity changed without a lifecycle event");
+            }
+            if (physical.size == logical.size &&
+                physical.references == logical.references) {
+                continue;
+            }
+            EventFields fields;
+            fields.id = physical.id;
+            fields.size = physical.size;
+            fields.generation = physical.generation;
+            fields.references = std::span<const ObjectId>(
+                physical.references.data(), physical.references.size());
+            fields.mutator_side = mutator_side;
+            write_event_raw(
+                "update", fields,
+                [&physical](std::ostream& output) {
+                    output << ",\"object_kind\":";
+                    write_json_string(output, physical.kind);
+                });
+            logical = physical;
+        }
+    }
+
+    template <typename AdditiveWriter>
+    void write_event(const gc::Heap& heap, std::string_view kind,
+                     const EventFields& fields,
+                     AdditiveWriter&& write_additive) {
+        if (move_transactions.empty()) {
+            reconcile_heap(heap, false);
+        }
+        write_event_raw(kind, fields,
+                        std::forward<AdditiveWriter>(write_additive));
+    }
+
     void add_object(ObjectId id, std::string_view kind,
                     std::uint64_t size, std::uint8_t generation,
                     std::span<const ObjectId> references) {
@@ -278,12 +389,6 @@ struct JsonlTraceWriter::Impl {
                     return object.id == id;
                 }),
             logical_objects.end());
-        for (auto& object : logical_objects) {
-            object.references.erase(
-                std::remove(object.references.begin(),
-                            object.references.end(), id),
-                object.references.end());
-        }
     }
 
     void relocate_object(ObjectId source, ObjectId destination) {
@@ -323,8 +428,22 @@ struct JsonlTraceWriter::Impl {
         const auto final_live_bytes = live_bytes(objects);
         peak_live_bytes = std::max(peak_live_bytes, final_live_bytes);
         const auto metrics = heap.metrics();
-        const auto collection_count =
+        const auto lifetime_collection_count =
             metrics.major_collections + metrics.minor_collections;
+        if (lifetime_collection_count < collection_count_baseline) {
+            throw std::logic_error(
+                "trace heap collection metrics moved backwards");
+        }
+        const auto collection_count =
+            lifetime_collection_count - collection_count_baseline;
+        if (active_collection.has_value() || !move_transactions.empty()) {
+            throw std::logic_error(
+                "trace run ended inside a collection transaction");
+        }
+        if (collection_count != next_collection_id) {
+            throw std::logic_error(
+                "trace logical collection evidence disagrees with metrics");
+        }
 
         std::ofstream stats(output_directory / "stats.json",
                             std::ios::binary | std::ios::trunc);
@@ -334,6 +453,11 @@ struct JsonlTraceWriter::Impl {
         stats << "{\"live_bytes_final\":" << final_live_bytes
               << ",\"forwarded_reference_count\":"
               << forwarded_reference_count
+              << ",\"forwarded_reference_totals\":{\"heap\":"
+              << forwarded_reference_totals[0]
+              << ",\"root\":" << forwarded_reference_totals[1]
+              << ",\"registry\":" << forwarded_reference_totals[2]
+              << "}"
               << ",\"pause_slices\":" << pause_slices
               << ",\"collection_count\":" << collection_count
               << ",\"event_totals\":{";
@@ -347,7 +471,8 @@ struct JsonlTraceWriter::Impl {
                 event_totals.find(std::string(kRequiredEventKinds[i]));
             stats << (found == event_totals.end() ? 0 : found->second);
         }
-        stats << "},\"ticks\":" << retired_ticks
+        stats << "},\"snapshot_interval\":" << snapshot_interval
+              << ",\"ticks\":" << retired_ticks
               << ",\"peak_live_bytes\":" << peak_live_bytes << "}\n";
         if (!stats) {
             throw std::runtime_error("failed to write trace stats.json");
@@ -366,11 +491,16 @@ struct JsonlTraceWriter::Impl {
     std::vector<TraceHeapObject> logical_objects;
     std::map<std::string, std::uint64_t> event_totals;
     std::uint64_t forwarded_reference_count{0};
+    std::array<std::uint64_t, 3> forwarded_reference_totals{};
     std::uint64_t pause_slices{0};
     std::uint64_t peak_live_bytes{0};
     bool started{false};
     bool finished{false};
-    std::size_t collection_depth{0};
+    std::optional<ActiveCollection> active_collection;
+    std::vector<ActiveMove> move_transactions;
+    std::uint64_t next_collection_id{0};
+    std::uint64_t next_transaction_id{0};
+    std::uint64_t collection_count_baseline{0};
 };
 
 JsonlTraceWriter::JsonlTraceWriter(
@@ -398,6 +528,9 @@ void JsonlTraceWriter::on_program_start(const gc::Heap& heap) {
     impl_->started = true;
     impl_->tick = 0;
     impl_->source_position.reset();
+    const auto metrics = heap.metrics();
+    impl_->collection_count_baseline =
+        metrics.major_collections + metrics.minor_collections;
     impl_->synchronize_heap(heap);
     impl_->write_snapshot();
 }
@@ -409,7 +542,7 @@ void JsonlTraceWriter::on_program_exit(const gc::Heap& heap,
     }
     impl_->tick = retired_ticks;
     impl_->source_position.reset();
-    impl_->synchronize_heap(heap);
+    impl_->reconcile_heap(heap, false);
     impl_->write_snapshot();
     impl_->write_stats(heap, retired_ticks);
     impl_->finished = true;
@@ -444,7 +577,8 @@ void JsonlTraceWriter::on_mark_slice(const gc::Heap& heap,
 void JsonlTraceWriter::on_relocate(
     const gc::Heap& heap, ObjectId source_id, std::uint64_t size,
     std::uint8_t source_generation, std::uint64_t from_slot,
-    std::uint64_t to_slot, ObjectId destination_id) {
+    std::uint64_t to_slot, ObjectId destination_id,
+    TraceMoveKind move_kind) {
     EventFields fields;
     fields.id = source_id;
     fields.size = size;
@@ -452,8 +586,11 @@ void JsonlTraceWriter::on_relocate(
     fields.from = from_slot;
     fields.to = to_slot;
     impl_->write_event(heap, "relocate", fields,
-                       [destination_id](std::ostream& output) {
-                           output << ",\"to_id\":" << destination_id;
+                       [destination_id, move_kind](std::ostream& output) {
+                           output << ",\"to_id\":" << destination_id
+                                  << ",\"move_kind\":";
+                           write_json_string(
+                               output, trace_move_kind_label(move_kind));
                        });
     impl_->relocate_object(source_id, destination_id);
 }
@@ -535,30 +672,216 @@ void JsonlTraceWriter::on_verify_step(
                        });
 }
 
-void JsonlTraceWriter::on_reference_forwarded() {
+void JsonlTraceWriter::on_reference_forwarded(
+    ObjectId source_id, ObjectId destination_id,
+    TraceForwardKind kind, std::optional<ObjectId> owner_id) {
+    if (source_id == destination_id) {
+        throw std::logic_error(
+            "trace forwarding evidence requires unequal object IDs");
+    }
+    if ((kind == TraceForwardKind::Heap) != owner_id.has_value()) {
+        throw std::logic_error(
+            "trace heap forwarding evidence requires exactly one owner ID");
+    }
+    EventFields fields;
+    const auto collection_id =
+        impl_->active_collection.has_value()
+            ? std::optional<std::uint64_t>(impl_->active_collection->id)
+            : std::nullopt;
+    impl_->write_event_raw(
+        "gc", fields,
+        [collection_id, source_id, destination_id, owner_id,
+         kind](std::ostream& output) {
+            output << ",\"op\":\"forward\",\"collection_id\":";
+            if (collection_id.has_value()) {
+                output << *collection_id;
+            } else {
+                output << "null";
+            }
+            output << ",\"from_id\":" << source_id;
+            output << ",\"to_id\":" << destination_id;
+            output << ",\"owner_id\":";
+            if (owner_id.has_value()) {
+                output << *owner_id;
+            } else {
+                output << "null";
+            }
+            output << ",\"forward_kind\":";
+            write_json_string(output, trace_forward_kind_label(kind));
+        });
     ++impl_->forwarded_reference_count;
+    ++impl_->forwarded_reference_totals[
+        trace_forward_kind_index(kind)];
 }
 
 void JsonlTraceWriter::on_pause_slice() {
+    EventFields fields;
+    const auto collection_id =
+        impl_->active_collection.has_value()
+            ? std::optional<std::uint64_t>(impl_->active_collection->id)
+            : std::nullopt;
+    impl_->write_event_raw(
+        "gc", fields,
+        [collection_id](std::ostream& output) {
+            output << ",\"op\":\"pause\",\"collection_id\":";
+            if (collection_id.has_value()) {
+                output << *collection_id;
+            } else {
+                output << "null";
+            }
+        });
     ++impl_->pause_slices;
 }
 
 void JsonlTraceWriter::on_heap_sample(const gc::Heap& heap) {
-    impl_->sample_heap(heap);
+    impl_->reconcile_heap(heap, true);
 }
 
-void JsonlTraceWriter::on_collection_begin(const gc::Heap& heap) {
-    impl_->synchronize_heap(heap);
-    ++impl_->collection_depth;
-}
-
-void JsonlTraceWriter::on_collection_end(const gc::Heap& heap) {
-    if (impl_->collection_depth == 0) {
+void JsonlTraceWriter::on_logical_collection_begin(
+    const gc::Heap& heap, TraceCollectionKind kind) {
+    if (impl_->active_collection.has_value()) {
         throw std::logic_error(
-            "trace collection transaction ended without a begin");
+            "trace logical collection began while another was active");
     }
-    impl_->synchronize_heap(heap);
-    --impl_->collection_depth;
+    impl_->reconcile_heap(heap, false);
+    const auto collection_id = impl_->next_collection_id;
+    const auto kind_label = trace_collection_kind_label(kind);
+    const auto bytes = live_bytes(impl_->logical_objects);
+    const auto objects = impl_->logical_objects.size();
+    EventFields fields;
+    impl_->write_event_raw(
+        "gc", fields,
+        [collection_id, kind_label, bytes, objects](std::ostream& output) {
+            output << ",\"op\":\"collection_begin\",\"collection_id\":"
+                   << collection_id << ",\"collection_kind\":";
+            write_json_string(output, kind_label);
+            output << ",\"live_bytes\":" << bytes
+                   << ",\"live_objects\":" << objects;
+        });
+    impl_->active_collection =
+        Impl::ActiveCollection{collection_id, kind};
+    ++impl_->next_collection_id;
+}
+
+void JsonlTraceWriter::on_logical_collection_end(
+    const gc::Heap& heap) {
+    if (!impl_->active_collection.has_value()) {
+        throw std::logic_error(
+            "trace logical collection ended without a begin");
+    }
+    if (!impl_->move_transactions.empty()) {
+        throw std::logic_error(
+            "trace logical collection ended inside a move transaction");
+    }
+    impl_->reconcile_heap(heap, false);
+    const auto collection = *impl_->active_collection;
+    const auto kind_label = trace_collection_kind_label(collection.kind);
+    const auto bytes = live_bytes(impl_->logical_objects);
+    const auto objects = impl_->logical_objects.size();
+    EventFields fields;
+    impl_->write_event_raw(
+        "gc", fields,
+        [collection, kind_label, bytes, objects](std::ostream& output) {
+            output << ",\"op\":\"collection_end\",\"collection_id\":"
+                   << collection.id << ",\"collection_kind\":";
+            write_json_string(output, kind_label);
+            output << ",\"live_bytes\":" << bytes
+                   << ",\"live_objects\":" << objects;
+        });
+    impl_->active_collection.reset();
+}
+
+void JsonlTraceWriter::on_move_begin(const gc::Heap& heap,
+                                     TraceMoveCause cause) {
+    impl_->reconcile_heap(heap, false);
+    const auto transaction_id = impl_->next_transaction_id;
+    const auto parent_transaction_id =
+        impl_->move_transactions.empty()
+            ? std::optional<std::uint64_t>{}
+            : std::optional<std::uint64_t>{
+                  impl_->move_transactions.back().id};
+    const auto depth = impl_->move_transactions.size() + 1;
+    const auto cause_label = trace_move_cause_label(cause);
+    const auto collection_id =
+        impl_->active_collection.has_value()
+            ? std::optional<std::uint64_t>{impl_->active_collection->id}
+            : std::optional<std::uint64_t>{};
+    const auto bytes = live_bytes(impl_->logical_objects);
+    const auto objects = impl_->logical_objects.size();
+    EventFields fields;
+    impl_->write_event_raw(
+        "gc", fields,
+        [transaction_id, parent_transaction_id, depth, cause_label,
+         collection_id, bytes, objects](std::ostream& output) {
+            output << ",\"op\":\"move_begin\",\"transaction_id\":"
+                   << transaction_id << ",\"parent_transaction_id\":";
+            if (parent_transaction_id.has_value()) {
+                output << *parent_transaction_id;
+            } else {
+                output << "null";
+            }
+            output << ",\"depth\":" << depth << ",\"cause\":";
+            write_json_string(output, cause_label);
+            output << ",\"collection_id\":";
+            if (collection_id.has_value()) {
+                output << *collection_id;
+            } else {
+                output << "null";
+            }
+            output << ",\"live_bytes\":" << bytes
+                   << ",\"live_objects\":" << objects;
+        });
+    impl_->move_transactions.push_back(
+        Impl::ActiveMove{transaction_id, cause});
+    ++impl_->next_transaction_id;
+}
+
+void JsonlTraceWriter::on_move_end(const gc::Heap& heap) {
+    if (impl_->move_transactions.empty()) {
+        throw std::logic_error(
+            "trace move transaction ended without a begin");
+    }
+    impl_->reconcile_heap(heap, false);
+    const auto transaction = impl_->move_transactions.back();
+    const auto parent_transaction_id =
+        impl_->move_transactions.size() > 1
+            ? std::optional<std::uint64_t>{
+                  impl_->move_transactions[
+                      impl_->move_transactions.size() - 2].id}
+            : std::optional<std::uint64_t>{};
+    const auto depth = impl_->move_transactions.size();
+    const auto cause_label = trace_move_cause_label(transaction.cause);
+    const auto collection_id =
+        impl_->active_collection.has_value()
+            ? std::optional<std::uint64_t>{impl_->active_collection->id}
+            : std::optional<std::uint64_t>{};
+    const auto bytes = live_bytes(impl_->logical_objects);
+    const auto objects = impl_->logical_objects.size();
+    EventFields fields;
+    impl_->write_event_raw(
+        "gc", fields,
+        [transaction, parent_transaction_id, depth, cause_label,
+         collection_id, bytes, objects](std::ostream& output) {
+            output << ",\"op\":\"move_end\",\"transaction_id\":"
+                   << transaction.id
+                   << ",\"parent_transaction_id\":";
+            if (parent_transaction_id.has_value()) {
+                output << *parent_transaction_id;
+            } else {
+                output << "null";
+            }
+            output << ",\"depth\":" << depth << ",\"cause\":";
+            write_json_string(output, cause_label);
+            output << ",\"collection_id\":";
+            if (collection_id.has_value()) {
+                output << *collection_id;
+            } else {
+                output << "null";
+            }
+            output << ",\"live_bytes\":" << bytes
+                   << ",\"live_objects\":" << objects;
+        });
+    impl_->move_transactions.pop_back();
 }
 
 std::span<const std::string_view> trace_schedule_names() {

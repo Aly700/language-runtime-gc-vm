@@ -446,7 +446,9 @@ private:
     void rewrite_incremental_compaction_roots(
         RootProvider* roots, std::span<Value*> extra_roots);
     void rewrite_incremental_compaction_value(Value& value,
-                                              bool require_forwarded) const;
+                                              bool require_forwarded,
+                                              TraceForwardKind kind,
+                                              std::optional<ObjectId> owner_id) const;
     [[nodiscard]] Value canonicalize_incremental_compaction_read(
         Value value) const;
     [[nodiscard]] Value normalize_incremental_compaction_shadow_value(
@@ -507,7 +509,9 @@ private:
     void rewrite_references(const ForwardingTable& forwarding,
                             std::vector<std::optional<Object>>& compacted_objects,
                             RootProvider* roots, std::span<Value*> extra_roots) const;
-    void rewrite_value(Value& value, const ForwardingTable& forwarding) const;
+    void rewrite_value(Value& value, const ForwardingTable& forwarding,
+                       TraceForwardKind kind,
+                       std::optional<ObjectId> owner_id) const;
     [[nodiscard]] std::vector<ObjectId> process_weak_targets(
         const ForwardingTable& forwarding,
         std::vector<std::optional<Object>>& moved_objects,
