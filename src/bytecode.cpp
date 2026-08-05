@@ -218,6 +218,8 @@ const char* op_name(OpCode op) {
         return "BuilderToStr";
     case OpCode::BuilderClear:
         return "BuilderClear";
+    case OpCode::ConstantBool:
+        return "ConstantBool";
     }
     return "<invalid>";
 }
@@ -2025,6 +2027,19 @@ bool transfer_instruction(const Module& module, std::size_t function_index, std:
         state.stack.push_back(int64_value());
         return push_fallthrough_or_report(pc, function, function_index, std::move(state),
                                           successors, diagnostics);
+    case OpCode::ConstantBool:
+        if (ins.operand != 0 && ins.operand != 1) {
+            return reject(
+                diagnostics, function_index, pc,
+                VerifierReason::InvalidBoolConstant,
+                instruction_message(
+                    function, pc,
+                    "bool constant operand must be canonical 0 or 1"));
+        }
+        state.stack.push_back(bool_value());
+        return push_fallthrough_or_report(
+            pc, function, function_index, std::move(state), successors,
+            diagnostics);
     case OpCode::PushStr:
         if (ins.operand < 0 ||
             static_cast<std::uint64_t>(ins.operand) >=
@@ -3822,6 +3837,8 @@ const char* verifier_reason_name(VerifierReason reason) {
         return "BuilderOperationOnNonBuilder";
     case VerifierReason::BuilderAppendRequiresStr:
         return "BuilderAppendRequiresStr";
+    case VerifierReason::InvalidBoolConstant:
+        return "InvalidBoolConstant";
     }
     return "<unknown>";
 }

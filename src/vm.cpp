@@ -1,5 +1,7 @@
 #include "lang/vm.hpp"
 
+#include "numeric.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <charconv>
@@ -414,6 +416,12 @@ Value VM::execute_verified(const Module& module,
             push(frame, Value::int64(ins.operand));
             ++frame.pc;
             break;
+        case OpCode::ConstantBool:
+            assert((ins.operand == 0 || ins.operand == 1) &&
+                   "verifier invariant violated: ConstantBool must be canonical");
+            push(frame, Value::boolean(ins.operand != 0));
+            ++frame.pc;
+            break;
         case OpCode::PushStr: {
             assert(ins.operand >= 0 &&
                    static_cast<std::size_t>(ins.operand) <
@@ -671,7 +679,7 @@ Value VM::execute_verified(const Module& module,
                    "verifier invariant violated: AddI64 lhs must be i64");
             const auto rhs = rhs_value.as_i64();
             const auto lhs = lhs_value.as_i64();
-            push(frame, Value::int64(lhs + rhs));
+            push(frame, Value::int64(detail::wrapping_add_i64(lhs, rhs)));
             ++frame.pc;
             break;
         }

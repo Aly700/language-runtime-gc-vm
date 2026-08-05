@@ -10,6 +10,13 @@
 
 namespace lang::frontend {
 
+namespace {
+
+CompileResult compile_program_impl(std::string_view source,
+                                   const CompileOptions* options);
+
+} // namespace
+
 const char* type_name(Type type) {
     switch (type) {
     case Type::Int64:
@@ -43,6 +50,18 @@ const char* type_name(Type type) {
 }
 
 CompileResult compile_program(std::string_view source) {
+    return compile_program_impl(source, nullptr);
+}
+
+CompileResult compile_program(std::string_view source,
+                              const CompileOptions& options) {
+    return compile_program_impl(source, &options);
+}
+
+namespace {
+
+CompileResult compile_program_impl(std::string_view source,
+                                   const CompileOptions* options) {
     auto lexed = detail::lex_source(source);
     if (!lexed.diagnostics.empty()) {
         CompileResult result;
@@ -68,8 +87,12 @@ CompileResult compile_program(std::string_view source) {
         return result;
     }
 
-    auto compiled =
-        detail::compile_checked_program(*parsed.program, checked.result_type);
+    const auto* optimizer_options =
+        options != nullptr && options->optimize
+            ? &options->optimizer
+            : nullptr;
+    auto compiled = detail::compile_checked_program(
+        *parsed.program, checked.result_type, optimizer_options);
     if (!compiled.verified_module.has_value()) {
         CompileResult result;
         result.result_type = coarse_result_type;
@@ -80,7 +103,11 @@ CompileResult compile_program(std::string_view source) {
     CompileResult result;
     result.result_type = coarse_result_type;
     result.verified_module = std::move(compiled.verified_module);
+    result.optimization_stats =
+        std::move(compiled.optimization_stats);
     return result;
 }
+
+} // namespace
 
 } // namespace lang::frontend
