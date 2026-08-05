@@ -29,13 +29,16 @@ copy at `showcase/SCHEMA.md`. Each measured workload lives at
 `positions.json` are unmodified `lang_trace` outputs; `program.lang` is the exact source
 passed to the emitter; and `output.txt` is the VM stdout captured as raw bytes.
 
-The manifest has a top-level `note` naming the emitter commit and an ordered `artifacts`
-array. Every artifact records `id`, `type` (`trace-bundle`, `schema`, or `source`), the
+The manifest has a top-level `note` stating its measured-execution provenance and an
+ordered `artifacts` array. Every artifact records `id`, `type` (`trace-bundle`, `schema`,
+or `source`), the
 fixed `label` `measured`, its showcase-relative `path`, `desc`, executed `schedule`
 (`null` for the schema), and per-file byte `sizes` and lowercase hexadecimal `sha256`
-maps. A trace-bundle entry covers all six files in its demo directory. The manifest does
-not hash itself; `showcase_pin` regenerates and byte-compares the entire tree, including
-the manifest, schema, sources, stdout, and every emitter file.
+maps. Each trace-bundle artifact also records `verify_events` as `full` or `sampled`,
+matching the emitter mode declared by that bundle's `stats.json`. A trace-bundle entry
+covers all six files in its demo directory. The manifest does not hash itself;
+`showcase_pin` regenerates and byte-compares the entire tree, including the manifest,
+schema, sources, stdout, and every emitter file.
 
 ## Units and identity
 
@@ -95,8 +98,12 @@ Collector work at an instruction boundary uses the upcoming instruction's tick. 
 trapping instruction is not retired. The exit snapshot and `stats.json` `ticks` contain
 the final retired-instruction count.
 
-`seq` is a zero-based event index, increasing by one for every event. It disambiguates
-events with equal ticks. It is scoped to one run.
+`seq` is a zero-based emitted-event index, increasing by one for every event. It
+disambiguates events with equal ticks and is scoped to one run. In sampled verification
+mode, a dropped `verify_step` callback never consumes a `seq`; consequently the visible
+event stream remains contiguous and snapshot sequence validation remains exact. The
+separate `verify_index` described below counts true verification callbacks and can have
+gaps in the emitted stream.
 
 `src_pos` is `{"line":L,"col":C}` with optional additive `"fn":"NAME"` when the
 frontend debug table contains the current pc. It is populated for mutator-side `alloc`,
@@ -115,13 +122,77 @@ marking, eviction, and validation work, and for hand-built bytecode without a po
 | `intern` | `id`, `size`, `gen`, `src_pos` | `hit` is integer `1` for an existing canonical and `0` for a miss-created canonical. `id` is the canonical `Str`. |
 | `evict` | `id`, `size`, `gen` | The weak intern-table canonical selected for eviction. Emission precedes removal and does not keep the string alive. |
 | `trap` | `src_pos` | `reason` is the caught runtime diagnostic string. `id`, `size`, `gen`, movement fields, and `refs` are null. Uncaught typed exceptions use their existing deterministic message. |
-| `verify_step` | optional `size` | `check` names the validator. Current names are `validate_after_collection`, `incremental_tricolor`, `shadow_marking`, `shadow_compaction`, `remembered_set`, `weak_targets`, `ephemerons`, and `intern_table`. `size` is null unless the validator already has an exact element count; no count is estimated. |
+| `verify_step` | optional `size` | `check` names the runtime validator. Current names are `validate_after_collection`, `incremental_tricolor`, `shadow_marking`, `shadow_compaction`, `remembered_set`, `weak_targets`, `ephemerons`, and `intern_table`. `size` is null unless the validator already has an exact element count; no count is estimated. In sampled mode the ordered additive fields after `check` are `verify_index`, `collection_id`, `scope_index`, `check_index`, and `terminal`, as defined below. Full mode retains the original `check`-only shape. |
 | `update` | `id`, `size`, `gen`, `refs` | Complete post-mutation traced state for an already-live object. `object_kind` repeats the immutable descriptor name. Identity, kind, and young/old generation cannot change; `size` and ordered `refs` replace their prior values. Mutator updates carry the current `src_pos`; collector weak/ephemeron clearing is null-positioned. |
 | `gc` | fixed payload fields `id` through `src_pos` are null | `op` carries replayable collector control evidence. Its additive fields are defined below. |
 
 Strings in `kind`, `reason`, `check`, `object_kind`, and `fn` are schema labels or copied
 diagnostics, not numeric measurements. Boolean measurements such as `hit` are encoded as
 integer `0` or `1`.
+
+### Verification-event modes
+
+`lang_trace --verify-events full|sampled` selects deterministic writer-side handling of
+runtime `verify_step` callbacks. `full` is the default and emits every callback with the
+original event shape. Its `stats.json` retention descriptor is the exact string `all`.
+`sampled` applies the following fixed rule while the writer observes the live event
+stream; it is not a post-filter:
+
+- The head window is the first 40 verification callbacks in the run, identified by
+  zero-based `verify_index < 40`. Every one is emitted.
+- Within each nonempty logical collection, the first callback (`scope_index == 0`), the
+  first occurrence of every distinct `check` (`check_index == 0`), each callback whose
+  zero-based `scope_index` is a multiple of 16, and the terminal callback are emitted.
+  The terminal callback is the collection's last verification callback, so every
+  nonempty collection retains both boundaries and every validator category it ran.
+- Callbacks outside a logical collection form one cumulative unscoped sequence for the
+  run. Beyond the global head, only callbacks whose zero-based unscoped `scope_index` is
+  a multiple of 16 are emitted. Unscoped callbacks have no collection boundary or
+  per-check retention guarantee.
+- These predicates are a union: a callback is emitted once when any applicable predicate
+  holds. All other `verify_step` callbacks are omitted. No non-verification event is
+  sampled.
+
+The sampled `retention_rule` descriptor is exactly
+`head40_or_collection_first_last_first_check_stride16;unscoped_head40_or_stride16`.
+The fixed constants are reported independently as `head_window: 40` and `stride: 16` in
+`stats.json`.
+
+Every emitted sampled `verify_step` has the following ordered metadata after `check`:
+
+- `verify_index`: zero-based index among all true verification callbacks in the run;
+- `collection_id`: the active logical collection ID, or null for an unscoped callback;
+- `scope_index`: zero-based true callback index within that collection, or within the
+  cumulative unscoped callback sequence;
+- `check_index`: zero-based true occurrence index for this `check` within that collection,
+  or across the cumulative unscoped sequence; and
+- `terminal`: integer `1` only for the last verification callback of a logical collection,
+  otherwise `0`. It is always `0` when `collection_id` is null.
+
+The ordinals count callbacks before sampling, so gaps prove where eligible thinning could
+have occurred. Dropped callbacks advance `verify_index`, `scope_index`, and the applicable
+`check_index`, but do not consume an event `seq`. In sampled mode each `collection_end`
+adds, after `live_objects`, `verify_true_count`, `verify_emitted_count`, and
+`verify_checks`. The two counts cover that logical collection. `verify_checks` lists every
+distinct check observed there in first-encounter order; each listed check has its
+`check_index == 0` event retained. A collection with no verification callbacks reports
+zero counts and an empty array. Full-mode collection boundaries keep their original
+shape.
+
+These events currently observe runtime heap validators only. The compile-time bytecode
+verifier runs before the trace writer exists and is not represented by `verify_step`;
+sampling does not change or imply that scope.
+
+#### Renderer guidance
+
+A renderer detects sampling from `stats.json` `verify_events.mode`, not from apparent
+gaps in `seq` or by guessing from event density. In `full` mode every runtime validation
+callback is visible. In `sampled` mode the renderer is guaranteed the 40-callback run
+head; for every nonempty logical collection, its first and last verification callback
+and the first callback of each validator name; and the fixed stride samples described
+above. The per-event ordinals and per-collection ledgers identify the visible callbacks'
+positions in the true validation sequence. The global and unscoped stats counts quantify
+sampling without reconstructing omitted events.
 
 ### Replay evidence and transaction boundaries
 
@@ -138,7 +209,7 @@ those transitions.
 |---|---|---|
 | `pause` | `collection_id` | One event per measured stop-the-world entry. `collection_id` is the active logical collection or null when the pause precedes its begin event. |
 | `forward` | `collection_id`, `from_id`, `to_id`, `owner_id`, `forward_kind` | One event per unequal-ID rewrite counted by `forwarded_reference_count`. `from_id -> to_id` must be the direct full-ID mapping already established by a `relocate`/`promote` event. `forward_kind` is `heap` for a snapshot-visible object field, `root` for a precise or mutator-local root slot, and `registry` for collector-owned IDs not present in snapshots. `owner_id` is the exact live owning object for `heap`; it is null for `root` and `registry`. |
-| `collection_begin` / `collection_end` | `collection_id`, `collection_kind`, `live_bytes`, `live_objects` | Balanced logical collection boundaries. IDs start at zero and increase by one at the exact major/minor metric increment. Marking-to-compaction remains one major collection. Boundary counts describe the replay mirror. |
+| `collection_begin` / `collection_end` | `collection_id`, `collection_kind`, `live_bytes`, `live_objects`; sampled `collection_end` additionally has `verify_true_count`, `verify_emitted_count`, `verify_checks` | Balanced logical collection boundaries. IDs start at zero and increase by one at the exact major/minor metric increment. Marking-to-compaction remains one major collection. Boundary counts describe the replay mirror. The sampled verification ledgers have the exact meaning specified above. |
 | `move_begin` / `move_end` | `transaction_id`, `parent_transaction_id`, `depth`, `cause`, `collection_id`, `live_bytes`, `live_objects` | Balanced, nestable death-accounting/movement transactions. Transaction IDs start at zero. Parent is null at depth one. |
 
 `collection_kind` is `major` or `minor`. Movement `cause` is one of
@@ -246,7 +317,7 @@ movement. Renderers must not infer identity from a base slot alone.
 `stats.json` is one JSON object with keys in this order:
 
 ```json
-{"live_bytes_final":0,"forwarded_reference_count":0,"forwarded_reference_totals":{"heap":0,"root":0,"registry":0},"pause_slices":0,"collection_count":0,"event_totals":{"alloc":0,"mark_slice":0,"relocate":0,"promote":0,"die":0,"intern":0,"evict":0,"trap":0,"verify_step":0},"snapshot_interval":4096,"ticks":0,"peak_live_bytes":0}
+{"live_bytes_final":0,"forwarded_reference_count":0,"forwarded_reference_totals":{"heap":0,"root":0,"registry":0},"pause_slices":0,"collection_count":0,"event_totals":{"alloc":0,"mark_slice":0,"relocate":0,"promote":0,"die":0,"intern":0,"evict":0,"trap":0,"verify_step":0},"verify_events":{"mode":"full","head_window":40,"stride":16,"retention_rule":"all","true_count":0,"emitted_count":0,"unscoped_true_count":0,"unscoped_emitted_count":0},"snapshot_interval":4096,"ticks":0,"peak_live_bytes":0}
 ```
 
 - `live_bytes_final`: sum of final live descriptor widths multiplied by 8.
@@ -266,6 +337,18 @@ movement. Renderers must not infer identity from a base slot alone.
 - `event_totals`: exact emitted count for the original nine required runtime kinds
   (`alloc` through `verify_step`), including zeros. Replay-only `update` and `gc` counts
   are deliberately derived from `events.jsonl` rather than duplicated here.
+  `event_totals.verify_step` is the emitted count, not the pre-sampling true count.
+- `verify_events`: exact verification-emission contract and its independent ledgers, with
+  keys in this order: `mode`, `head_window`, `stride`, `retention_rule`, `true_count`,
+  `emitted_count`, `unscoped_true_count`, and `unscoped_emitted_count`. `mode` is `full`
+  or `sampled`; `head_window` is 40; `stride` is 16; and `retention_rule` is `all` for
+  full mode or the exact sampled descriptor above. `true_count` counts every runtime
+  verification callback before sampling, while `emitted_count` counts serialized
+  `verify_step` events and equals `event_totals.verify_step`. The unscoped fields are the
+  corresponding true and emitted counts for callbacks outside logical collections. In
+  full mode both emitted ledgers equal their true counterparts. In sampled mode true
+  counts are greater than or equal to emitted counts, and the collection ledgers plus
+  unscoped ledgers reconcile to the global totals.
 - `snapshot_interval`: positive event cadence used to prove that no periodic seek point
   was deleted.
 - `ticks`: final VM retired-instruction count.
@@ -287,9 +370,10 @@ ascending pc order and are copied directly from the ADR-0021 tables.
 
 ## Determinism guarantee
 
-For an equal verified program, equal named stress schedule, equal snapshot interval, and
-equal runtime version, all four trace files are byte-identical. Ordering is derived only
-from VM retired instructions, event sequence, heap base slots, descriptor visitors,
-ordered collector registries, writer-local collection/transaction IDs, and module pc
-order. The emitter never reads a wall clock, host pointer, random device, thread schedule,
-or unordered container.
+For an equal verified program, equal named stress schedule, equal snapshot interval,
+equal verification-event mode, and equal runtime version, all four trace files are
+byte-identical. Ordering is derived only from VM retired instructions, event sequence,
+heap base slots, descriptor visitors, ordered collector registries, writer-local
+collection/transaction IDs, verification callback ordinals, and module pc order. The
+emitter never reads a wall clock, host pointer, random device, thread schedule, or
+unordered container.

@@ -37,6 +37,12 @@ constexpr std::array<std::string_view, 9> kRequiredEventKinds{
     "intern", "evict", "trap", "verify_step",
 };
 
+constexpr std::uint64_t kVerifyHeadWindow = 40;
+constexpr std::uint64_t kVerifyStride = 16;
+constexpr std::string_view kSampledVerifyRetentionRule =
+    "head40_or_collection_first_last_first_check_stride16;"
+    "unscoped_head40_or_stride16";
+
 void write_json_string(std::ostream& output, std::string_view value) {
     static constexpr char kHex[] = "0123456789abcdef";
     output.put('"');
@@ -179,6 +185,11 @@ struct JsonlTraceWriter::Impl {
     struct ActiveCollection {
         std::uint64_t id{0};
         TraceCollectionKind kind{TraceCollectionKind::Major};
+        std::uint64_t verify_true_count{0};
+        std::uint64_t verify_emitted_count{0};
+        std::map<std::string, std::uint64_t> verify_check_counts;
+        std::vector<std::string> verify_checks;
+        bool verify_terminal_seen{false};
     };
 
     struct ActiveMove {
@@ -186,11 +197,18 @@ struct JsonlTraceWriter::Impl {
         TraceMoveCause cause{TraceMoveCause::AtomicMajor};
     };
 
-    explicit Impl(std::filesystem::path directory, std::size_t interval)
-        : output_directory(std::move(directory)), snapshot_interval(interval) {
+    explicit Impl(std::filesystem::path directory, std::size_t interval,
+                  VerifyEventMode mode)
+        : output_directory(std::move(directory)), snapshot_interval(interval),
+          verify_mode(mode) {
         if (snapshot_interval == 0) {
             throw std::invalid_argument(
                 "trace snapshot interval must be positive");
+        }
+        if (verify_mode != VerifyEventMode::Full &&
+            verify_mode != VerifyEventMode::Sampled) {
+            throw std::invalid_argument(
+                "trace verify event mode must be full or sampled");
         }
         std::filesystem::create_directories(output_directory);
         events.open(output_directory / "events.jsonl",
@@ -471,7 +489,23 @@ struct JsonlTraceWriter::Impl {
                 event_totals.find(std::string(kRequiredEventKinds[i]));
             stats << (found == event_totals.end() ? 0 : found->second);
         }
-        stats << "},\"snapshot_interval\":" << snapshot_interval
+        stats << "},\"verify_events\":{\"mode\":";
+        write_json_string(
+            stats, verify_mode == VerifyEventMode::Full ? "full" : "sampled");
+        stats << ",\"head_window\":" << kVerifyHeadWindow
+              << ",\"stride\":" << kVerifyStride
+              << ",\"retention_rule\":";
+        write_json_string(
+            stats, verify_mode == VerifyEventMode::Full
+                       ? std::string_view{"all"}
+                       : kSampledVerifyRetentionRule);
+        stats << ",\"true_count\":" << verify_true_count
+              << ",\"emitted_count\":" << verify_emitted_count
+              << ",\"unscoped_true_count\":"
+              << unscoped_verify_true_count
+              << ",\"unscoped_emitted_count\":"
+              << unscoped_verify_emitted_count
+              << "},\"snapshot_interval\":" << snapshot_interval
               << ",\"ticks\":" << retired_ticks
               << ",\"peak_live_bytes\":" << peak_live_bytes << "}\n";
         if (!stats) {
@@ -481,6 +515,7 @@ struct JsonlTraceWriter::Impl {
 
     std::filesystem::path output_directory;
     std::size_t snapshot_interval{4096};
+    VerifyEventMode verify_mode{VerifyEventMode::Full};
     std::ofstream events;
     std::ofstream snapshots;
     std::uint64_t tick{0};
@@ -501,13 +536,18 @@ struct JsonlTraceWriter::Impl {
     std::uint64_t next_collection_id{0};
     std::uint64_t next_transaction_id{0};
     std::uint64_t collection_count_baseline{0};
+    std::uint64_t verify_true_count{0};
+    std::uint64_t verify_emitted_count{0};
+    std::uint64_t unscoped_verify_true_count{0};
+    std::uint64_t unscoped_verify_emitted_count{0};
+    std::map<std::string, std::uint64_t> unscoped_verify_check_counts;
 };
 
 JsonlTraceWriter::JsonlTraceWriter(
     std::filesystem::path output_directory,
-    std::size_t snapshot_interval)
+    std::size_t snapshot_interval, VerifyEventMode verify_mode)
     : impl_(std::make_unique<Impl>(std::move(output_directory),
-                                   snapshot_interval)) {}
+                                   snapshot_interval, verify_mode)) {}
 
 JsonlTraceWriter::~JsonlTraceWriter() = default;
 JsonlTraceWriter::JsonlTraceWriter(JsonlTraceWriter&&) noexcept = default;
@@ -662,14 +702,128 @@ void JsonlTraceWriter::on_trap(const gc::Heap& heap,
 
 void JsonlTraceWriter::on_verify_step(
     const gc::Heap& heap, std::string_view check,
-    std::optional<std::uint64_t> elements_examined) {
+    std::optional<std::uint64_t> elements_examined,
+    TraceVerifyBoundary boundary) {
+    if (boundary != TraceVerifyBoundary::None &&
+        boundary != TraceVerifyBoundary::CollectionEnd) {
+        throw std::logic_error("trace verify step has an unknown boundary");
+    }
+
+    const bool terminal =
+        boundary == TraceVerifyBoundary::CollectionEnd;
+    if (terminal && !impl_->active_collection.has_value()) {
+        throw std::logic_error(
+            "trace terminal verify step occurred outside a collection");
+    }
+    if (impl_->active_collection.has_value() &&
+        impl_->active_collection->verify_terminal_seen) {
+        if (terminal) {
+            throw std::logic_error(
+                "trace collection received a duplicate terminal verify step");
+        }
+        throw std::logic_error(
+            "trace collection received a verify step after its terminal");
+    }
+
+    const auto verify_index = impl_->verify_true_count;
+    const bool collection_scoped =
+        impl_->active_collection.has_value();
+    const std::string check_name(check);
+    std::uint64_t scope_index = 0;
+    std::uint64_t check_index = 0;
+    if (collection_scoped) {
+        const auto& collection = *impl_->active_collection;
+        scope_index = collection.verify_true_count;
+        const auto found =
+            collection.verify_check_counts.find(check_name);
+        if (found != collection.verify_check_counts.end()) {
+            check_index = found->second;
+        }
+    } else {
+        scope_index = impl_->unscoped_verify_true_count;
+        const auto found =
+            impl_->unscoped_verify_check_counts.find(check_name);
+        if (found != impl_->unscoped_verify_check_counts.end()) {
+            check_index = found->second;
+        }
+    }
+
+    bool retain = true;
+    if (impl_->verify_mode == VerifyEventMode::Sampled) {
+        const bool in_head = verify_index < kVerifyHeadWindow;
+        if (collection_scoped) {
+            retain = in_head || scope_index == 0 || check_index == 0 ||
+                     scope_index % kVerifyStride == 0 || terminal;
+        } else {
+            retain = in_head || scope_index % kVerifyStride == 0;
+        }
+    }
+
+    if (impl_->move_transactions.empty()) {
+        impl_->reconcile_heap(heap, false);
+    }
+
+    ++impl_->verify_true_count;
+    std::optional<std::uint64_t> collection_id;
+    if (collection_scoped) {
+        auto& collection = *impl_->active_collection;
+        collection_id = collection.id;
+        ++collection.verify_true_count;
+        auto [occurrence, first_encounter] =
+            collection.verify_check_counts.try_emplace(check_name, 0);
+        if (first_encounter) {
+            collection.verify_checks.push_back(check_name);
+        }
+        ++occurrence->second;
+        if (terminal) {
+            collection.verify_terminal_seen = true;
+        }
+    } else {
+        ++impl_->unscoped_verify_true_count;
+        auto [occurrence, first_encounter] =
+            impl_->unscoped_verify_check_counts.try_emplace(check_name, 0);
+        (void)first_encounter;
+        ++occurrence->second;
+    }
+
+    if (!retain) {
+        return;
+    }
+
     EventFields fields;
     fields.size = elements_examined;
-    impl_->write_event(heap, "verify_step", fields,
-                       [check](std::ostream& output) {
-                           output << ",\"check\":";
-                           write_json_string(output, check);
-                       });
+    if (impl_->verify_mode == VerifyEventMode::Full) {
+        impl_->write_event_raw(
+            "verify_step", fields,
+            [check](std::ostream& output) {
+                output << ",\"check\":";
+                write_json_string(output, check);
+            });
+    } else {
+        impl_->write_event_raw(
+            "verify_step", fields,
+            [check, verify_index, collection_id, scope_index, check_index,
+             terminal](std::ostream& output) {
+                output << ",\"check\":";
+                write_json_string(output, check);
+                output << ",\"verify_index\":" << verify_index
+                       << ",\"collection_id\":";
+                if (collection_id.has_value()) {
+                    output << *collection_id;
+                } else {
+                    output << "null";
+                }
+                output << ",\"scope_index\":" << scope_index
+                       << ",\"check_index\":" << check_index
+                       << ",\"terminal\":" << (terminal ? 1 : 0);
+            });
+    }
+    ++impl_->verify_emitted_count;
+    if (collection_scoped) {
+        ++impl_->active_collection->verify_emitted_count;
+    } else {
+        ++impl_->unscoped_verify_emitted_count;
+    }
 }
 
 void JsonlTraceWriter::on_reference_forwarded(
@@ -758,8 +912,9 @@ void JsonlTraceWriter::on_logical_collection_begin(
             output << ",\"live_bytes\":" << bytes
                    << ",\"live_objects\":" << objects;
         });
-    impl_->active_collection =
-        Impl::ActiveCollection{collection_id, kind};
+    impl_->active_collection.emplace();
+    impl_->active_collection->id = collection_id;
+    impl_->active_collection->kind = kind;
     ++impl_->next_collection_id;
 }
 
@@ -773,6 +928,12 @@ void JsonlTraceWriter::on_logical_collection_end(
         throw std::logic_error(
             "trace logical collection ended inside a move transaction");
     }
+    if (impl_->verify_mode == VerifyEventMode::Sampled &&
+        impl_->active_collection->verify_true_count != 0 &&
+        !impl_->active_collection->verify_terminal_seen) {
+        throw std::logic_error(
+            "trace nonempty collection ended without a terminal verify step");
+    }
     impl_->reconcile_heap(heap, false);
     const auto collection = *impl_->active_collection;
     const auto kind_label = trace_collection_kind_label(collection.kind);
@@ -781,12 +942,29 @@ void JsonlTraceWriter::on_logical_collection_end(
     EventFields fields;
     impl_->write_event_raw(
         "gc", fields,
-        [collection, kind_label, bytes, objects](std::ostream& output) {
+        [collection, kind_label, bytes, objects,
+         verify_mode = impl_->verify_mode](std::ostream& output) {
             output << ",\"op\":\"collection_end\",\"collection_id\":"
                    << collection.id << ",\"collection_kind\":";
             write_json_string(output, kind_label);
             output << ",\"live_bytes\":" << bytes
                    << ",\"live_objects\":" << objects;
+            if (verify_mode == VerifyEventMode::Sampled) {
+                output << ",\"verify_true_count\":"
+                       << collection.verify_true_count
+                       << ",\"verify_emitted_count\":"
+                       << collection.verify_emitted_count
+                       << ",\"verify_checks\":[";
+                for (std::size_t index = 0;
+                     index < collection.verify_checks.size(); ++index) {
+                    if (index != 0) {
+                        output.put(',');
+                    }
+                    write_json_string(output,
+                                      collection.verify_checks[index]);
+                }
+                output.put(']');
+            }
         });
     impl_->active_collection.reset();
 }

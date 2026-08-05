@@ -20,11 +20,12 @@ struct Options {
     std::string schedule;
     std::filesystem::path output_directory;
     std::size_t snapshot_interval{4096};
+    lang::VerifyEventMode verify_events{lang::VerifyEventMode::Full};
 };
 
 void print_usage(std::ostream& output) {
     output << "usage: lang_trace <program.lang> --schedule <name> --out <dir> "
-              "[--snapshot-interval N]\n";
+              "[--snapshot-interval N] [--verify-events full|sampled]\n";
 }
 
 std::size_t parse_positive_size(const std::string& text) {
@@ -47,6 +48,7 @@ Options parse_options(int argc, char** argv) {
     bool saw_schedule = false;
     bool saw_output = false;
     bool saw_interval = false;
+    bool saw_verify_events = false;
     for (int index = 2; index < argc; ++index) {
         const std::string_view option = argv[index];
         if (index + 1 >= argc) {
@@ -63,6 +65,16 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--snapshot-interval" && !saw_interval) {
             options.snapshot_interval = parse_positive_size(value);
             saw_interval = true;
+        } else if (option == "--verify-events" && !saw_verify_events) {
+            if (value == "full") {
+                options.verify_events = lang::VerifyEventMode::Full;
+            } else if (value == "sampled") {
+                options.verify_events = lang::VerifyEventMode::Sampled;
+            } else {
+                throw std::invalid_argument(
+                    "unknown verify event mode '" + value + "'");
+            }
+            saw_verify_events = true;
         } else {
             throw std::invalid_argument(
                 "unknown or repeated option " + std::string(option));
@@ -216,7 +228,8 @@ int main(int argc, char** argv) {
                         options.output_directory / "positions.json");
 
         lang::JsonlTraceWriter writer(options.output_directory,
-                                      options.snapshot_interval);
+                                      options.snapshot_interval,
+                                      options.verify_events);
         lang::VM vm(&writer);
         vm.set_gc_stress(std::move(stress));
 

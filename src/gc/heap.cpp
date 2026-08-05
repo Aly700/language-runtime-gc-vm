@@ -3943,7 +3943,8 @@ void Heap::finalize_incremental_compaction(
     incremental_compaction_shadow_intern_table_.clear();
     incremental_compaction_shadow_ephemerons_.clear();
     ++metrics_.incremental_compaction_final_pauses;
-    validate_after_collection(roots, extra_roots);
+    validate_after_collection(
+        roots, extra_roots, TraceVerifyBoundary::CollectionEnd);
     if (trace_sink_ != nullptr) {
         trace_sink_->on_heap_sample(*this);
         trace_sink_->on_logical_collection_end(*this);
@@ -3983,7 +3984,8 @@ void Heap::finish_incremental_marking_impl(RootProvider* roots,
     if (trace_sink_ != nullptr) {
         trace_sink_->on_move_end(*this);
     }
-    validate_after_collection(roots, extra_roots);
+    validate_after_collection(
+        roots, extra_roots, TraceVerifyBoundary::CollectionEnd);
     if (trace_sink_ != nullptr) {
         trace_sink_->on_heap_sample(*this);
         trace_sink_->on_logical_collection_end(*this);
@@ -4161,7 +4163,8 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     if (trace_sink_ != nullptr) {
         trace_sink_->on_move_end(*this);
     }
-    validate_after_collection(roots, extra_roots);
+    validate_after_collection(
+        roots, extra_roots, TraceVerifyBoundary::CollectionEnd);
     if (trace_sink_ != nullptr) {
         trace_sink_->on_heap_sample(*this);
         trace_sink_->on_logical_collection_end(*this);
@@ -4641,7 +4644,9 @@ void Heap::validate_heap_storage_layout() const {
     }
 }
 
-void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const {
+void Heap::validate_after_collection(
+    RootProvider* roots, std::span<Value*> extra_roots,
+    TraceVerifyBoundary boundary) const {
     ++TEST_ONLY_validation_count_;
 
     validate_heap_storage_layout();
@@ -4666,7 +4671,7 @@ void Heap::validate_after_collection(RootProvider* roots, std::span<Value*> extr
     validate_ephemerons();
     if (trace_sink_ != nullptr) {
         trace_sink_->on_verify_step(
-            *this, "validate_after_collection", std::nullopt);
+            *this, "validate_after_collection", std::nullopt, boundary);
     }
 }
 

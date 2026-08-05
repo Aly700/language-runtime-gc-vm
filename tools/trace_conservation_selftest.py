@@ -498,6 +498,93 @@ def _impossible_builder_width(bundle: checker.TraceBundle) -> None:
     raise SelfTestFailure("real trace has no Builder allocation to corrupt")
 
 
+def _sampled_verify_stats(bundle: checker.TraceBundle) -> dict[str, object]:
+    verify_events = bundle.stats.get("verify_events")
+    if (
+        not isinstance(verify_events, dict)
+        or verify_events.get("mode") != "sampled"
+    ):
+        raise SelfTestFailure("real trace does not use sampled verify events")
+    return verify_events
+
+
+def _delete_sampled_retained_head(bundle: checker.TraceBundle) -> None:
+    verify_events = _sampled_verify_stats(bundle)
+    for index, event in enumerate(bundle.events):
+        if event.get("kind") != "verify_step" or event.get("verify_index") != 0:
+            continue
+
+        scope_ledger = verify_events
+        scope_field = "unscoped_emitted_count"
+        collection_id = event.get("collection_id")
+        if collection_id is not None:
+            for collection_end in bundle.events:
+                if (
+                    collection_end.get("kind") == "gc"
+                    and collection_end.get("op") == "collection_end"
+                    and collection_end.get("collection_id") == collection_id
+                ):
+                    scope_ledger = collection_end
+                    scope_field = "verify_emitted_count"
+                    break
+            else:
+                raise SelfTestFailure(
+                    "sampled retained head has no matching collection_end ledger"
+                )
+
+        ledgers = (
+            (verify_events, "emitted_count"),
+            (scope_ledger, scope_field),
+        )
+        for ledger, field in ledgers:
+            count = ledger.get(field)
+            if type(count) is not int or count <= 0:
+                raise SelfTestFailure(
+                    f"sampled retained head has no positive {field} ledger"
+                )
+
+        _delete_event_and_repair_surface(bundle, index)
+        for ledger, field in ledgers:
+            ledger[field] -= 1
+        return
+    raise SelfTestFailure("real sampled trace has no retained verify head to delete")
+
+
+def _declare_sampled_stream_full(bundle: checker.TraceBundle) -> None:
+    verify_events = _sampled_verify_stats(bundle)
+    verify_events["mode"] = "full"
+    verify_events["retention_rule"] = "all"
+
+
+def _tamper_sampled_true_total(bundle: checker.TraceBundle) -> None:
+    verify_events = _sampled_verify_stats(bundle)
+    true_count = verify_events.get("true_count")
+    if type(true_count) is not int:
+        raise SelfTestFailure("real sampled trace has no true verify total to corrupt")
+    verify_events["true_count"] = true_count + 1
+
+
+def _tamper_sampled_head_check_index(bundle: checker.TraceBundle) -> None:
+    _sampled_verify_stats(bundle)
+    for event in bundle.events:
+        if event.get("kind") != "verify_step" or event.get("verify_index") != 0:
+            continue
+        check_index = event.get("check_index")
+        if type(check_index) is not int:
+            raise SelfTestFailure("sampled retained head has no check index")
+        event["check_index"] = check_index + 1
+        return
+    raise SelfTestFailure("real sampled trace has no first retained verify event")
+
+
+def _tamper_sampled_unscoped_total_to_uint64_max(
+    bundle: checker.TraceBundle,
+) -> None:
+    verify_events = _sampled_verify_stats(bundle)
+    verify_events["true_count"] = checker.UINT64_MAX
+    verify_events["unscoped_true_count"] = checker.UINT64_MAX
+
+
 CORRUPTIONS: tuple[tuple[str, str, Mutation], ...] = (
     ("drop_relocation", "MOVEMENT_CONSERVATION", _drop_relocation),
     ("drop_paired_relocation", "MOVEMENT_CONSERVATION", _drop_paired_relocation),
@@ -538,6 +625,23 @@ CORRUPTIONS: tuple[tuple[str, str, Mutation], ...] = (
     ("diagnostic_injection", "SCHEMA", _inject_diagnostic_label),
     ("contextless_forward", "LIFECYCLE", _insert_contextless_forward),
     ("impossible_builder_width", "SCHEMA", _impossible_builder_width),
+    (
+        "sampled_retained_head_deletion",
+        "VERIFY_SAMPLING",
+        _delete_sampled_retained_head,
+    ),
+    ("sampled_stream_declared_full", "VERIFY_SAMPLING", _declare_sampled_stream_full),
+    ("sampled_true_total", "VERIFY_SAMPLING", _tamper_sampled_true_total),
+    (
+        "sampled_head_check_index",
+        "VERIFY_SAMPLING",
+        _tamper_sampled_head_check_index,
+    ),
+    (
+        "sampled_uint64_max_unscoped_total",
+        "VERIFY_SAMPLING",
+        _tamper_sampled_unscoped_total_to_uint64_max,
+    ),
 )
 
 

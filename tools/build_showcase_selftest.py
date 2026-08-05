@@ -276,6 +276,81 @@ def watchability_predicates_reject_dull_real_event_subsets() -> None:
     )
 
 
+def verify_event_policy_is_explicit_and_manifested() -> None:
+    expected_modes = {
+        "tree_churn": "sampled",
+        "intern_pressure": "sampled",
+        "ephemeron_lifecycle": "full",
+    }
+    require(
+        {demo.id: demo.verify_events for demo in showcase.DEMOS} == expected_modes,
+        "showcase verify-event policy drifted",
+    )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "SCHEMA.md").write_bytes(b"schema marker\n")
+        for demo in showcase.DEMOS:
+            trace_directory = root / "traces" / demo.id
+            trace_directory.mkdir(parents=True)
+            for name in showcase.BUNDLE_FILES:
+                (trace_directory / name).write_bytes(f"{demo.id}:{name}\n".encode())
+
+            command = showcase._lang_trace_command(
+                Path("/lang_trace"),
+                trace_directory / "program.lang",
+                trace_directory,
+                demo,
+            )
+            require(
+                command.count("--verify-events") == 1,
+                f"{demo.id}: lang_trace command did not set verify events exactly once",
+            )
+            option = command.index("--verify-events")
+            require(
+                command[option + 1] == expected_modes[demo.id],
+                f"{demo.id}: lang_trace command used the wrong verify-event mode",
+            )
+            (trace_directory / "stats.json").write_text(
+                json.dumps({"verify_events": {"mode": expected_modes[demo.id]}}),
+                encoding="utf-8",
+            )
+            showcase._assert_verify_event_mode(trace_directory, demo)
+
+        mismatched_demo = showcase.DEMOS[0]
+        mismatched_directory = root / "traces" / mismatched_demo.id
+        (mismatched_directory / "stats.json").write_text(
+            json.dumps({"verify_events": {"mode": "full"}}),
+            encoding="utf-8",
+        )
+        expect_showcase_error(
+            lambda: showcase._assert_verify_event_mode(
+                mismatched_directory, mismatched_demo
+            ),
+            "verify-events mode mismatch",
+        )
+
+        showcase._write_manifest(root)
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        require(
+            manifest["note"] == showcase.MANIFEST_NOTE,
+            "manifest contains stale or ambiguous emitter provenance",
+        )
+        require(
+            all(artifact["label"] == "measured" for artifact in manifest["artifacts"]),
+            "manifest contains an artifact not labeled measured",
+        )
+        bundle_modes = {
+            artifact["id"]: artifact.get("verify_events")
+            for artifact in manifest["artifacts"]
+            if artifact["type"] == "trace-bundle"
+        }
+        require(
+            bundle_modes == expected_modes,
+            "manifest verify-event policy does not match the emitter policy",
+        )
+
+
 def main() -> int:
     tests = (
         protected_repository_paths_are_rejected,
@@ -288,6 +363,7 @@ def main() -> int:
         captured_output_is_revalidated_before_replacement,
         reappearing_output_preserves_previous_backup,
         watchability_predicates_reject_dull_real_event_subsets,
+        verify_event_policy_is_explicit_and_manifested,
     )
     for test in tests:
         test()

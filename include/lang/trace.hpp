@@ -60,6 +60,16 @@ enum class TraceForwardKind : std::uint8_t {
     Registry,
 };
 
+enum class VerifyEventMode : std::uint8_t {
+    Full,
+    Sampled,
+};
+
+enum class TraceVerifyBoundary : std::uint8_t {
+    None,
+    CollectionEnd,
+};
+
 // TraceSink is a one-way observer. Runtime code never reads a value back from a
 // sink, and a null sink leaves every existing collector path untouched.
 class TraceSink {
@@ -102,7 +112,8 @@ public:
     virtual void on_trap(const gc::Heap& heap, std::string_view reason) = 0;
     virtual void on_verify_step(
         const gc::Heap& heap, std::string_view check,
-        std::optional<std::uint64_t> elements_examined) = 0;
+        std::optional<std::uint64_t> elements_examined,
+        TraceVerifyBoundary boundary = TraceVerifyBoundary::None) = 0;
 
     // GC evidence is observer-only. It is serialized for independent replay
     // and never feeds back into runtime decisions.
@@ -124,7 +135,8 @@ class JsonlTraceWriter final : public TraceSink {
 public:
     explicit JsonlTraceWriter(
         std::filesystem::path output_directory,
-        std::size_t snapshot_interval = 4096);
+        std::size_t snapshot_interval = 4096,
+        VerifyEventMode verify_mode = VerifyEventMode::Full);
     ~JsonlTraceWriter() override;
 
     JsonlTraceWriter(const JsonlTraceWriter&) = delete;
@@ -164,7 +176,8 @@ public:
     void on_trap(const gc::Heap& heap, std::string_view reason) override;
     void on_verify_step(
         const gc::Heap& heap, std::string_view check,
-        std::optional<std::uint64_t> elements_examined) override;
+        std::optional<std::uint64_t> elements_examined,
+        TraceVerifyBoundary boundary = TraceVerifyBoundary::None) override;
     void on_reference_forwarded(ObjectId source_id,
                                 ObjectId destination_id,
                                 TraceForwardKind kind,
