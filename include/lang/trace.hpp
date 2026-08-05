@@ -33,6 +33,33 @@ struct TraceHeapObject {
     std::vector<ObjectId> references;
 };
 
+enum class TraceCollectionKind : std::uint8_t {
+    Major,
+    Minor,
+};
+
+enum class TraceMoveCause : std::uint8_t {
+    AtomicMajor,
+    AtomicMinor,
+    IncrementalDeathAccounting,
+    IncrementalCompactionStep,
+    IncrementalCompactionFinalize,
+    IncrementalMarkCompact,
+    MapGrowth,
+    BuilderGrowth,
+};
+
+enum class TraceMoveKind : std::uint8_t {
+    Compaction,
+    Growth,
+};
+
+enum class TraceForwardKind : std::uint8_t {
+    Heap,
+    Root,
+    Registry,
+};
+
 // TraceSink is a one-way observer. Runtime code never reads a value back from a
 // sink, and a null sink leaves every existing collector path untouched.
 class TraceSink {
@@ -57,7 +84,8 @@ public:
                              std::uint8_t source_generation,
                              std::uint64_t from_slot,
                              std::uint64_t to_slot,
-                             ObjectId destination_id) = 0;
+                             ObjectId destination_id,
+                             TraceMoveKind move_kind) = 0;
     virtual void on_promote(const gc::Heap& heap, ObjectId source_id,
                             std::uint64_t size, std::uint64_t from_slot,
                             std::uint64_t to_slot,
@@ -76,13 +104,20 @@ public:
         const gc::Heap& heap, std::string_view check,
         std::optional<std::uint64_t> elements_examined) = 0;
 
-    // Counter-only observations used by stats.json. They do not create JSONL
-    // events and never feed back into runtime decisions.
-    virtual void on_reference_forwarded() = 0;
+    // GC evidence is observer-only. It is serialized for independent replay
+    // and never feeds back into runtime decisions.
+    virtual void on_reference_forwarded(ObjectId source_id,
+                                        ObjectId destination_id,
+                                        TraceForwardKind kind,
+                                        std::optional<ObjectId> owner_id) = 0;
     virtual void on_pause_slice() = 0;
     virtual void on_heap_sample(const gc::Heap& heap) = 0;
-    virtual void on_collection_begin(const gc::Heap& heap) = 0;
-    virtual void on_collection_end(const gc::Heap& heap) = 0;
+    virtual void on_logical_collection_begin(
+        const gc::Heap& heap, TraceCollectionKind kind) = 0;
+    virtual void on_logical_collection_end(const gc::Heap& heap) = 0;
+    virtual void on_move_begin(const gc::Heap& heap,
+                               TraceMoveCause cause) = 0;
+    virtual void on_move_end(const gc::Heap& heap) = 0;
 };
 
 class JsonlTraceWriter final : public TraceSink {
@@ -112,7 +147,8 @@ public:
     void on_relocate(const gc::Heap& heap, ObjectId source_id,
                      std::uint64_t size, std::uint8_t source_generation,
                      std::uint64_t from_slot, std::uint64_t to_slot,
-                     ObjectId destination_id) override;
+                     ObjectId destination_id,
+                     TraceMoveKind move_kind) override;
     void on_promote(const gc::Heap& heap, ObjectId source_id,
                     std::uint64_t size, std::uint64_t from_slot,
                     std::uint64_t to_slot,
@@ -129,11 +165,18 @@ public:
     void on_verify_step(
         const gc::Heap& heap, std::string_view check,
         std::optional<std::uint64_t> elements_examined) override;
-    void on_reference_forwarded() override;
+    void on_reference_forwarded(ObjectId source_id,
+                                ObjectId destination_id,
+                                TraceForwardKind kind,
+                                std::optional<ObjectId> owner_id) override;
     void on_pause_slice() override;
     void on_heap_sample(const gc::Heap& heap) override;
-    void on_collection_begin(const gc::Heap& heap) override;
-    void on_collection_end(const gc::Heap& heap) override;
+    void on_logical_collection_begin(
+        const gc::Heap& heap, TraceCollectionKind kind) override;
+    void on_logical_collection_end(const gc::Heap& heap) override;
+    void on_move_begin(const gc::Heap& heap,
+                       TraceMoveCause cause) override;
+    void on_move_end(const gc::Heap& heap) override;
 
 private:
     struct Impl;

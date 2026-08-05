@@ -1,0 +1,15 @@
+fn make() -> pair<ephemeron<pair<i64, i64>, pair<i64, i64>>, pair<i64, i64>> {
+  let key: pair<i64, i64> = pair(1, 2);
+  let value: pair<i64, i64> = pair(3, 4);
+  let entry: ephemeron<pair<i64, i64>, pair<i64, i64>> = ephemeron(key, value);
+  pair(entry, value)
+}
+
+let kept: pair<ephemeron<pair<i64, i64>, pair<i64, i64>>, pair<i64, i64>> = make();
+let index: i64 = 0;
+let noise: pair<i64, i64> = pair(0, 0);
+while index < 4 {
+  noise = pair(index, index);
+  index = index + 1;
+}
+kept

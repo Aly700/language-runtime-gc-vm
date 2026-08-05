@@ -1,0 +1,22 @@
+let p00: pair<i64, i64> = pair(0, 0);
+let p01: pair<i64, i64> = pair(1, 1);
+let p02: pair<i64, i64> = pair(2, 2);
+let p03: pair<i64, i64> = pair(3, 3);
+let p04: pair<i64, i64> = pair(4, 4);
+let p05: pair<i64, i64> = pair(5, 5);
+let p06: pair<i64, i64> = pair(6, 6);
+let p07: pair<i64, i64> = pair(7, 7);
+let p08: pair<i64, i64> = pair(8, 8);
+let p09: pair<i64, i64> = pair(9, 9);
+let p10: pair<i64, i64> = pair(10, 10);
+let p11: pair<i64, i64> = pair(11, 11);
+let p12: pair<i64, i64> = pair(12, 12);
+let p13: pair<i64, i64> = pair(13, 13);
+let p14: pair<i64, i64> = pair(14, 14);
+let p15: pair<i64, i64> = pair(15, 15);
+let buffer: builder = builder();
+let holder: pair<builder, builder> = pair(buffer, buffer);
+let other: builder = builder();
+buffer.append("0123456789abcdef");
+holder.left = other;
+pair(holder, p00)

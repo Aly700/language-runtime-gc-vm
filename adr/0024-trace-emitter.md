@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted for showcase instrumentation milestone T1.
+Accepted for showcase instrumentation milestone T1; replay-evidence amendment accepted
+for milestone T2.
 
 ## Context
 
@@ -51,8 +52,46 @@ passes no `HeapMetrics` accumulator to descriptor validation and canonicalizes o
 host trace data. WeakRef and Ephemeron fields are copied from their collector-owned slots
 without marking them. To place a periodic snapshot between logical collection events
 before the production heap is installed, the JSONL writer owns a private mirror seeded
-and resynchronized by that walk. The mirror is not accessible to the heap and cannot
+and reconciled against that walk. Reconciliation emits explicit `update` evidence rather
+than silently importing graph state. The mirror is not accessible to the heap and cannot
 affect liveness.
+
+T2's strict replay found that private mirror resynchronization alone could conceal a
+mutator field write or Map/Builder width change between periodic snapshots. The writer
+therefore diffs each authorized heap sample against its mirror and emits a complete
+post-state `update` for every changed object in ascending base-slot order. Identity,
+kind, and generation drift remain lifecycle errors; they cannot be imported by an
+update. Pair, RefArray, Map, Record, Ephemeron, and Builder mutation funnels sample after
+publish and before any stress-triggered collection.
+
+The pause and unequal-ID forwarding observations now emit graph-neutral `gc` events as
+well as incrementing stats. Forward events carry the direct full-ID source/destination
+mapping plus the live owner for snapshot-visible heap fields, and classify those fields,
+precise/mutator-local roots, and collector registries. Replay can therefore require exact
+per-owner/per-mapping visible-edge forwarding, while allowing only explicit owner death
+or weak/ephemeron clearing to cancel an unperformed visible rewrite, without treating
+opaque registries as heap edges. Logical collection begin/end events align with the actual
+major/minor metric increments, while separately numbered movement transactions bracket
+atomic movement, incremental death accounting/steps/finalization, and Map/Builder growth
+relocation. These observations remain one-way: no runtime path reads their IDs, labels,
+counters, or serialized state.
+
+`stats.json` records the positive snapshot interval so a checker can prove seek-point
+cadence rather than only validating lines that remain. Its collection count is the
+major-plus-minor metric delta from `on_program_start` to exit, which keeps trace evidence
+run-scoped even when an embedder attaches a writer to a previously used heap. Forwarded
+reference totals are also partitioned by heap/root/registry classification, providing a
+second deterministic ledger for the event classification.
+
+These ledgers establish deterministic internal consistency, not cryptographic
+provenance. Authenticating a bundle against a party able to rewrite every file requires
+an externally trusted signature or digest and is deliberately separate from the runtime
+observer contract.
+
+T2 derives exact forwarding obligations for snapshot-visible heap fields. Root and
+registry observations are opaque evidence: replay validates their direct movement
+mapping and classification totals, but does not reconstruct VM root locations or
+collector-registry membership, which are outside the snapshot graph contract.
 
 The JSON writer uses only ordered vectors/maps and fixed field order. `tick` is the VM
 counter, `seq` is a writer-local monotonic index, object IDs are the existing complete
@@ -77,6 +116,9 @@ This decision preserves the following existing contracts:
   absent from `trace_roots`.
 - **Output determinism:** the writer receives no output reference; `lang_trace` copies
   the VM's existing byte channel to stdout only after execution.
+- **Replay accountability:** every snapshot-visible graph field changes through `alloc`,
+  `die`, `relocate`, `promote`, or `update`; every stats pause, forwarding rewrite, and
+  logical collection increment has one countable `gc` event.
 
 The only enabled-run failure newly possible is a host trace-output error (for example a
 full disk). That error is an embedder I/O failure, not a collector decision. With a valid
@@ -100,12 +142,20 @@ The final proof is the untouched legacy gate: every pre-existing correctness tes
 pinned corpus/hash assertions run with the tracing code linked but the default null sink.
 They must remain green without changing an existing test source or pin.
 
+T2 adds a stdlib-only continuous replay checker. It verifies every snapshot without
+rebasing, proves byte/object conservation at every numbered movement transaction,
+resolves all references at movement and logical-collection completion, and cross-checks
+stats against serialized evidence. A separate self-test mutates real generated bundles
+in temporary directories and requires classified rejection of every corruption.
+
 ## Consequences
 
 - Embedders pay no trace allocation or serialization cost unless they install a sink.
 - Enabled tracing may allocate host memory and perform synchronous host file I/O, but it
   allocates nothing in the language heap.
 - Object identity in a trace is a movement chain, not a permanent numeric ID.
+- Enabled traces include explicit object-state and GC-control evidence. This increases
+  event volume but makes collection statistics and snapshots independently replayable.
 - Exact schema and replay rules live in `SCHEMA.md` and can evolve additively after T1.
 
 ## Rejected alternatives

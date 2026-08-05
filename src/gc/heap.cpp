@@ -1064,7 +1064,10 @@ public:
     ForwardingVisitor(const Heap& heap, const ForwardingTable& forwarding)
         : heap_(heap), forwarding_(forwarding) {}
 
-    void visit(Value& root) override { heap_.rewrite_value(root, forwarding_); }
+    void visit(Value& root) override {
+        heap_.rewrite_value(root, forwarding_, TraceForwardKind::Root,
+                            std::nullopt);
+    }
 
 private:
     const Heap& heap_;
@@ -1077,7 +1080,9 @@ public:
         : heap_(heap), require_forwarded_(require_forwarded) {}
 
     void visit(Value& root) override {
-        heap_.rewrite_incremental_compaction_value(root, require_forwarded_);
+        heap_.rewrite_incremental_compaction_value(
+            root, require_forwarded_, TraceForwardKind::Root,
+            std::nullopt);
     }
 
 private:
@@ -2398,10 +2403,11 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     forwarding[old_slot] = new_id;
 
     if (trace_sink_ != nullptr) {
+        trace_sink_->on_move_begin(*this, TraceMoveCause::MapGrowth);
         trace_sink_->on_relocate(
             *this, old_id, storage_slot_count(*objects_[old_slot]),
             trace_generation(objects_[old_slot]->generation), old_slot,
-            new_slot, new_id);
+            new_slot, new_id, TraceMoveKind::Growth);
     }
 
     auto moved = *objects_[old_slot];
@@ -2425,7 +2431,9 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
             }
             const auto destination = *forwarding[grey_slot];
             if (trace_sink_ != nullptr && destination != grey) {
-                trace_sink_->on_reference_forwarded();
+                trace_sink_->on_reference_forwarded(
+                    grey, destination, TraceForwardKind::Registry,
+                    std::nullopt);
             }
             grey = destination;
         }
@@ -2446,6 +2454,9 @@ void Heap::relocate_map_for_growth(Value& owner, Value& key, Value& value,
     validate_weak_targets();
     validate_intern_table();
     validate_ephemerons();
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_move_end(*this);
+    }
 }
 
 void Heap::store_map_entry(ObjectId id, Value key, Value value) {
@@ -2531,6 +2542,9 @@ void Heap::store_map_entry(ObjectId id, Value key, Value value) {
                 : value;
     }
 
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_heap_sample(*this);
+    }
     if (barrier_triggered &&
         stress_config_.collect_minor_after_every_write_barrier) {
         std::array<Value*, 3> mutation_roots{&owner, &key, &value};
@@ -2538,9 +2552,6 @@ void Heap::store_map_entry(ObjectId id, Value key, Value value) {
     } else {
         validate_heap_storage_layout();
         validate_remembered_set();
-    }
-    if (trace_sink_ != nullptr) {
-        trace_sink_->on_heap_sample(*this);
     }
 }
 
@@ -2573,6 +2584,9 @@ void Heap::store_pair_field(ObjectId id, PairField field, Value value) {
         }
     }
 
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_heap_sample(*this);
+    }
     if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
         collect_minor();
     }
@@ -2653,10 +2667,11 @@ void Heap::relocate_builder_for_growth(Value& owner, Value& source,
     forwarding[old_slot] = new_id;
 
     if (trace_sink_ != nullptr) {
+        trace_sink_->on_move_begin(*this, TraceMoveCause::BuilderGrowth);
         trace_sink_->on_relocate(
             *this, old_id, storage_slot_count(*objects_[old_slot]),
             trace_generation(objects_[old_slot]->generation), old_slot,
-            new_slot, new_id);
+            new_slot, new_id, TraceMoveKind::Growth);
     }
 
     auto moved = *objects_[old_slot];
@@ -2681,7 +2696,9 @@ void Heap::relocate_builder_for_growth(Value& owner, Value& source,
             }
             const auto destination = *forwarding[grey_slot];
             if (trace_sink_ != nullptr && destination != grey) {
-                trace_sink_->on_reference_forwarded();
+                trace_sink_->on_reference_forwarded(
+                    grey, destination, TraceForwardKind::Registry,
+                    std::nullopt);
             }
             grey = destination;
         }
@@ -2703,6 +2720,9 @@ void Heap::relocate_builder_for_growth(Value& owner, Value& source,
     validate_weak_targets();
     validate_intern_table();
     validate_ephemerons();
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_move_end(*this);
+    }
 }
 
 void Heap::mutate_builder(Value& owner, Value* source,
@@ -2837,6 +2857,9 @@ void Heap::store_ref_array_element(ObjectId id, std::size_t index, Value value) 
             normalize_incremental_compaction_shadow_value(value);
     }
 
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_heap_sample(*this);
+    }
     if (barrier_triggered && stress_config_.collect_minor_after_every_write_barrier) {
         collect_minor();
     }
@@ -2882,6 +2905,9 @@ void Heap::store_record_field(ObjectId id, std::size_t index, Value value) {
                 : value;
     }
 
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_heap_sample(*this);
+    }
     if (barrier_triggered &&
         stress_config_.collect_minor_after_every_write_barrier) {
         std::array<Value*, 2> mutation_roots{&owner, &value};
@@ -2924,6 +2950,9 @@ void Heap::store_ephemeron_value(ObjectId id, Value value) {
             shadow.ephemeron_value_is_ref_
                 ? normalize_incremental_compaction_shadow_value(value)
                 : value;
+    }
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_heap_sample(*this);
     }
     if (barrier && stress_config_.collect_minor_after_every_write_barrier) {
         std::array<Value*, 2> roots{&owner, &value};
@@ -3174,6 +3203,10 @@ void Heap::start_incremental_marking() {
     incremental_marking_active_ = true;
     ++metrics_.major_collections;
     ++metrics_.incremental_cycles_started;
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_logical_collection_begin(
+            *this, TraceCollectionKind::Major);
+    }
 }
 
 std::size_t Heap::incremental_mark_step(std::size_t budget) {
@@ -3253,6 +3286,10 @@ void Heap::start_incremental_compaction() {
     validate_ephemerons();
     ++metrics_.major_collections;
     ++metrics_.incremental_compaction_cycles_started;
+    if (trace_sink_ != nullptr) {
+        trace_sink_->on_logical_collection_begin(
+            *this, TraceCollectionKind::Major);
+    }
     prepare_incremental_compaction();
 }
 
@@ -3302,7 +3339,8 @@ std::size_t Heap::incremental_compact_step_impl(
         }
 
         if (trace_sink_ != nullptr) {
-            trace_sink_->on_collection_begin(*this);
+            trace_sink_->on_move_begin(
+                *this, TraceMoveCause::IncrementalCompactionStep);
         }
         auto moved = *objects_[source_slot];
         const bool promoted =
@@ -3312,7 +3350,8 @@ std::size_t Heap::incremental_compact_step_impl(
             trace_sink_->on_relocate(
                 *this, entry.source_id, entry.width,
                 trace_generation(moved.generation), entry.source_slot,
-                entry.destination_slot, entry.destination_id);
+                entry.destination_slot, entry.destination_id,
+                TraceMoveKind::Compaction);
         }
         if (trace_sink_ != nullptr && promoted) {
             trace_sink_->on_promote(
@@ -3358,7 +3397,7 @@ std::size_t Heap::incremental_compact_step_impl(
             record_promoted_object_edges(promoted_slots);
         }
         if (trace_sink_ != nullptr) {
-            trace_sink_->on_collection_end(*this);
+            trace_sink_->on_move_end(*this);
         }
         validate_after_collection(roots, extra_roots);
     }
@@ -3402,7 +3441,8 @@ void Heap::prepare_incremental_compaction() {
 
 void Heap::prepare_incremental_compaction_from_marked() {
     if (trace_sink_ != nullptr) {
-        trace_sink_->on_collection_begin(*this);
+        trace_sink_->on_move_begin(
+            *this, TraceMoveCause::IncrementalDeathAccounting);
     }
     incremental_compaction_plan_.clear();
     incremental_compaction_cursor_ = 0;
@@ -3537,7 +3577,7 @@ void Heap::prepare_incremental_compaction_from_marked() {
     incremental_compaction_shadow_ephemerons_ = ephemerons_;
     incremental_compaction_active_ = true;
     if (trace_sink_ != nullptr) {
-        trace_sink_->on_collection_end(*this);
+        trace_sink_->on_move_end(*this);
     }
     validate_after_collection(nullptr, {});
 }
@@ -3549,7 +3589,9 @@ void Heap::rewrite_incremental_compaction_roots(
 }
 
 void Heap::rewrite_incremental_compaction_value(
-    Value& value, bool require_forwarded) const {
+    Value& value, bool require_forwarded,
+    TraceForwardKind kind,
+    std::optional<ObjectId> owner_id) const {
     if (!value.is_object()) {
         return;
     }
@@ -3563,7 +3605,8 @@ void Heap::rewrite_incremental_compaction_value(
             const auto destination =
                 *incremental_compaction_forwarding_[source_slot];
             if (trace_sink_ != nullptr && destination != id) {
-                trace_sink_->on_reference_forwarded();
+                trace_sink_->on_reference_forwarded(
+                    id, destination, kind, owner_id);
             }
             value = Value::object(destination);
             (void)checked_slot(value.as_object());
@@ -3581,7 +3624,8 @@ void Heap::rewrite_incremental_compaction_value(
 
 Value Heap::canonicalize_incremental_compaction_read(Value value) const {
     if (incremental_compaction_active_) {
-        rewrite_incremental_compaction_value(value, false);
+        rewrite_incremental_compaction_value(
+            value, false, TraceForwardKind::Root, std::nullopt);
     }
     return value;
 }
@@ -3632,7 +3676,9 @@ void Heap::forward_incremental_compaction_registries(
         if (owner == entry.source_id) {
             if (trace_sink_ != nullptr &&
                 entry.destination_id != owner) {
-                trace_sink_->on_reference_forwarded();
+                trace_sink_->on_reference_forwarded(
+                    owner, entry.destination_id,
+                    TraceForwardKind::Registry, std::nullopt);
             }
             owner = entry.destination_id;
         }
@@ -3845,30 +3891,42 @@ void Heap::finalize_incremental_compaction(
     }
     if (trace_sink_ != nullptr) {
         trace_sink_->on_pause_slice();
-        trace_sink_->on_collection_begin(*this);
+        trace_sink_->on_move_begin(
+            *this, TraceMoveCause::IncrementalCompactionFinalize);
     }
     PartialForwardingVisitor visitor(*this, true);
     trace_collection_roots(visitor, roots, extra_roots);
-    for (auto& slot : objects_) {
+    for (std::size_t owner_slot = 0; owner_slot < objects_.size();
+         ++owner_slot) {
+        auto& slot = objects_[owner_slot];
         if (!slot.has_value()) {
             continue;
         }
+        const auto owner_id = make_object_id(
+            static_cast<std::uint32_t>(owner_slot),
+            generations_[owner_slot]);
         visit_reference_fields(*slot, [&](Value& field) {
-            rewrite_incremental_compaction_value(field, true);
+            rewrite_incremental_compaction_value(
+                field, true, TraceForwardKind::Heap, owner_id);
         }, &metrics_);
         if (slot->kind == ObjectKind::WeakRef) {
-            rewrite_incremental_compaction_value(slot->weak_target_, true);
+            rewrite_incremental_compaction_value(
+                slot->weak_target_, true, TraceForwardKind::Heap,
+                owner_id);
         } else if (slot->kind == ObjectKind::Ephemeron) {
-            rewrite_incremental_compaction_value(slot->ephemeron_key_, true);
+            rewrite_incremental_compaction_value(
+                slot->ephemeron_key_, true, TraceForwardKind::Heap,
+                owner_id);
             if (slot->ephemeron_value_is_ref_) {
                 rewrite_incremental_compaction_value(
-                    slot->ephemeron_value_, true);
+                    slot->ephemeron_value_, true,
+                    TraceForwardKind::Heap, owner_id);
             }
         }
     }
     prune_remembered_set();
     if (trace_sink_ != nullptr) {
-        trace_sink_->on_collection_end(*this);
+        trace_sink_->on_move_end(*this);
     }
     validate_after_collection(roots, extra_roots);
     validate_incremental_compaction_against_atomic(roots, extra_roots);
@@ -3888,13 +3946,15 @@ void Heap::finalize_incremental_compaction(
     validate_after_collection(roots, extra_roots);
     if (trace_sink_ != nullptr) {
         trace_sink_->on_heap_sample(*this);
+        trace_sink_->on_logical_collection_end(*this);
     }
 }
 
 void Heap::finish_incremental_marking_impl(RootProvider* roots,
                                            std::span<Value*> extra_roots) {
     if (trace_sink_ != nullptr) {
-        trace_sink_->on_collection_begin(*this);
+        trace_sink_->on_move_begin(
+            *this, TraceMoveCause::IncrementalMarkCompact);
     }
     finish_incremental_marking_liveness(roots, extra_roots);
 
@@ -3921,11 +3981,12 @@ void Heap::finish_incremental_marking_impl(RootProvider* roots,
     record_promoted_object_edges(compacted.promoted_slots);
     prune_remembered_set();
     if (trace_sink_ != nullptr) {
-        trace_sink_->on_collection_end(*this);
+        trace_sink_->on_move_end(*this);
     }
     validate_after_collection(roots, extra_roots);
     if (trace_sink_ != nullptr) {
         trace_sink_->on_heap_sample(*this);
+        trace_sink_->on_logical_collection_end(*this);
     }
 }
 
@@ -4038,7 +4099,6 @@ void Heap::collect_with_extra_roots(std::span<Value*> extra_roots) {
 void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Value*> extra_roots) {
     if (trace_sink_ != nullptr) {
         trace_sink_->on_pause_slice();
-        trace_sink_->on_collection_begin(*this);
     }
     if (incremental_compaction_active_) {
         finish_incremental_compaction_impl(roots, extra_roots);
@@ -4055,6 +4115,18 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
         ++metrics_.major_collections;
     } else {
         ++metrics_.minor_collections;
+    }
+    if (trace_sink_ != nullptr) {
+        const auto trace_kind =
+            kind == CollectionKind::Major
+                ? TraceCollectionKind::Major
+                : TraceCollectionKind::Minor;
+        const auto move_cause =
+            kind == CollectionKind::Major
+                ? TraceMoveCause::AtomicMajor
+                : TraceMoveCause::AtomicMinor;
+        trace_sink_->on_logical_collection_begin(*this, trace_kind);
+        trace_sink_->on_move_begin(*this, move_cause);
     }
 
     std::vector<ObjectId> worklist;
@@ -4087,11 +4159,12 @@ void Heap::collect_impl(CollectionKind kind, RootProvider* roots, std::span<Valu
     prune_remembered_set();
 
     if (trace_sink_ != nullptr) {
-        trace_sink_->on_collection_end(*this);
+        trace_sink_->on_move_end(*this);
     }
     validate_after_collection(roots, extra_roots);
     if (trace_sink_ != nullptr) {
         trace_sink_->on_heap_sample(*this);
+        trace_sink_->on_logical_collection_end(*this);
     }
 }
 
@@ -4228,7 +4301,8 @@ Heap::CompactionResult Heap::compact_live_objects(CollectionKind kind) const {
         if (trace_sink_ != nullptr && old_slot != next_live_slot) {
             trace_sink_->on_relocate(
                 *this, source_id, required_slots, source_generation,
-                old_slot, next_live_slot, new_id);
+                old_slot, next_live_slot, new_id,
+                TraceMoveKind::Compaction);
         }
         if (trace_sink_ != nullptr && promoted) {
             trace_sink_->on_promote(
@@ -4249,17 +4323,46 @@ void Heap::rewrite_references(const ForwardingTable& forwarding,
     ForwardingVisitor visitor(*this, forwarding);
     trace_collection_roots(visitor, roots, extra_roots);
 
-    for (auto& slot : compacted_objects) {
+    std::vector<std::optional<ObjectId>> trace_owner_ids;
+    if (trace_sink_ != nullptr) {
+        trace_owner_ids.resize(compacted_objects.size());
+        for (const auto destination : forwarding) {
+            if (!destination.has_value()) {
+                continue;
+            }
+            const auto destination_slot =
+                static_cast<std::size_t>(slot_from(*destination));
+            if (destination_slot >= trace_owner_ids.size()) {
+                throw std::logic_error(
+                    "movement forwarding owner exceeds destination heap");
+            }
+            trace_owner_ids[destination_slot] = *destination;
+        }
+    }
+
+    for (std::size_t owner_slot = 0;
+         owner_slot < compacted_objects.size(); ++owner_slot) {
+        auto& slot = compacted_objects[owner_slot];
         if (!slot.has_value()) {
             continue;
         }
+        const auto owner_id = trace_sink_ != nullptr
+                                  ? trace_owner_ids[owner_slot]
+                                  : std::nullopt;
+        if (trace_sink_ != nullptr && !owner_id.has_value()) {
+            throw std::logic_error(
+                "moved object missing trace owner identity");
+        }
         visit_reference_fields(*slot, [&](Value& field) {
-            rewrite_value(field, forwarding);
+            rewrite_value(field, forwarding, TraceForwardKind::Heap,
+                          owner_id);
         }, &metrics_);
     }
 }
 
-void Heap::rewrite_value(Value& value, const ForwardingTable& forwarding) const {
+void Heap::rewrite_value(Value& value, const ForwardingTable& forwarding,
+                         TraceForwardKind kind,
+                         std::optional<ObjectId> owner_id) const {
     if (!value.is_object()) {
         return;
     }
@@ -4271,7 +4374,8 @@ void Heap::rewrite_value(Value& value, const ForwardingTable& forwarding) const 
     }
     const auto destination = *forwarding[old_slot];
     if (trace_sink_ != nullptr && destination != old_id) {
-        trace_sink_->on_reference_forwarded();
+        trace_sink_->on_reference_forwarded(
+            old_id, destination, kind, owner_id);
     }
     value = Value::object(destination);
 }
@@ -4292,7 +4396,9 @@ std::vector<ObjectId> Heap::process_weak_targets(
 
         const auto new_owner = *forwarding[old_owner_slot];
         if (trace_sink_ != nullptr && new_owner != old_owner) {
-            trace_sink_->on_reference_forwarded();
+            trace_sink_->on_reference_forwarded(
+                old_owner, new_owner, TraceForwardKind::Registry,
+                std::nullopt);
         }
         const auto new_owner_slot = static_cast<std::size_t>(slot_from(new_owner));
         if (new_owner_slot >= moved_objects.size() ||
@@ -4312,7 +4418,9 @@ std::vector<ObjectId> Heap::process_weak_targets(
                 const auto destination = *forwarding[old_target_slot];
                 if (trace_sink_ != nullptr &&
                     destination != old_target) {
-                    trace_sink_->on_reference_forwarded();
+                    trace_sink_->on_reference_forwarded(
+                        old_target, destination,
+                        TraceForwardKind::Heap, new_owner);
                 }
                 target = Value::object(destination);
                 ++metrics_.weak_targets_forwarded;
@@ -4362,7 +4470,9 @@ std::vector<Heap::InternEntry> Heap::process_intern_table(
             forwarding[old_slot].has_value()) {
             if (trace_sink_ != nullptr &&
                 *forwarding[old_slot] != entry.canonical) {
-                trace_sink_->on_reference_forwarded();
+                trace_sink_->on_reference_forwarded(
+                    entry.canonical, *forwarding[old_slot],
+                    TraceForwardKind::Registry, std::nullopt);
             }
             rewritten.push_back(
                 InternEntry{entry.content_hash, *forwarding[old_slot]});
@@ -4397,7 +4507,9 @@ std::vector<ObjectId> Heap::process_ephemerons(
         if (owner_slot >= forwarding.size() || !forwarding[owner_slot].has_value()) continue;
         const auto new_owner = *forwarding[owner_slot];
         if (trace_sink_ != nullptr && new_owner != old_owner) {
-            trace_sink_->on_reference_forwarded();
+            trace_sink_->on_reference_forwarded(
+                old_owner, new_owner, TraceForwardKind::Registry,
+                std::nullopt);
         }
         auto& object = *moved_objects[slot_from(new_owner)];
         auto& key = object.ephemeron_key_;
@@ -4415,7 +4527,9 @@ std::vector<ObjectId> Heap::process_ephemerons(
                 const auto destination_key = *forwarding[key_slot];
                 if (trace_sink_ != nullptr &&
                     destination_key != old_key) {
-                    trace_sink_->on_reference_forwarded();
+                    trace_sink_->on_reference_forwarded(
+                        old_key, destination_key,
+                        TraceForwardKind::Heap, new_owner);
                 }
                 key = Value::object(destination_key);
                 if (object.ephemeron_value_is_ref_ && value.is_object()) {
@@ -4429,7 +4543,9 @@ std::vector<ObjectId> Heap::process_ephemerons(
                         *forwarding[value_slot];
                     if (trace_sink_ != nullptr &&
                         destination_value != old_value) {
-                        trace_sink_->on_reference_forwarded();
+                        trace_sink_->on_reference_forwarded(
+                            old_value, destination_value,
+                            TraceForwardKind::Heap, new_owner);
                     }
                     value = Value::object(destination_value);
                 }
@@ -4451,7 +4567,9 @@ std::vector<ObjectId> Heap::rewrite_remembered_set(const ForwardingTable& forwar
         }
         const auto rewritten_id = *forwarding[old_slot];
         if (trace_sink_ != nullptr && rewritten_id != remembered) {
-            trace_sink_->on_reference_forwarded();
+            trace_sink_->on_reference_forwarded(
+                remembered, rewritten_id,
+                TraceForwardKind::Registry, std::nullopt);
         }
         bool already_present = false;
         for (const auto existing : rewritten) {
