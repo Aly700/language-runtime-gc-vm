@@ -16,13 +16,15 @@ struct VMMetrics {
     std::uint64_t raw_module_executions{0};
     std::uint64_t raw_function_executions{0};
     gc::HeapMetrics heap;
+
+    bool operator==(const VMMetrics&) const = default;
 };
 
 class VM : public gc::RootProvider {
 public:
     static constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
 
-    VM();
+    explicit VM(TraceSink* trace_sink = nullptr);
     VM(const VM&) = delete;
     VM& operator=(const VM&) = delete;
 
@@ -34,6 +36,10 @@ public:
     Value execute(const VerifiedModule& module);
     void set_max_call_depth(std::size_t max_call_depth) { max_call_depth_ = max_call_depth; }
     void set_gc_stress(gc::StressConfig config);
+    void set_trace_sink(TraceSink* trace_sink) {
+        trace_sink_ = trace_sink;
+        heap_.set_trace_sink(trace_sink);
+    }
     [[nodiscard]] gc::StressConfig gc_stress_config() const { return gc_stress_; }
     void trace_roots(gc::RootVisitor& visitor) override;
     [[nodiscard]] const std::vector<std::uint8_t>& output() const { return output_; }
@@ -80,6 +86,7 @@ private:
     // Deliberately absent from trace_roots: this owns copied host/plain data
     // only and can neither dangle after movement nor extend heap liveness.
     std::optional<RuntimeTrace> last_trap_trace_;
+    TraceSink* trace_sink_{nullptr};
     gc::Heap heap_;
     gc::StressConfig gc_stress_{};
     std::uint64_t instructions_executed_{0};
