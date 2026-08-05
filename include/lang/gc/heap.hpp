@@ -526,7 +526,9 @@ private:
         const ForwardingTable& forwarding) const;
     void prune_remembered_set();
     void validate_heap_storage_layout() const;
-    void validate_after_collection(RootProvider* roots, std::span<Value*> extra_roots) const;
+    void validate_after_collection(
+        RootProvider* roots, std::span<Value*> extra_roots,
+        TraceVerifyBoundary boundary = TraceVerifyBoundary::None) const;
     void validate_incremental_result_against_atomic(
         RootProvider* roots, std::span<Value*> extra_roots) const;
     void validate_remembered_set() const;

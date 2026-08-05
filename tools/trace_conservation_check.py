@@ -111,6 +111,17 @@ VERIFY_STEP_CHECKS = frozenset(
         "intern_table",
     }
 )
+VERIFY_EVENT_MODES = frozenset({"full", "sampled"})
+VERIFY_HEAD_WINDOW = 40
+VERIFY_STRIDE = 16
+SAMPLED_VERIFY_RETENTION_RULE = (
+    "head40_or_collection_first_last_first_check_stride16;"
+    "unscoped_head40_or_stride16"
+)
+VERIFY_RETENTION_RULES = {
+    "full": "all",
+    "sampled": SAMPLED_VERIFY_RETENTION_RULE,
+}
 GC_OPS = frozenset(
     {
         "pause",
@@ -201,6 +212,20 @@ class MovementTransaction:
     observed_heap_forwards: Counter[tuple[int, int, int]] = field(
         default_factory=Counter
     )
+
+
+@dataclass
+class VerifyScope:
+    collection_id: int | None
+    emitted_count: int = 0
+    verify_index_base: int | None = None
+    last_scope_index: int | None = None
+    scope_indices: set[int] = field(default_factory=set)
+    last_check_indices: dict[str, int] = field(default_factory=dict)
+    last_check_scope_indices: dict[str, int] = field(default_factory=dict)
+    last_check_emitted_ordinals: dict[str, int] = field(default_factory=dict)
+    first_check_order: list[str] = field(default_factory=list)
+    terminal_scope_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -359,6 +384,57 @@ def _require_keys(
         _violate("SCHEMA", seq, event, list(expected), list(actual))
 
 
+def _require_verify_checks(
+    value: object, *, seq: int | str, event: str
+) -> list[str]:
+    if not isinstance(value, list):
+        _violate("SCHEMA", seq, event, "verify_checks array", value)
+    checks: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        check = _require_choice(
+            item,
+            VERIFY_STEP_CHECKS,
+            seq=seq,
+            event=event,
+            field=f"verify_checks[{index}]",
+        )
+        if check in seen:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                event,
+                "unique verify_checks",
+                value,
+            )
+        seen.add(check)
+        checks.append(check)
+    return checks
+
+
+def _stride_evidence(
+    scope_indices: set[int], true_count: int
+) -> tuple[int, list[int], int | None]:
+    retained = sorted(
+        index for index in scope_indices if index % VERIFY_STRIDE == 0
+    )
+    expected_count = (
+        0
+        if true_count == 0
+        else ((true_count - 1) // VERIFY_STRIDE) + 1
+    )
+    next_expected = 0
+    first_missing: int | None = None
+    for index in retained:
+        if index != next_expected:
+            first_missing = next_expected
+            break
+        next_expected += VERIFY_STRIDE
+    if first_missing is None and next_expected < true_count:
+        first_missing = next_expected
+    return expected_count, retained, first_missing
+
+
 def _validate_src_pos(value: object, seq: int, kind: str) -> None:
     if value is None:
         return
@@ -448,7 +524,9 @@ def _validate_object_shape(
             )
 
 
-def _validate_event_schema(event: dict[str, Any], expected_seq: int) -> None:
+def _validate_event_schema(
+    event: dict[str, Any], expected_seq: int, verify_mode: str
+) -> None:
     if len(event) < len(FIXED_EVENT_KEYS):
         _violate(
             "SCHEMA",
@@ -560,7 +638,17 @@ def _validate_event_schema(event: dict[str, Any], expected_seq: int) -> None:
         if not isinstance(event["reason"], str):
             _violate("SCHEMA", seq, kind, "reason string", event["reason"])
     elif kind == "verify_step":
-        _require_keys(event, (*FIXED_EVENT_KEYS, "check"), seq=seq, event=kind)
+        expected_keys = (*FIXED_EVENT_KEYS, "check")
+        if verify_mode == "sampled":
+            expected_keys = (
+                *expected_keys,
+                "verify_index",
+                "collection_id",
+                "scope_index",
+                "check_index",
+                "terminal",
+            )
+        _require_keys(event, expected_keys, seq=seq, event=kind)
         _expect_nulls(event, seq, "id", "gen", "from", "to", "refs", "src_pos")
         _require_choice(
             event["check"],
@@ -569,6 +657,42 @@ def _validate_event_schema(event: dict[str, Any], expected_seq: int) -> None:
             event=kind,
             field="check",
         )
+        if verify_mode == "sampled":
+            _require_uint(
+                event["verify_index"],
+                seq=seq,
+                event=kind,
+                field="verify_index",
+            )
+            collection_id = _require_nullable_uint(
+                event["collection_id"],
+                seq=seq,
+                event=kind,
+                field="collection_id",
+            )
+            _require_uint(
+                event["scope_index"],
+                seq=seq,
+                event=kind,
+                field="scope_index",
+            )
+            _require_uint(
+                event["check_index"],
+                seq=seq,
+                event=kind,
+                field="check_index",
+            )
+            terminal = event["terminal"]
+            if type(terminal) is not int or terminal not in {0, 1}:
+                _violate("SCHEMA", seq, kind, "terminal integer 0|1", terminal)
+            if collection_id is None and terminal != 0:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    kind,
+                    "unscoped terminal=0",
+                    terminal,
+                )
     elif kind == "update":
         _require_keys(event, (*FIXED_EVENT_KEYS, "object_kind"), seq=seq, event=kind)
         _expect_nulls(event, seq, "from", "to")
@@ -587,13 +711,13 @@ def _validate_event_schema(event: dict[str, Any], expected_seq: int) -> None:
             object_kind, event["size"], refs, seq=seq, event=kind
         )
     elif kind == "gc":
-        _validate_gc_schema(event, seq)
+        _validate_gc_schema(event, seq, verify_mode)
     else:
         raise AssertionError(f"unhandled event kind {kind}")
     _ = tick
 
 
-def _validate_gc_schema(event: dict[str, Any], seq: int) -> None:
+def _validate_gc_schema(event: dict[str, Any], seq: int, verify_mode: str) -> None:
     _expect_nulls(event, seq, "id", "size", "gen", "from", "to", "refs", "src_pos")
     op = _require_choice(
         event.get("op"), GC_OPS, seq=seq, event="gc", field="op"
@@ -665,6 +789,13 @@ def _validate_gc_schema(event: dict[str, Any], seq: int) -> None:
             "live_bytes",
             "live_objects",
         )
+        if op == "collection_end" and verify_mode == "sampled":
+            expected_keys = (
+                *expected_keys,
+                "verify_true_count",
+                "verify_emitted_count",
+                "verify_checks",
+            )
         _require_keys(event, expected_keys, seq=seq, event="gc")
         _require_uint(event["collection_id"], seq=seq, event="gc", field="collection_id")
         _require_choice(
@@ -676,6 +807,31 @@ def _validate_gc_schema(event: dict[str, Any], seq: int) -> None:
         )
         _require_uint(event["live_bytes"], seq=seq, event="gc", field="live_bytes")
         _require_uint(event["live_objects"], seq=seq, event="gc", field="live_objects")
+        if op == "collection_end" and verify_mode == "sampled":
+            verify_true_count = _require_uint(
+                event["verify_true_count"],
+                seq=seq,
+                event="gc",
+                field="verify_true_count",
+            )
+            verify_emitted_count = _require_uint(
+                event["verify_emitted_count"],
+                seq=seq,
+                event="gc",
+                field="verify_emitted_count",
+            )
+            _require_verify_checks(event["verify_checks"], seq=seq, event="gc")
+            if verify_true_count < verify_emitted_count:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "gc",
+                    "verify_true_count >= verify_emitted_count",
+                    {
+                        "verify_true_count": verify_true_count,
+                        "verify_emitted_count": verify_emitted_count,
+                    },
+                )
         return
     expected_keys = (
         *FIXED_EVENT_KEYS,
@@ -774,7 +930,7 @@ def _validate_snapshot_schema(snapshot: dict[str, Any], index: int) -> None:
         previous_base = base
 
 
-def _validate_stats_schema(stats: dict[str, Any]) -> None:
+def _validate_stats_schema(stats: dict[str, Any]) -> str:
     expected_keys = (
         "live_bytes_final",
         "forwarded_reference_count",
@@ -782,13 +938,18 @@ def _validate_stats_schema(stats: dict[str, Any]) -> None:
         "pause_slices",
         "collection_count",
         "event_totals",
+        "verify_events",
         "snapshot_interval",
         "ticks",
         "peak_live_bytes",
     )
     _require_keys(stats, expected_keys, seq="stats", event="stats")
     for field in expected_keys:
-        if field in {"event_totals", "forwarded_reference_totals"}:
+        if field in {
+            "event_totals",
+            "forwarded_reference_totals",
+            "verify_events",
+        }:
             continue
         _require_uint(stats[field], seq="stats", event="stats", field=field)
     if stats["snapshot_interval"] == 0:
@@ -806,6 +967,126 @@ def _validate_stats_schema(stats: dict[str, Any]) -> None:
     for kind in REQUIRED_EVENT_KINDS:
         _require_uint(
             totals[kind], seq="stats", event="stats", field=f"event_totals.{kind}"
+        )
+    verify_events = stats["verify_events"]
+    if not isinstance(verify_events, dict):
+        _violate(
+            "SCHEMA", "stats", "stats", "verify_events object", verify_events
+        )
+    verify_event_keys = (
+        "mode",
+        "head_window",
+        "stride",
+        "retention_rule",
+        "true_count",
+        "emitted_count",
+        "unscoped_true_count",
+        "unscoped_emitted_count",
+    )
+    _require_keys(
+        verify_events,
+        verify_event_keys,
+        seq="stats",
+        event="verify_events",
+    )
+    mode = _require_choice(
+        verify_events["mode"],
+        VERIFY_EVENT_MODES,
+        seq="stats",
+        event="verify_events",
+        field="mode",
+    )
+    head_window = _require_uint(
+        verify_events["head_window"],
+        seq="stats",
+        event="verify_events",
+        field="head_window",
+    )
+    stride = _require_uint(
+        verify_events["stride"],
+        seq="stats",
+        event="verify_events",
+        field="stride",
+    )
+    retention_rule = verify_events["retention_rule"]
+    if not isinstance(retention_rule, str):
+        _violate(
+            "SCHEMA",
+            "stats",
+            "verify_events",
+            "retention_rule string",
+            retention_rule,
+        )
+    counts = {
+        field: _require_uint(
+            verify_events[field],
+            seq="stats",
+            event="verify_events",
+            field=field,
+        )
+        for field in (
+            "true_count",
+            "emitted_count",
+            "unscoped_true_count",
+            "unscoped_emitted_count",
+        )
+    }
+    expected_policy = {
+        "head_window": VERIFY_HEAD_WINDOW,
+        "stride": VERIFY_STRIDE,
+        "retention_rule": VERIFY_RETENTION_RULES[mode],
+    }
+    actual_policy = {
+        "head_window": head_window,
+        "stride": stride,
+        "retention_rule": retention_rule,
+    }
+    if actual_policy != expected_policy:
+        _violate(
+            "VERIFY_SAMPLING",
+            "stats",
+            "verify_events",
+            expected_policy,
+            actual_policy,
+        )
+    ledger_consistent = (
+        counts["true_count"] >= counts["emitted_count"]
+        and counts["unscoped_true_count"]
+        >= counts["unscoped_emitted_count"]
+        and counts["unscoped_true_count"] <= counts["true_count"]
+        and counts["unscoped_emitted_count"] <= counts["emitted_count"]
+    )
+    if not ledger_consistent:
+        _violate(
+            "VERIFY_SAMPLING",
+            "stats",
+            "verify_events",
+            (
+                "true_count >= emitted_count; "
+                "unscoped_true_count >= unscoped_emitted_count; "
+                "unscoped counts <= global counts"
+            ),
+            counts,
+        )
+    if mode == "full" and (
+        counts["true_count"] != counts["emitted_count"]
+        or counts["unscoped_true_count"]
+        != counts["unscoped_emitted_count"]
+    ):
+        _violate(
+            "VERIFY_SAMPLING",
+            "stats",
+            "verify_events",
+            "full mode true and emitted ledgers are equal",
+            counts,
+        )
+    if counts["emitted_count"] != totals["verify_step"]:
+        _violate(
+            "VERIFY_SAMPLING",
+            "stats",
+            "verify_events",
+            {"emitted_count": totals["verify_step"]},
+            {"emitted_count": counts["emitted_count"]},
         )
     forward_totals = stats["forwarded_reference_totals"]
     if not isinstance(forward_totals, dict):
@@ -829,11 +1110,13 @@ def _validate_stats_schema(stats: dict[str, Any]) -> None:
             event="stats",
             field=f"forwarded_reference_totals.{kind}",
         )
+    return mode
 
 
 class _Replay:
     def __init__(self, bundle: TraceBundle) -> None:
         self.bundle = bundle
+        self.verify_mode = bundle.stats["verify_events"]["mode"]
         self.live: dict[int, HeapObject] = {}
         self.seen_ids: set[int] = set()
         self.max_slot_generation: dict[int, int] = {}
@@ -863,9 +1146,376 @@ class _Replay:
         self.collection_observed_heap_forwards: Counter[
             tuple[int, int, int]
         ] = Counter()
+        self.verify_emitted_count = 0
+        self.verify_collection_emitted_count = 0
+        self.verify_collection_ledger_true_count = 0
+        self.verify_collection_ledger_emitted_count = 0
+        self.verify_last_index: int | None = None
+        self.verify_indices: set[int] = set()
+        self.unscoped_verify_scope = VerifyScope(collection_id=None)
+        self.collection_verify_scope: VerifyScope | None = None
 
     def live_bytes(self) -> int:
         return sum(object_.size for object_ in self.live.values()) * 8
+
+    def _apply_verify_step(self, event: dict[str, Any], seq: int) -> None:
+        self.verify_emitted_count += 1
+        active_id = (
+            self.active_collection[0]
+            if self.active_collection is not None
+            else None
+        )
+        if self.verify_mode == "full":
+            if active_id is None:
+                self.unscoped_verify_scope.emitted_count += 1
+            else:
+                self.verify_collection_emitted_count += 1
+            return
+
+        verify_events = self.bundle.stats["verify_events"]
+        verify_index = event["verify_index"]
+        if verify_index >= verify_events["true_count"]:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "verify_step",
+                {"verify_index_less_than": verify_events["true_count"]},
+                {"verify_index": verify_index},
+            )
+        if (
+            self.verify_last_index is not None
+            and verify_index <= self.verify_last_index
+        ):
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "verify_step",
+                {"verify_index_greater_than": self.verify_last_index},
+                {"verify_index": verify_index},
+            )
+
+        collection_id = event["collection_id"]
+        if collection_id != active_id:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "verify_step",
+                {"collection_id": active_id},
+                {"collection_id": collection_id},
+            )
+        if active_id is None:
+            scope = self.unscoped_verify_scope
+        else:
+            scope = self.collection_verify_scope
+            if scope is None or scope.collection_id != active_id:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "verify_step",
+                    {"active_verify_scope": active_id},
+                    None if scope is None else scope.collection_id,
+                )
+
+        scope_index = event["scope_index"]
+        if active_id is None:
+            expected_verify_index = (
+                scope_index + self.verify_collection_ledger_true_count
+            )
+            if verify_index != expected_verify_index:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "verify_step",
+                    {"verify_index": expected_verify_index},
+                    {
+                        "verify_index": verify_index,
+                        "scope_index": scope_index,
+                        "completed_collection_true_count": (
+                            self.verify_collection_ledger_true_count
+                        ),
+                    },
+                )
+        elif scope.verify_index_base is None:
+            if scope_index != 0:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "verify_step",
+                    {"first_retained_scope_index": 0},
+                    {"scope_index": scope_index},
+                )
+            scope.verify_index_base = verify_index
+        else:
+            expected_verify_index = scope.verify_index_base + scope_index
+            if verify_index != expected_verify_index:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "verify_step",
+                    {"verify_index": expected_verify_index},
+                    {
+                        "verify_index": verify_index,
+                        "verify_index_base": scope.verify_index_base,
+                        "scope_index": scope_index,
+                    },
+                )
+        if (
+            scope.last_scope_index is not None
+            and scope_index <= scope.last_scope_index
+        ):
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "verify_step",
+                {"scope_index_greater_than": scope.last_scope_index},
+                {"scope_index": scope_index},
+            )
+
+        check = event["check"]
+        check_index = event["check_index"]
+        if check_index > scope_index:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "verify_step",
+                {"check_index_at_most_scope_index": scope_index},
+                {"check_index": check_index},
+            )
+        previous_check_index = scope.last_check_indices.get(check)
+        previous_check_scope_index = scope.last_check_scope_indices.get(check)
+        previous_check_emitted_ordinal = (
+            scope.last_check_emitted_ordinals.get(check)
+        )
+        if (
+            previous_check_index is not None
+            and check_index <= previous_check_index
+        ):
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "verify_step",
+                {
+                    "check": check,
+                    "check_index_greater_than": previous_check_index,
+                },
+                {"check_index": check_index},
+            )
+        if previous_check_index is not None:
+            if (
+                previous_check_scope_index is None
+                or previous_check_emitted_ordinal is None
+            ):
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "verify_step",
+                    {"previous_check_ordinals": "present"},
+                    {
+                        "scope_index": previous_check_scope_index,
+                        "emitted_ordinal": previous_check_emitted_ordinal,
+                    },
+                )
+            check_delta = check_index - previous_check_index
+            scope_positions_between = (
+                scope_index - previous_check_scope_index - 1
+            )
+            emitted_positions_between = (
+                scope.emitted_count - previous_check_emitted_ordinal - 1
+            )
+            omitted_positions_between = (
+                scope_positions_between - emitted_positions_between
+            )
+            maximum_check_delta = omitted_positions_between + 1
+            if omitted_positions_between < 0 or check_delta > maximum_check_delta:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "verify_step",
+                    {
+                        "check": check,
+                        "check_index_delta_at_most": maximum_check_delta,
+                    },
+                    {
+                        "check_index_delta": check_delta,
+                        "omitted_scope_positions": omitted_positions_between,
+                    },
+                )
+        if previous_check_index is None:
+            if active_id is None:
+                maximum_first_check_index = scope_index - scope.emitted_count
+                first_check_index_valid = (
+                    check_index <= maximum_first_check_index
+                )
+            else:
+                maximum_first_check_index = 0
+                first_check_index_valid = check_index == 0
+            if not first_check_index_valid:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "verify_step",
+                    {
+                        "check": check,
+                        "first_emitted_check_index_at_most": (
+                            maximum_first_check_index
+                        ),
+                    },
+                    {"check_index": check_index},
+                )
+            if active_id is not None:
+                scope.first_check_order.append(check)
+
+        terminal = event["terminal"]
+        if active_id is not None and scope.terminal_scope_index is not None:
+            expected = (
+                "no duplicate terminal"
+                if terminal == 1
+                else "no verify event after terminal"
+            )
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "verify_step",
+                expected,
+                {
+                    "terminal_scope_index": scope.terminal_scope_index,
+                    "scope_index": scope_index,
+                    "terminal": terminal,
+                },
+            )
+
+        in_head = verify_index < VERIFY_HEAD_WINDOW
+        if active_id is None:
+            eligible = in_head or scope_index % VERIFY_STRIDE == 0
+        else:
+            eligible = (
+                in_head
+                or scope_index == 0
+                or check_index == 0
+                or scope_index % VERIFY_STRIDE == 0
+                or terminal == 1
+            )
+        if not eligible:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "verify_step",
+                "event eligible under sampled retention union",
+                {
+                    "verify_index": verify_index,
+                    "collection_id": collection_id,
+                    "scope_index": scope_index,
+                    "check_index": check_index,
+                    "terminal": terminal,
+                },
+            )
+
+        self.verify_last_index = verify_index
+        self.verify_indices.add(verify_index)
+        scope.last_scope_index = scope_index
+        scope.scope_indices.add(scope_index)
+        scope.last_check_indices[check] = check_index
+        scope.last_check_scope_indices[check] = scope_index
+        scope.last_check_emitted_ordinals[check] = scope.emitted_count
+        scope.emitted_count += 1
+        if terminal == 1:
+            scope.terminal_scope_index = scope_index
+        if active_id is not None:
+            self.verify_collection_emitted_count += 1
+
+    def _finish_sampled_verify_collection(
+        self, event: dict[str, Any], seq: int
+    ) -> None:
+        scope = self.collection_verify_scope
+        if scope is None or scope.collection_id != event["collection_id"]:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "gc",
+                {"active_verify_scope": event["collection_id"]},
+                None if scope is None else scope.collection_id,
+            )
+
+        true_count = event["verify_true_count"]
+        emitted_count = event["verify_emitted_count"]
+        if emitted_count != scope.emitted_count:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "gc",
+                {"verify_emitted_count": scope.emitted_count},
+                {"verify_emitted_count": emitted_count},
+            )
+        if event["verify_checks"] != scope.first_check_order:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "gc",
+                {"verify_checks": scope.first_check_order},
+                {"verify_checks": event["verify_checks"]},
+            )
+
+        out_of_range = sorted(
+            index for index in scope.scope_indices if index >= true_count
+        )
+        if out_of_range:
+            _violate(
+                "VERIFY_SAMPLING",
+                seq,
+                "gc",
+                {"scope_index_less_than": true_count},
+                {"scope_indices": out_of_range},
+            )
+        if true_count == 0:
+            actual_empty_state = {
+                "emitted_count": scope.emitted_count,
+                "verify_checks": event["verify_checks"],
+                "terminal_scope_index": scope.terminal_scope_index,
+            }
+            expected_empty_state = {
+                "emitted_count": 0,
+                "verify_checks": [],
+                "terminal_scope_index": None,
+            }
+            if actual_empty_state != expected_empty_state:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "gc",
+                    expected_empty_state,
+                    actual_empty_state,
+                )
+        else:
+            expected_stride_count, retained_stride_indices, first_missing = (
+                _stride_evidence(scope.scope_indices, true_count)
+            )
+            if (
+                len(retained_stride_indices) != expected_stride_count
+                or first_missing is not None
+            ):
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "gc",
+                    {"required_stride_count": expected_stride_count},
+                    {
+                        "retained_stride_count": len(retained_stride_indices),
+                        "first_missing_scope_index": first_missing,
+                    },
+                )
+            expected_terminal = true_count - 1
+            if scope.terminal_scope_index != expected_terminal:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    seq,
+                    "gc",
+                    {"terminal_scope_index": expected_terminal},
+                    {"terminal_scope_index": scope.terminal_scope_index},
+                )
+
+        self.verify_collection_ledger_true_count += true_count
+        self.verify_collection_ledger_emitted_count += emitted_count
+        self.collection_verify_scope = None
 
     def _sample_peak(self) -> None:
         self.peak_live_bytes = max(self.peak_live_bytes, self.live_bytes())
@@ -1526,6 +2176,10 @@ class _Replay:
             self.collection_observed_heap_forwards.clear()
             self.next_collection_id += 1
             self.collections += 1
+            if self.verify_mode == "sampled":
+                self.collection_verify_scope = VerifyScope(
+                    collection_id=event["collection_id"]
+                )
             self._require_resolved_references(seq, "collection_begin")
             return
         if op == "collection_end":
@@ -1542,6 +2196,8 @@ class _Replay:
                 self.collection_observed_heap_forwards,
                 seq,
             )
+            if self.verify_mode == "sampled":
+                self._finish_sampled_verify_collection(event, seq)
             self.active_collection = None
             self.last_death_base = None
             self.collection_pending_heap_forwards.clear()
@@ -1702,7 +2358,9 @@ class _Replay:
             self._apply_evict(event, seq)
         elif kind == "gc":
             self._apply_gc(event, seq)
-        elif kind in {"mark_slice", "trap", "verify_step"}:
+        elif kind == "verify_step":
+            self._apply_verify_step(event, seq)
+        elif kind in {"mark_slice", "trap"}:
             pass
         else:
             raise AssertionError(f"unhandled event kind {kind}")
@@ -1797,6 +2455,131 @@ class _Replay:
             {"live_objects": len(actual_live)},
         )
 
+    def _verify_verify_event_ledgers(self) -> None:
+        eof_seq = len(self.bundle.events)
+        verify_events = self.bundle.stats["verify_events"]
+        unscoped_emitted = self.unscoped_verify_scope.emitted_count
+        event_total = self.bundle.stats["event_totals"]["verify_step"]
+
+        if self.verify_mode == "full":
+            expected = {
+                "true_count": self.verify_emitted_count,
+                "emitted_count": self.verify_emitted_count,
+                "unscoped_true_count": unscoped_emitted,
+                "unscoped_emitted_count": unscoped_emitted,
+                "event_totals.verify_step": self.verify_emitted_count,
+            }
+            actual = {
+                "true_count": verify_events["true_count"],
+                "emitted_count": verify_events["emitted_count"],
+                "unscoped_true_count": verify_events["unscoped_true_count"],
+                "unscoped_emitted_count": verify_events[
+                    "unscoped_emitted_count"
+                ],
+                "event_totals.verify_step": event_total,
+            }
+            if actual != expected:
+                _violate(
+                    "VERIFY_SAMPLING",
+                    eof_seq,
+                    "stats",
+                    expected,
+                    actual,
+                )
+            return
+
+        required_head = set(
+            range(min(VERIFY_HEAD_WINDOW, verify_events["true_count"]))
+        )
+        missing_head = sorted(required_head - self.verify_indices)
+        if missing_head:
+            _violate(
+                "VERIFY_SAMPLING",
+                eof_seq,
+                "stats",
+                {"required_verify_head": sorted(required_head)},
+                {"missing_verify_indices": missing_head},
+            )
+
+        unscoped_true_count = verify_events["unscoped_true_count"]
+        out_of_range = sorted(
+            index
+            for index in self.unscoped_verify_scope.scope_indices
+            if index >= unscoped_true_count
+        )
+        if out_of_range:
+            _violate(
+                "VERIFY_SAMPLING",
+                eof_seq,
+                "stats",
+                {"unscoped_scope_index_less_than": unscoped_true_count},
+                {"unscoped_scope_indices": out_of_range},
+            )
+        expected_stride_count, retained_stride_indices, first_missing = (
+            _stride_evidence(
+                self.unscoped_verify_scope.scope_indices,
+                unscoped_true_count,
+            )
+        )
+        if (
+            len(retained_stride_indices) != expected_stride_count
+            or first_missing is not None
+        ):
+            _violate(
+                "VERIFY_SAMPLING",
+                eof_seq,
+                "stats",
+                {"required_unscoped_stride_count": expected_stride_count},
+                {
+                    "retained_unscoped_stride_count": len(
+                        retained_stride_indices
+                    ),
+                    "first_missing_unscoped_scope_index": first_missing,
+                },
+            )
+
+        expected_true_count = (
+            self.verify_collection_ledger_true_count + unscoped_true_count
+        )
+        if verify_events["true_count"] != expected_true_count:
+            _violate(
+                "VERIFY_SAMPLING",
+                eof_seq,
+                "stats",
+                {"true_count": expected_true_count},
+                {"true_count": verify_events["true_count"]},
+            )
+
+        expected_emitted_count = (
+            self.verify_collection_ledger_emitted_count
+            + verify_events["unscoped_emitted_count"]
+        )
+        emitted_ledger = {
+            "emitted_count": verify_events["emitted_count"],
+            "unscoped_emitted_count": verify_events[
+                "unscoped_emitted_count"
+            ],
+            "collection_emitted_count": self.verify_collection_ledger_emitted_count,
+            "event_totals.verify_step": event_total,
+        }
+        actual_emission = {
+            "emitted_count": self.verify_emitted_count,
+            "unscoped_emitted_count": unscoped_emitted,
+            "collection_emitted_count": self.verify_collection_emitted_count,
+            "event_totals.verify_step": self.verify_emitted_count,
+        }
+        if (
+            verify_events["emitted_count"] != expected_emitted_count
+            or emitted_ledger != actual_emission
+        ):
+            _violate(
+                "VERIFY_SAMPLING",
+                eof_seq,
+                "stats",
+                actual_emission,
+                emitted_ledger,
+            )
+
     def verify_stats(self) -> CheckSummary:
         if self.transactions:
             _violate("MOVEMENT_CONSERVATION", len(self.bundle.events), "eof", "all movement transactions closed", [tx.transaction_id for tx in self.transactions])
@@ -1831,6 +2614,7 @@ class _Replay:
             expected = self.bundle.stats[field]
             if expected != actual:
                 _violate("STATS_CONSISTENCY", len(self.bundle.events), "stats", {field: actual}, {field: expected})
+        self._verify_verify_event_ledgers()
         actual_totals = {kind: self.event_totals[kind] for kind in REQUIRED_EVENT_KINDS}
         if self.bundle.stats["event_totals"] != actual_totals:
             _violate(
@@ -1854,12 +2638,12 @@ def check_trace_bundle(
     bundle: TraceBundle, source: Path | str | None = None
 ) -> CheckSummary:
     del source
-    _validate_stats_schema(bundle.stats)
+    verify_mode = _validate_stats_schema(bundle.stats)
     replay = _Replay(bundle)
     replay.prepare_snapshots()
     replay.verify_snapshots_at(0)
     for seq, event in enumerate(bundle.events):
-        _validate_event_schema(event, seq)
+        _validate_event_schema(event, seq, verify_mode)
         replay.apply(event, seq)
         replay.verify_snapshots_at(seq + 1)
     return replay.verify_stats()

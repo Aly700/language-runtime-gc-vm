@@ -26,7 +26,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CONSERVATION_CHECKER = REPOSITORY_ROOT / "tools" / "trace_conservation_check.py"
 SCHEMA_SOURCE = REPOSITORY_ROOT / "SCHEMA.md"
-EMITTER_COMMIT = "fb6e2aae48a8f40f243fa913cead3dae69a0e74e"
+MANIFEST_NOTE = (
+    "Measured by the deterministic lang_trace emitter; every trace byte comes "
+    "from real program execution."
+)
 SNAPSHOT_INTERVAL = 256
 MAX_EVENTS_BYTES = 2_000_000
 PROCESS_TIMEOUT_SECONDS = 120
@@ -60,6 +63,7 @@ class ShowcaseError(RuntimeError):
 class Demo:
     id: str
     schedule: str
+    verify_events: str
     desc: str
 
     @property
@@ -71,16 +75,19 @@ DEMOS = (
     Demo(
         "tree_churn",
         "combined_mark_compact",
+        "sampled",
         "Binary-tree pruning, survivor promotion, movement, and final teardown waves.",
     ),
     Demo(
         "intern_pressure",
         "combined_mark_compact",
+        "sampled",
         "Dynamic weak string interning with canonical hits, misses, survivors, and evictions.",
     ),
     Demo(
         "ephemeron_lifecycle",
         "incremental_1",
+        "full",
         "Conditional-value survival followed by same-collection key/value death.",
     ),
 )
@@ -510,6 +517,47 @@ def _run_checker(trace_directory: Path) -> str:
     return verdict
 
 
+def _lang_trace_command(
+    lang_trace: Path,
+    program: Path,
+    trace_directory: Path,
+    demo: Demo,
+) -> List[str]:
+    return [
+        str(lang_trace),
+        str(program),
+        "--schedule",
+        demo.schedule,
+        "--out",
+        str(trace_directory),
+        "--snapshot-interval",
+        str(SNAPSHOT_INTERVAL),
+        "--verify-events",
+        demo.verify_events,
+    ]
+
+
+def _assert_verify_event_mode(trace_directory: Path, demo: Demo) -> None:
+    stats_path = trace_directory / "stats.json"
+    try:
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ShowcaseError(
+            f"{demo.id}: could not read generated verify-events mode: {error}"
+        ) from error
+    actual_mode = (
+        stats.get("verify_events", {}).get("mode")
+        if isinstance(stats, dict)
+        and isinstance(stats.get("verify_events"), dict)
+        else None
+    )
+    _require(
+        actual_mode == demo.verify_events,
+        f"{demo.id}: generated verify-events mode mismatch: expected "
+        f"{demo.verify_events!r}, got {actual_mode!r}",
+    )
+
+
 def _generate_demo(
     lang_trace: Path,
     root: Path,
@@ -522,16 +570,7 @@ def _generate_demo(
     program.write_bytes(source_bytes)
     try:
         emitted = subprocess.run(
-            [
-                str(lang_trace),
-                str(program),
-                "--schedule",
-                demo.schedule,
-                "--out",
-                str(trace_directory),
-                "--snapshot-interval",
-                str(SNAPSHOT_INTERVAL),
-            ],
+            _lang_trace_command(lang_trace, program, trace_directory, demo),
             cwd=str(REPOSITORY_ROOT),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -565,6 +604,7 @@ def _generate_demo(
         f"<{MAX_EVENTS_BYTES}",
     )
     verdict = _run_checker(trace_directory)
+    _assert_verify_event_mode(trace_directory, demo)
     events = _read_events(events_path)
     counts = _event_counts(events)
     watch_detail = _assert_watchability(demo, events, counts)
@@ -629,15 +669,13 @@ def _write_manifest(root: Path) -> None:
                 "path": f"traces/{demo.id}",
                 "desc": demo.desc,
                 "schedule": demo.schedule,
+                "verify_events": demo.verify_events,
                 "sizes": bundle_sizes,
                 "sha256": bundle_hashes,
             }
         )
     manifest = {
-        "note": (
-            "Measured by the lang_trace emitter at commit "
-            f"{EMITTER_COMMIT}; every trace byte comes from real program execution."
-        ),
+        "note": MANIFEST_NOTE,
         "artifacts": artifacts,
     }
     encoded = (json.dumps(manifest, ensure_ascii=True, indent=2) + "\n").encode(
@@ -768,8 +806,9 @@ def _is_managed_showcase(path: Path) -> bool:
         return False
     note = manifest.get("note")
     artifacts = manifest.get("artifacts")
-    if not isinstance(note, str) or not note.startswith(
-        "Measured by the lang_trace emitter at commit "
+    legacy_note_prefix = "Measured by the lang_trace emitter at commit "
+    if not isinstance(note, str) or (
+        note != MANIFEST_NOTE and not note.startswith(legacy_note_prefix)
     ):
         return False
     if not isinstance(artifacts, list) or len(artifacts) != len(MANAGED_ARTIFACT_IDS):

@@ -235,6 +235,10 @@ add_executable(trace_writer_run_metrics tests/trace_writer_run_metrics.cpp)
 target_link_libraries(trace_writer_run_metrics PRIVATE lang_runtime)
 target_compile_options(trace_writer_run_metrics PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(trace_verify_sampling tests/trace_verify_sampling.cpp)
+target_link_libraries(trace_verify_sampling PRIVATE lang_runtime)
+target_compile_options(trace_verify_sampling PRIVATE -Wall -Wextra -Wpedantic)
+
 include(CTest)
 add_test(NAME lang_smoke COMMAND lang_smoke)
 add_test(NAME lang_phase1_correctness COMMAND lang_phase1_correctness)
@@ -310,6 +314,7 @@ add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)
 add_test(NAME trace_determinism COMMAND trace_determinism)
 add_test(NAME trace_transparency COMMAND trace_transparency)
 add_test(NAME trace_writer_run_metrics COMMAND trace_writer_run_metrics)
+add_test(NAME trace_verify_sampling COMMAND trace_verify_sampling)
 
 if(BUILD_TESTING)
 find_program(
@@ -342,6 +347,32 @@ set(
     TRACE_CONSERVATION_ARTIFACT_ROOT
     "${CMAKE_CURRENT_BINARY_DIR}/Testing/Temporary/trace_conservation")
 set(TRACE_CONSERVATION_SNAPSHOT_INTERVAL 64)
+
+set(
+    TRACE_SAMPLED_CONSERVATION_BUNDLE
+    "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/sampled_string_builder")
+add_test(
+    NAME trace_conservation_generate_sampled_string_builder
+    COMMAND lang_trace
+        "${CMAKE_CURRENT_SOURCE_DIR}/examples/string_builder.lang"
+        --schedule combined_mark_compact
+        --out "${TRACE_SAMPLED_CONSERVATION_BUNDLE}"
+        --snapshot-interval "${TRACE_CONSERVATION_SNAPSHOT_INTERVAL}"
+        --verify-events sampled)
+set_tests_properties(
+    trace_conservation_generate_sampled_string_builder
+    PROPERTIES FIXTURES_SETUP
+        "trace_conservation_fixture_sampled_string_builder")
+add_test(
+    NAME trace_conservation_check_sampled_string_builder
+    COMMAND "${LANG_TRACE_PYTHON3_EXECUTABLE}"
+        "${TRACE_CONSERVATION_CHECKER}"
+        "${TRACE_SAMPLED_CONSERVATION_BUNDLE}")
+set_tests_properties(
+    trace_conservation_check_sampled_string_builder
+    PROPERTIES
+        FIXTURES_REQUIRED "trace_conservation_fixture_sampled_string_builder"
+        PASS_REGULAR_EXPRESSION "OK events=.*snapshots_verified=")
 
 function(add_trace_conservation_case case_name source_path schedule_name)
     set(
@@ -414,13 +445,14 @@ add_test(
         "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/string_builder_combined_mark_compact"
         "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/records_showcase_combined_mark_compact"
         "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/string_interning_combined_mark_compact"
-        "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/forward_then_update_incremental_1")
+        "${TRACE_CONSERVATION_ARTIFACT_ROOT}/$<CONFIG>/forward_then_update_incremental_1"
+        "${TRACE_SAMPLED_CONSERVATION_BUNDLE}")
 set_tests_properties(
     trace_conservation_selftest
     PROPERTIES
         FIXTURES_REQUIRED
-            "trace_conservation_fixture_string_builder_combined_mark_compact;trace_conservation_fixture_records_showcase_combined_mark_compact;trace_conservation_fixture_string_interning_combined_mark_compact;trace_conservation_fixture_forward_then_update_incremental_1"
-        PASS_REGULAR_EXPRESSION "SELFTEST OK corruptions=31")
+            "trace_conservation_fixture_string_builder_combined_mark_compact;trace_conservation_fixture_records_showcase_combined_mark_compact;trace_conservation_fixture_string_interning_combined_mark_compact;trace_conservation_fixture_forward_then_update_incremental_1;trace_conservation_fixture_sampled_string_builder"
+        PASS_REGULAR_EXPRESSION "SELFTEST OK corruptions=36")
 
 set(
     SHOWCASE_PIN_OUTPUT
@@ -432,7 +464,7 @@ add_test(
 set_tests_properties(
     showcase_builder_selftest
     PROPERTIES
-        PASS_REGULAR_EXPRESSION "SELFTEST OK cases=10"
+        PASS_REGULAR_EXPRESSION "SELFTEST OK cases=11"
         TIMEOUT 30)
 add_test(
     NAME showcase_pin
