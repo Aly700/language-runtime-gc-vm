@@ -1,5 +1,6 @@
 #pragma once
 
+#include "lang/trace.hpp"
 #include "lang/value.hpp"
 
 #include <cstdint>
@@ -91,6 +92,8 @@ struct HeapMetrics {
     std::uint64_t incremental_compaction_objects_relocated{0};
     std::uint64_t incremental_compaction_final_pauses{0};
     std::uint64_t incremental_compaction_differential_validations{0};
+
+    bool operator==(const HeapMetrics&) const = default;
 };
 
 enum class ObjectGeneration {
@@ -204,7 +207,7 @@ private:
 
 class Heap {
 public:
-    Heap();
+    explicit Heap(TraceSink* trace_sink = nullptr);
     ~Heap() noexcept;
 
     Heap(const Heap&) = delete;
@@ -314,6 +317,9 @@ public:
     [[nodiscard]] std::size_t capacity_slots() const { return objects_.size(); }
     [[nodiscard]] StressConfig stress_config() const { return stress_config_; }
     [[nodiscard]] HeapMetrics metrics() const { return metrics_; }
+    void set_trace_sink(TraceSink* trace_sink) { trace_sink_ = trace_sink; }
+    [[nodiscard]] TraceSink* trace_sink() const { return trace_sink_; }
+    [[nodiscard]] std::vector<TraceHeapObject> trace_snapshot() const;
 
     [[nodiscard]] bool TEST_ONLY_is_young_object(ObjectId id) const;
     [[nodiscard]] bool TEST_ONLY_is_old_object(ObjectId id) const;
@@ -526,6 +532,7 @@ private:
     void validate_value(Value value) const;
 
     RootProvider* root_provider_{nullptr};
+    TraceSink* trace_sink_{nullptr};
     std::shared_ptr<HeapLifetime> lifetime_;
     StressConfig stress_config_{};
     std::vector<std::optional<Object>> objects_;

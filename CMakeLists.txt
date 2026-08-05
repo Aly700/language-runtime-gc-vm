@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(lang_runtime
     src/bytecode.cpp
     src/gc/heap.cpp
+    src/trace.cpp
     src/vm.cpp
     src/frontend/compiler.cpp
     src/frontend/diagnostics.cpp
@@ -214,6 +215,22 @@ target_compile_definitions(
 add_executable(lang_bench src/bench.cpp)
 target_link_libraries(lang_bench PRIVATE lang_runtime)
 
+add_executable(lang_trace src/tools/lang_trace.cpp)
+target_link_libraries(lang_trace PRIVATE lang_runtime)
+target_compile_options(lang_trace PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(trace_determinism tests/trace_determinism.cpp)
+target_link_libraries(trace_determinism PRIVATE lang_runtime)
+target_compile_options(trace_determinism PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(
+    trace_determinism PRIVATE LANG_EXAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
+
+add_executable(trace_transparency tests/trace_transparency.cpp)
+target_link_libraries(trace_transparency PRIVATE lang_runtime)
+target_compile_options(trace_transparency PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_definitions(
+    trace_transparency PRIVATE LANG_EXAMPLES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/examples")
+
 include(CTest)
 add_test(NAME lang_smoke COMMAND lang_smoke)
 add_test(NAME lang_phase1_correctness COMMAND lang_phase1_correctness)
@@ -286,3 +303,5 @@ add_test(NAME lang_iteration47_string_builder_fuzz
     COMMAND lang_iteration47_string_builder_fuzz)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)
+add_test(NAME trace_determinism COMMAND trace_determinism)
+add_test(NAME trace_transparency COMMAND trace_transparency)

@@ -78,7 +78,8 @@ std::runtime_error runtime_trap(std::size_t function_index, std::size_t pc,
 
 } // namespace
 
-VM::VM() {
+VM::VM(TraceSink* trace_sink)
+    : trace_sink_(trace_sink), heap_(trace_sink) {
     heap_.set_root_provider(this);
 }
 
@@ -388,6 +389,10 @@ Value VM::execute_verified(const Module& module,
     instructions_executed_ = 0;
     incremental_budget_cursor_ = 0;
     incremental_compaction_budget_cursor_ = 0;
+    if (trace_sink_ != nullptr) {
+        trace_sink_->set_mutator_context(0, std::nullopt);
+        trace_sink_->on_program_start(heap_);
+    }
 
     std::size_t active_function_index = module.entry_function;
     std::size_t active_pc = 0;
@@ -398,6 +403,22 @@ Value VM::execute_verified(const Module& module,
         active_function_index = frame.function_index;
         active_pc = frame.pc;
         const auto& function = module.functions[frame.function_index];
+        if (trace_sink_ != nullptr) {
+            std::optional<TraceSourcePosition> source_position;
+            if (frame.pc < function.source_positions.size()) {
+                const auto& position = function.source_positions[frame.pc];
+                TraceSourcePosition traced{
+                    static_cast<std::uint64_t>(position.line),
+                    static_cast<std::uint64_t>(position.column),
+                    std::nullopt};
+                if (!function.debug_name.empty()) {
+                    traced.function = function.debug_name;
+                }
+                source_position = std::move(traced);
+            }
+            trace_sink_->set_mutator_context(
+                instructions_executed_, std::move(source_position));
+        }
         if (function.code[frame.pc].op == OpCode::TailCall) {
             // TailCall maps describe a dying-frame boundary. The verifier proves that
             // the operand stack contains exactly the outgoing arguments. Canonicalize
@@ -1332,6 +1353,10 @@ Value VM::execute_verified(const Module& module,
             frames_.pop_back();
             ++instructions_executed_;
             if (frames_.empty()) {
+                if (trace_sink_ != nullptr) {
+                    trace_sink_->on_program_exit(
+                        heap_, instructions_executed_);
+                }
                 return result;
             }
             push(frames_.back(), result);
@@ -1340,18 +1365,46 @@ Value VM::execute_verified(const Module& module,
         }
         ++instructions_executed_;
       }
+      if (trace_sink_ != nullptr) {
+          trace_sink_->on_program_exit(heap_, instructions_executed_);
+      }
       return Value::nil();
-    } catch (...) {
+    } catch (const std::exception& error) {
         if (!last_trap_trace_.has_value()) {
             last_trap_trace_ = capture_runtime_trace(
                 module, active_function_index, active_pc,
                 RuntimeFailureKind::Trap);
+        }
+        if (trace_sink_ != nullptr) {
+            trace_sink_->on_trap(heap_, error.what());
         }
         if (heap_.incremental_marking_active()) {
             heap_.finish_incremental_marking();
         }
         if (heap_.incremental_compaction_active()) {
             heap_.finish_incremental_compaction();
+        }
+        if (trace_sink_ != nullptr) {
+            trace_sink_->on_program_exit(heap_, instructions_executed_);
+        }
+        throw;
+    } catch (...) {
+        if (!last_trap_trace_.has_value()) {
+            last_trap_trace_ = capture_runtime_trace(
+                module, active_function_index, active_pc,
+                RuntimeFailureKind::Trap);
+        }
+        if (trace_sink_ != nullptr) {
+            trace_sink_->on_trap(heap_, "non-standard exception");
+        }
+        if (heap_.incremental_marking_active()) {
+            heap_.finish_incremental_marking();
+        }
+        if (heap_.incremental_compaction_active()) {
+            heap_.finish_incremental_compaction();
+        }
+        if (trace_sink_ != nullptr) {
+            trace_sink_->on_program_exit(heap_, instructions_executed_);
         }
         throw;
     }
