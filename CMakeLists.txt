@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(lang_runtime
     src/bytecode.cpp
     src/gc/heap.cpp
+    src/optimizer.cpp
     src/vm.cpp
     src/frontend/compiler.cpp
     src/frontend/diagnostics.cpp
@@ -206,6 +207,11 @@ add_executable(lang_iteration47_string_builder_fuzz
 target_link_libraries(
     lang_iteration47_string_builder_fuzz PRIVATE lang_runtime)
 
+add_executable(lang_iteration48_optimizer
+    tests/iteration48_optimizer.cpp)
+target_link_libraries(
+    lang_iteration48_optimizer PRIVATE lang_runtime)
+
 add_executable(lang_examples tests/lang_examples.cpp)
 target_link_libraries(lang_examples PRIVATE lang_runtime)
 target_compile_definitions(
@@ -284,5 +290,7 @@ add_test(NAME lang_iteration47_string_builder
     COMMAND lang_iteration47_string_builder)
 add_test(NAME lang_iteration47_string_builder_fuzz
     COMMAND lang_iteration47_string_builder_fuzz)
+add_test(NAME lang_iteration48_optimizer
+    COMMAND lang_iteration48_optimizer)
 add_test(NAME lang_examples COMMAND lang_examples)
 add_test(NAME lang_bench_smoke COMMAND lang_bench --smoke --repetitions 1)

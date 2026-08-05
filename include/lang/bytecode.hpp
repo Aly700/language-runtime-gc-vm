@@ -81,6 +81,7 @@ enum class OpCode {
     BuilderLen,
     BuilderToStr,
     BuilderClear,
+    ConstantBool,
 };
 
 struct Instruction {
@@ -484,6 +485,7 @@ enum class VerifierReason {
     I64AbsRequiresI64,          // I64Abs operand is not an i64.
     BuilderOperationOnNonBuilder, // Builder operation receiver is not a Builder.
     BuilderAppendRequiresStr,   // BuilderAppend value operand is not a Str.
+    InvalidBoolConstant,        // ConstantBool operand is not canonical 0 or 1.
 };
 
 struct VerifierDiagnostic {

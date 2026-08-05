@@ -1,5 +1,7 @@
 #include "compiler.hpp"
 
+#include "lang/optimizer.hpp"
+
 #include <cassert>
 #include <cstdint>
 #include <iostream>
@@ -1655,7 +1657,9 @@ private:
 } // namespace
 
 CompileModuleResult compile_checked_program(const Program& program,
-                                            const TypeSpec& result_type) {
+                                            const TypeSpec& result_type,
+                                            const OptimizerOptions*
+                                                optimizer_options) {
     Module module;
     module.entry_function = 0;
     module.named_types.reserve(program.types.size());
@@ -1782,24 +1786,58 @@ CompileModuleResult compile_checked_program(const Program& program,
     assert(expected_array_opcode_counts(program) == actual_array_opcode_counts(module) &&
            "compiler bug: source array element types disagreed with scalar/ref array opcodes");
 
-    auto verification_report = verify_module_with_diagnostics(std::move(module));
-    if (!verification_report.module.has_value()) {
-        for (const auto& diagnostic : verification_report.diagnostics) {
-            std::cerr << "compiler verifier diagnostic: "
-                      << format_verifier_diagnostic(diagnostic) << "\n";
+    std::optional<VerifiedModule> verified_module;
+    std::optional<OptimizationStats> optimization_stats;
+    if (optimizer_options == nullptr) {
+        auto verification_report =
+            verify_module_with_diagnostics(std::move(module));
+        if (!verification_report.module.has_value()) {
+            for (const auto& diagnostic :
+                 verification_report.diagnostics) {
+                std::cerr << "compiler verifier diagnostic: "
+                          << format_verifier_diagnostic(diagnostic)
+                          << "\n";
+            }
+        }
+        assert(
+            verification_report.module.has_value() &&
+            "compiler bug: type-checked source emitted verifier-rejected module");
+        if (verification_report.module.has_value()) {
+            verified_module =
+                std::move(*verification_report.module);
+        }
+    } else {
+        auto optimization =
+            optimize_module(std::move(module), *optimizer_options);
+        if (!optimization.verified_module.has_value()) {
+            for (const auto& diagnostic : optimization.diagnostics) {
+                std::cerr << "compiler optimizer diagnostic: "
+                          << format_verifier_diagnostic(diagnostic)
+                          << "\n";
+            }
+        }
+        assert(
+            optimization.verified_module.has_value() &&
+            "compiler bug: optimizer emitted verifier-rejected module");
+        if (optimization.verified_module.has_value()) {
+            verified_module =
+                std::move(*optimization.verified_module);
+            optimization_stats = optimization.stats;
         }
     }
-    assert(verification_report.module.has_value() &&
-           "compiler bug: type-checked source emitted verifier-rejected module");
-    if (!verification_report.module.has_value()) {
+    if (!verified_module.has_value()) {
         CompileModuleResult result;
         result.diagnostics = {
-            Diagnostic{SourcePosition{}, "compiler emitted verifier-rejected module"}};
+            Diagnostic{
+                SourcePosition{},
+                optimizer_options == nullptr
+                    ? "compiler emitted verifier-rejected module"
+                    : "optimizer emitted verifier-rejected module"}};
         return result;
     }
-    auto verified_module = std::move(*verification_report.module);
 
-    auto roundtrip = verify_with_diagnostics(verified_module.module());
+    auto roundtrip =
+        verify_with_diagnostics(verified_module->module());
     if (!roundtrip.result.has_value()) {
         for (const auto& diagnostic : roundtrip.diagnostics) {
             std::cerr << "compiler stack-map round-trip diagnostic: "
@@ -1811,6 +1849,7 @@ CompileModuleResult compile_checked_program(const Program& program,
 
     CompileModuleResult result;
     result.verified_module = std::move(verified_module);
+    result.optimization_stats = std::move(optimization_stats);
     return result;
 }
 

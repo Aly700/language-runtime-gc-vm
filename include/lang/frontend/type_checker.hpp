@@ -1,6 +1,7 @@
 #pragma once
 
 #include "lang/bytecode.hpp"
+#include "lang/optimizer.hpp"
 
 #include <cstddef>
 #include <optional>
@@ -9,6 +10,11 @@
 #include <vector>
 
 namespace lang::frontend {
+
+struct CompileOptions {
+    bool optimize{false};
+    OptimizerOptions optimizer;
+};
 
 enum class Type {
     Int64,
@@ -39,6 +45,7 @@ struct Diagnostic {
 
 struct CompileResult {
     std::optional<VerifiedModule> verified_module;
+    std::optional<OptimizationStats> optimization_stats;
     Type result_type{Type::Invalid};
     std::vector<Diagnostic> diagnostics;
 
@@ -49,5 +56,7 @@ struct CompileResult {
 
 [[nodiscard]] const char* type_name(Type type);
 [[nodiscard]] CompileResult compile_program(std::string_view source);
+[[nodiscard]] CompileResult compile_program(
+    std::string_view source, const CompileOptions& options);
 
 } // namespace lang::frontend
