@@ -1,0 +1,28 @@
+// Watch dynamic strings miss then hit the weak intern table, transient canonicals evict
+// after their references drop, and two canonical survivors remain.
+let survivor_a: str = intern("survivor-" + to_str(1));
+let survivor_a_hit: str = intern("survivor-1");
+let survivor_b: str = intern("survivor-" + to_str(2));
+let survivor_b_hit: str = intern("survivor-2");
+
+let current: str = intern("transient-seed");
+let duplicate: str = intern("transient-seed");
+let index: i64 = 0;
+while index < 8 {
+  current = intern("transient-" + to_str(index));
+  duplicate = intern("transient-" + to_str(index));
+  index = index + 1;
+}
+
+print("phase=release-transients");
+current = "released-current";
+duplicate = "released-duplicate";
+let trigger: str = "collection-trigger-" + to_str(index);
+trigger = "released-trigger";
+
+let finish_ticks: i64 = 0;
+while finish_ticks < 8 {
+  finish_ticks = finish_ticks + 1;
+}
+print("survivors=" + survivor_a + "," + survivor_b);
+pair(survivor_a_hit, survivor_b_hit)

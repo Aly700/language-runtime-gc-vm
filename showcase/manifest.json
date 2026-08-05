@@ -1,0 +1,133 @@
+{
+  "note": "Measured by the lang_trace emitter at commit fb6e2aae48a8f40f243fa913cead3dae69a0e74e; every trace byte comes from real program execution.",
+  "artifacts": [
+    {
+      "id": "schema",
+      "type": "schema",
+      "label": "measured",
+      "path": "SCHEMA.md",
+      "desc": "Authoritative deterministic trace-bundle and manifest schema.",
+      "schedule": null,
+      "sizes": {
+        "SCHEMA.md": 18837
+      },
+      "sha256": {
+        "SCHEMA.md": "40f08fedd08e9a661b6e75412ae8aacb17bcdf03e154a2e6b732cb4369c6e4cd"
+      }
+    },
+    {
+      "id": "tree_churn-source",
+      "type": "source",
+      "label": "measured",
+      "path": "traces/tree_churn/program.lang",
+      "desc": "Executed source for tree_churn.",
+      "schedule": "combined_mark_compact",
+      "sizes": {
+        "program.lang": 1318
+      },
+      "sha256": {
+        "program.lang": "563778f314c423f360b77374beab3367737fd260bfde50409feabd72e7e7eb36"
+      }
+    },
+    {
+      "id": "tree_churn",
+      "type": "trace-bundle",
+      "label": "measured",
+      "path": "traces/tree_churn",
+      "desc": "Binary-tree pruning, survivor promotion, movement, and final teardown waves.",
+      "schedule": "combined_mark_compact",
+      "sizes": {
+        "events.jsonl": 1532509,
+        "snapshots.jsonl": 14394,
+        "stats.json": 348,
+        "positions.json": 4074,
+        "program.lang": 1318,
+        "output.txt": 38
+      },
+      "sha256": {
+        "events.jsonl": "100ed1870ce823ced97e72147e006ef78360fed6ea76a93ec616deb8705590ed",
+        "snapshots.jsonl": "c9692586e57ea18bdf4e8e020c764229a64606369269cdb9755667994fe45e08",
+        "stats.json": "094d2deba6187c0208813e50dbb7640ffee5def2b0178946f148ca6adecd4de8",
+        "positions.json": "534ad01fd994caab97363a88a1405aac77e97c6871a6b667ae6dc717d45f4376",
+        "program.lang": "563778f314c423f360b77374beab3367737fd260bfde50409feabd72e7e7eb36",
+        "output.txt": "3b18518b66972809f824b00e0a1a4fadfdb706b2b53e85171592551753225c5e"
+      }
+    },
+    {
+      "id": "intern_pressure-source",
+      "type": "source",
+      "label": "measured",
+      "path": "traces/intern_pressure/program.lang",
+      "desc": "Executed source for intern_pressure.",
+      "schedule": "combined_mark_compact",
+      "sizes": {
+        "program.lang": 987
+      },
+      "sha256": {
+        "program.lang": "f659db61aac8926840e0445db1d836e407bc6f85002a01b5dd4ef43440852915"
+      }
+    },
+    {
+      "id": "intern_pressure",
+      "type": "trace-bundle",
+      "label": "measured",
+      "path": "traces/intern_pressure",
+      "desc": "Dynamic weak string interning with canonical hits, misses, survivors, and evictions.",
+      "schedule": "combined_mark_compact",
+      "sizes": {
+        "events.jsonl": 1639115,
+        "snapshots.jsonl": 10472,
+        "stats.json": 351,
+        "positions.json": 3316,
+        "program.lang": 987,
+        "output.txt": 57
+      },
+      "sha256": {
+        "events.jsonl": "2da3af79cf2a2c080143c461a84ac74ac3b00303b552c4cdf9c79cb7da175375",
+        "snapshots.jsonl": "de347bff696d78e4db21ecc8c6bccf3b9b5b247ce709982a3d57688d405aea7e",
+        "stats.json": "90ac29c5c69866886d1ed8ea4bc79255a9df7d00ed65891fbb71098b8e2db327",
+        "positions.json": "dc524cdcfdc1b2ba3a27859317eb6e773de293d1931c42b4857286455b6a9b36",
+        "program.lang": "f659db61aac8926840e0445db1d836e407bc6f85002a01b5dd4ef43440852915",
+        "output.txt": "c01e9aed9da6ca5ef722f24356b2363ae2d37c3be8299208c481cd12922b249b"
+      }
+    },
+    {
+      "id": "ephemeron_lifecycle-source",
+      "type": "source",
+      "label": "measured",
+      "path": "traces/ephemeron_lifecycle/program.lang",
+      "desc": "Executed source for ephemeron_lifecycle.",
+      "schedule": "incremental_1",
+      "sizes": {
+        "program.lang": 954
+      },
+      "sha256": {
+        "program.lang": "4db3cbfff188a82944a8902803d1cd604f07b37a09d807010fa999d6e7e45fa9"
+      }
+    },
+    {
+      "id": "ephemeron_lifecycle",
+      "type": "trace-bundle",
+      "label": "measured",
+      "path": "traces/ephemeron_lifecycle",
+      "desc": "Conditional-value survival followed by same-collection key/value death.",
+      "schedule": "incremental_1",
+      "sizes": {
+        "events.jsonl": 286581,
+        "snapshots.jsonl": 4897,
+        "stats.json": 346,
+        "positions.json": 3786,
+        "program.lang": 954,
+        "output.txt": 17
+      },
+      "sha256": {
+        "events.jsonl": "b43266d755b72f9d31d4c291a2615fa5b613f87c5d1a8e3221b8b0348462c8d3",
+        "snapshots.jsonl": "f9595d0e7e3825e09d1a7153b2611b76ff0bf4cf6f28f02a218aa4be8c4f7084",
+        "stats.json": "ebeaf4167f29d314bc4bdd3f53d3bc766a88e0e4eda89967b8af6a347b3fc1e9",
+        "positions.json": "016f98460fdbd6b10e71d73b65a864a6da83d5712fb5464ebe70ed7021f57b34",
+        "program.lang": "4db3cbfff188a82944a8902803d1cd604f07b37a09d807010fa999d6e7e45fa9",
+        "output.txt": "6a609aa9531837ec15777251653f2704e248d3ecd95af376a9c0b1ae98a07712"
+      }
+    }
+  ]
+}

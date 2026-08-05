@@ -1,0 +1,1 @@
+{"live_bytes_final":72,"forwarded_reference_count":28,"forwarded_reference_totals":{"heap":3,"root":23,"registry":2},"pause_slices":411,"collection_count":42,"event_totals":{"alloc":30,"mark_slice":327,"relocate":26,"promote":27,"die":21,"intern":0,"evict":0,"trap":0,"verify_step":789},"snapshot_interval":256,"ticks":327,"peak_live_bytes":136}

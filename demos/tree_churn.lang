@@ -1,0 +1,51 @@
+// Watch a survivor set promote while discarded binary subtrees die in waves; dropping
+// the set produces the final whole-tree die wave.
+type Tree = pair<Tree, Tree>;
+type Forest = pair<Tree, Forest>;
+
+fn build_tree(depth: i64) -> Tree {
+  let tree: Tree = nil;
+  let left_tree: Tree = nil;
+  let right_tree: Tree = nil;
+  if depth < 1 {
+    tree = pair(nil, nil);
+  } else {
+    left_tree = build_tree(depth + -1);
+    right_tree = build_tree(depth + -1);
+    tree = pair(left_tree, right_tree);
+  }
+  tree
+}
+
+let survivor_one: Tree = build_tree(2);
+let survivor_two: Tree = build_tree(2);
+let empty_tree: Tree = nil;
+let empty_forest: Forest = nil;
+let survivor_tail: Forest = pair(survivor_two, empty_forest);
+let survivor_set: Forest = pair(survivor_one, survivor_tail);
+let missing: i64 = 0;
+
+print("phase=prune");
+if is_nil(survivor_one) {
+  missing = missing + 1;
+} else {
+  survivor_one.left = survivor_one;
+  survivor_one.right = survivor_one;
+}
+if is_nil(survivor_two) {
+  missing = missing + 1;
+} else {
+  survivor_two.left = survivor_two;
+  survivor_two.right = survivor_two;
+}
+
+print("phase=teardown");
+survivor_one = empty_tree;
+survivor_two = empty_tree;
+survivor_tail = empty_forest;
+survivor_set = empty_forest;
+
+let trigger: Tree = pair(nil, nil);
+trigger = empty_tree;
+print("phase=done");
+missing

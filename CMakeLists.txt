@@ -321,6 +321,16 @@ if(NOT LANG_TRACE_PYTHON3_EXECUTABLE)
     message(FATAL_ERROR
         "python3 is required for trace conservation tests; add python3 to PATH")
 endif()
+execute_process(
+    COMMAND "${LANG_TRACE_PYTHON3_EXECUTABLE}" -c
+        "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"
+    RESULT_VARIABLE LANG_TRACE_PYTHON_VERSION_OK
+    OUTPUT_QUIET
+    ERROR_QUIET)
+if(NOT LANG_TRACE_PYTHON_VERSION_OK EQUAL 0)
+    message(FATAL_ERROR
+        "Python 3.9 or newer is required for trace conservation and showcase tests")
+endif()
 
 set(
     TRACE_CONSERVATION_CHECKER
@@ -411,4 +421,31 @@ set_tests_properties(
         FIXTURES_REQUIRED
             "trace_conservation_fixture_string_builder_combined_mark_compact;trace_conservation_fixture_records_showcase_combined_mark_compact;trace_conservation_fixture_string_interning_combined_mark_compact;trace_conservation_fixture_forward_then_update_incremental_1"
         PASS_REGULAR_EXPRESSION "SELFTEST OK corruptions=31")
+
+set(
+    SHOWCASE_PIN_OUTPUT
+    "${CMAKE_CURRENT_BINARY_DIR}/Testing/Temporary/showcase_pin/$<CONFIG>")
+add_test(
+    NAME showcase_builder_selftest
+    COMMAND "${LANG_TRACE_PYTHON3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_showcase_selftest.py")
+set_tests_properties(
+    showcase_builder_selftest
+    PROPERTIES
+        PASS_REGULAR_EXPRESSION "SELFTEST OK cases=10"
+        TIMEOUT 30)
+add_test(
+    NAME showcase_pin
+    COMMAND "${LANG_TRACE_PYTHON3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/build_showcase.py"
+        --lang-trace "$<TARGET_FILE:lang_trace>"
+        --output "${SHOWCASE_PIN_OUTPUT}"
+        --verify-stable
+        --compare-to "${CMAKE_CURRENT_SOURCE_DIR}/showcase")
+set_tests_properties(
+    showcase_pin
+    PROPERTIES
+        PASS_REGULAR_EXPRESSION "PIN OK files=[0-9]+ bytes=[0-9]+"
+        RUN_SERIAL TRUE
+        TIMEOUT 300)
 endif()
