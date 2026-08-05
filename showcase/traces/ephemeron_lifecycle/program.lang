@@ -1,0 +1,30 @@
+// Watch the value survive after its holder drops it while the key stays rooted, then
+// watch key and value die together while the ephemeron itself stays alive.
+let key: pair<i64, i64> = pair(101, 102);
+let key_keeper: pair<pair<i64, i64>, i64> = pair(key, 1);
+let value: pair<i64, i64> = pair(201, 202);
+let value_keeper: pair<pair<i64, i64>, i64> = pair(value, 2);
+let entry: ephemeron<pair<i64, i64>, pair<i64, i64>> =
+    ephemeron(key_keeper.left, value_keeper.left);
+key = pair(901, 902);
+value = pair(903, 904);
+value_keeper.left = pair(501, 502);
+
+let phase_one_marker: pair<i64, i64> = pair(301, 302);
+let garbage: pair<i64, i64> = pair(0, 0);
+let i: i64 = 0;
+while i < 8 {
+  garbage = pair(i, i + 1);
+  i = i + 1;
+}
+
+key_keeper.left = pair(401, 402);
+let j: i64 = 0;
+while j < 8 {
+  garbage = pair(j + 1000, j + 1001);
+  j = j + 1;
+}
+
+let observed_key: pair<i64, i64> = entry.key();
+print("key-cleared=" + to_str(is_nil(observed_key)));
+entry

@@ -1,0 +1,2 @@
+phase=release-transients
+survivors=survivor-1,survivor-2

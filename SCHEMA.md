@@ -1,5 +1,7 @@
 # Trace Bundle Schema
 
+**Status:** Final
+
 `lang_trace` writes one deterministic bundle per run:
 
 - `events.jsonl` — ordered runtime, collector, and replay-evidence observations;
@@ -18,6 +20,22 @@ bundle is not a cryptographic attestation. A party that can coherently reauthor 
 event and every repeated ledger can construct a different valid bundle; provenance
 against that threat requires an externally trusted digest or signature, which is outside
 this schema and T2.
+
+## Bundle layout
+
+The checked-in showcase index is `showcase/manifest.json`, with the authoritative schema
+copy at `showcase/SCHEMA.md`. Each measured workload lives at
+`showcase/traces/<demo>/`: `events.jsonl`, `snapshots.jsonl`, `stats.json`, and
+`positions.json` are unmodified `lang_trace` outputs; `program.lang` is the exact source
+passed to the emitter; and `output.txt` is the VM stdout captured as raw bytes.
+
+The manifest has a top-level `note` naming the emitter commit and an ordered `artifacts`
+array. Every artifact records `id`, `type` (`trace-bundle`, `schema`, or `source`), the
+fixed `label` `measured`, its showcase-relative `path`, `desc`, executed `schedule`
+(`null` for the schema), and per-file byte `sizes` and lowercase hexadecimal `sha256`
+maps. A trace-bundle entry covers all six files in its demo directory. The manifest does
+not hash itself; `showcase_pin` regenerates and byte-compares the entire tree, including
+the manifest, schema, sources, stdout, and every emitter file.
 
 ## Units and identity
 
