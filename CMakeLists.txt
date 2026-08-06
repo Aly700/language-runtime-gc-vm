@@ -464,8 +464,20 @@ add_test(
 set_tests_properties(
     showcase_builder_selftest
     PROPERTIES
-        PASS_REGULAR_EXPRESSION "SELFTEST OK cases=11"
+        PASS_REGULAR_EXPRESSION "SELFTEST OK cases=13"
         TIMEOUT 30)
+add_test(
+    NAME reader_pin
+    COMMAND "${LANG_TRACE_PYTHON3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/reader_pin.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/showcase/reader.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/showcase/traces")
+set_tests_properties(
+    reader_pin
+    PROPERTIES
+        PASS_REGULAR_EXPRESSION
+            "READER PIN OK bundles=4 snapshots=90 replays=86 events=21369"
+        TIMEOUT 60)
 add_test(
     NAME showcase_pin
     COMMAND "${LANG_TRACE_PYTHON3_EXECUTABLE}"

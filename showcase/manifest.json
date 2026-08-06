@@ -9,10 +9,24 @@
       "desc": "Authoritative deterministic trace-bundle and manifest schema.",
       "schedule": null,
       "sizes": {
-        "SCHEMA.md": 24923
+        "SCHEMA.md": 25913
       },
       "sha256": {
-        "SCHEMA.md": "45fdf2da130aefd740d02e6459ef20f834b28921367d078585c9e5ce70d15b46"
+        "SCHEMA.md": "a6491efc325b3e3019d75b77535cb58c16c8a54c5b4004e053f543ed55cea37d"
+      }
+    },
+    {
+      "id": "reader",
+      "type": "tool",
+      "label": "synthetic",
+      "path": "reader.py",
+      "desc": "Semantic reference implementation of snapshot seeking and replay; not product code.",
+      "schedule": null,
+      "sizes": {
+        "reader.py": 4685
+      },
+      "sha256": {
+        "reader.py": "77da1748de299fc928f2cec83963e7f405d7ddf911e0a55f3b372d2b70c84852"
       }
     },
     {

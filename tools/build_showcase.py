@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate and pin measured lang_trace showcase bundles.
+"""Generate and pin measured lang_trace showcase bundles and reference reader.
 
 The four native trace files are created only by lang_trace. This packager copies the
-measured program/stdout companions, runs the conservation checker, enforces workload
-watchability, and builds a deterministic manifest over the resulting bytes.
+measured program/stdout companions and the synthetic reference reader, runs the
+conservation checker, enforces workload watchability, and builds a deterministic
+manifest over the resulting bytes.
 """
 
 from __future__ import annotations
@@ -26,6 +27,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CONSERVATION_CHECKER = REPOSITORY_ROOT / "tools" / "trace_conservation_check.py"
 SCHEMA_SOURCE = REPOSITORY_ROOT / "SCHEMA.md"
+READER_SOURCE = REPOSITORY_ROOT / "tools" / "showcase_reader.py"
+READER_DESCRIPTION = (
+    "Semantic reference implementation of snapshot seeking and replay; not product "
+    "code."
+)
 MANIFEST_NOTE = (
     "Measured by the deterministic lang_trace emitter; every trace byte comes "
     "from real program execution."
@@ -118,9 +124,23 @@ PROTECTED_REPOSITORY_PATHS = tuple(
 )
 MANAGED_ARTIFACT_IDS = {
     "schema",
+    "reader",
     *(f"{demo.id}-source" for demo in DEMOS),
     *(demo.id for demo in DEMOS),
 }
+FORMER_T5_DEMO_IDS = (
+    "tree_churn",
+    "intern_pressure",
+    "ephemeron_lifecycle",
+    "moving_floor",
+)
+FORMER_T5_MANAGED_ARTIFACT_IDS = frozenset(
+    {
+        "schema",
+        *(f"{demo_id}-source" for demo_id in FORMER_T5_DEMO_IDS),
+        *FORMER_T5_DEMO_IDS,
+    }
+)
 FORMER_T4_DEMO_IDS = (
     "tree_churn",
     "intern_pressure",
@@ -1031,6 +1051,19 @@ def _write_manifest(root: Path) -> None:
             "sha256": schema_hashes,
         }
     )
+    reader_sizes, reader_hashes = _metadata(root, ("reader.py",))
+    artifacts.append(
+        {
+            "id": "reader",
+            "type": "tool",
+            "label": "synthetic",
+            "path": "reader.py",
+            "desc": READER_DESCRIPTION,
+            "schedule": None,
+            "sizes": reader_sizes,
+            "sha256": reader_hashes,
+        }
+    )
     for demo in DEMOS:
         trace_directory = root / "traces" / demo.id
         source_sizes, source_hashes = _metadata(trace_directory, ("program.lang",))
@@ -1075,10 +1108,13 @@ def _build_bundle(
     output: Path,
     sources: Dict[str, bytes],
     schema_bytes: bytes,
+    reader_bytes: bytes,
     report: bool,
 ) -> Dict[str, DemoResult]:
     output.mkdir()
     (output / "SCHEMA.md").write_bytes(schema_bytes)
+    reader_path = output / "reader.py"
+    reader_path.write_bytes(reader_bytes)
     results: Dict[str, DemoResult] = {}
     for demo in DEMOS:
         result = _generate_demo(lang_trace, output, demo, sources[demo.id])
@@ -1091,6 +1127,7 @@ def _build_bundle(
             print(f"COUNTS {demo.id} {rendered_counts}")
             print(f"WATCH {demo.id} {result.watch_detail}")
     _write_manifest(output)
+    _normalize_bundle_modes(output)
     return results
 
 
@@ -1119,6 +1156,12 @@ def _inventory(root: Path) -> Dict[str, str]:
     return inventory
 
 
+def _normalize_bundle_modes(root: Path) -> None:
+    for relative, entry_type in _inventory(root).items():
+        if entry_type == "file":
+            (root / relative).chmod(0o755 if relative == "reader.py" else 0o644)
+
+
 def _compare_trees(left: Path, right: Path, purpose: str) -> Tuple[int, int]:
     left_inventory = _inventory(left)
     right_inventory = _inventory(right)
@@ -1141,8 +1184,17 @@ def _compare_trees(left: Path, right: Path, purpose: str) -> Tuple[int, int]:
                 f"generated={left_type} reference={right_type}"
             )
         if left_type == "file":
-            left_bytes = (left / relative).read_bytes()
-            right_bytes = (right / relative).read_bytes()
+            left_path = left / relative
+            right_path = right / relative
+            left_mode = stat.S_IMODE(left_path.lstat().st_mode)
+            right_mode = stat.S_IMODE(right_path.lstat().st_mode)
+            if left_mode != right_mode:
+                raise ShowcaseError(
+                    f"{purpose} mode drift at {relative}: "
+                    f"generated={left_mode:#05o} reference={right_mode:#05o}"
+                )
+            left_bytes = left_path.read_bytes()
+            right_bytes = right_path.read_bytes()
             if left_bytes != right_bytes:
                 raise ShowcaseError(f"{purpose} byte drift at {relative}")
             file_count += 1
@@ -1168,12 +1220,15 @@ def _resolve_user_path(path: Path, option: str) -> Path:
 
 def _managed_inventory(
     demo_ids: Sequence[str] = tuple(demo.id for demo in DEMOS),
+    include_reader: bool = True,
 ) -> Dict[str, str]:
     inventory = {
         "SCHEMA.md": "file",
         "manifest.json": "file",
         "traces": "directory",
     }
+    if include_reader:
+        inventory["reader.py"] = "file"
     for demo_id in demo_ids:
         directory = f"traces/{demo_id}"
         inventory[directory] = "directory"
@@ -1183,7 +1238,9 @@ def _managed_inventory(
 
 
 def _managed_artifact_profile(
-    demos: Sequence[Demo], include_verify_events: bool = True
+    demos: Sequence[Demo],
+    include_verify_events: bool = True,
+    include_reader: bool = True,
 ) -> List[Tuple[Dict[str, Any], Tuple[str, ...]]]:
     profile: List[Tuple[Dict[str, Any], Tuple[str, ...]]] = [
         (
@@ -1198,6 +1255,20 @@ def _managed_artifact_profile(
             ("SCHEMA.md",),
         )
     ]
+    if include_reader:
+        profile.append(
+            (
+                {
+                    "id": "reader",
+                    "type": "tool",
+                    "label": "synthetic",
+                    "path": "reader.py",
+                    "desc": READER_DESCRIPTION,
+                    "schedule": None,
+                },
+                ("reader.py",),
+            )
+        )
     for demo in demos:
         profile.extend(
             (
@@ -1270,30 +1341,47 @@ def _is_exact_legacy_manifest_note(note: str) -> bool:
 def _matches_managed_showcase_profile(
     actual_inventory: Dict[str, str], manifest: object
 ) -> bool:
-    """Match only the exact current or former-T4 managed metadata profile."""
-    former_demos = tuple(
+    """Match only exact current, former-T5, or former-T4 managed profiles."""
+    former_t5_demos = tuple(
+        demo for demo in DEMOS if demo.id in FORMER_T5_DEMO_IDS
+    )
+    former_t4_demos = tuple(
         demo for demo in DEMOS if demo.id in FORMER_T4_DEMO_IDS
     )
     managed_profiles = (
-        (_managed_inventory(), DEMOS, MANAGED_ARTIFACT_IDS, False),
+        (_managed_inventory(), DEMOS, MANAGED_ARTIFACT_IDS, False, True),
         (
-            _managed_inventory(FORMER_T4_DEMO_IDS),
-            former_demos,
+            _managed_inventory(FORMER_T5_DEMO_IDS, include_reader=False),
+            former_t5_demos,
+            FORMER_T5_MANAGED_ARTIFACT_IDS,
+            False,
+            False,
+        ),
+        (
+            _managed_inventory(FORMER_T4_DEMO_IDS, include_reader=False),
+            former_t4_demos,
             FORMER_T4_MANAGED_ARTIFACT_IDS,
             True,
+            False,
         ),
     )
     matched_profile = next(
         (
-            (demos, artifact_ids, allow_legacy_note)
-            for inventory, demos, artifact_ids, allow_legacy_note in managed_profiles
+            (demos, artifact_ids, allow_legacy_note, include_reader)
+            for (
+                inventory,
+                demos,
+                artifact_ids,
+                allow_legacy_note,
+                include_reader,
+            ) in managed_profiles
             if actual_inventory == inventory
         ),
         None,
     )
     if matched_profile is None:
         return False
-    demos, expected_artifact_ids, allow_legacy_note = matched_profile
+    demos, expected_artifact_ids, allow_legacy_note, include_reader = matched_profile
     if not isinstance(manifest, dict) or set(manifest) != {"note", "artifacts"}:
         return False
     note = manifest.get("note")
@@ -1304,7 +1392,9 @@ def _matches_managed_showcase_profile(
     ):
         return False
     artifact_profile = _managed_artifact_profile(
-        demos, include_verify_events=note == MANIFEST_NOTE
+        demos,
+        include_verify_events=note == MANIFEST_NOTE,
+        include_reader=include_reader,
     )
     if not isinstance(artifacts, list) or len(artifacts) != len(artifact_profile):
         return False
@@ -1377,7 +1467,12 @@ def _validate_paths(
         not _paths_overlap(output, lang_trace),
         "--output overlaps --lang-trace",
     )
-    inputs = [SCHEMA_SOURCE, CONSERVATION_CHECKER, *(demo.source for demo in DEMOS)]
+    inputs = [
+        SCHEMA_SOURCE,
+        READER_SOURCE,
+        CONSERVATION_CHECKER,
+        *(demo.source for demo in DEMOS),
+    ]
     for input_path in inputs:
         resolved_input = input_path.resolve()
         _require(
@@ -1485,17 +1580,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _validate_paths(lang_trace, output, compare_to)
         sources = {demo.id: demo.source.read_bytes() for demo in DEMOS}
         schema_bytes = SCHEMA_SOURCE.read_bytes()
+        reader_bytes = READER_SOURCE.read_bytes()
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix=f".{output.name}.build-", dir=str(output.parent)
         ) as temporary:
             workspace = Path(temporary)
             first = workspace / "first"
-            _build_bundle(lang_trace, first, sources, schema_bytes, report=True)
+            _build_bundle(
+                lang_trace,
+                first,
+                sources,
+                schema_bytes,
+                reader_bytes,
+                report=True,
+            )
             stable_result: Optional[Tuple[int, int]] = None
             if args.verify_stable:
                 second = workspace / "second"
-                _build_bundle(lang_trace, second, sources, schema_bytes, report=False)
+                _build_bundle(
+                    lang_trace,
+                    second,
+                    sources,
+                    schema_bytes,
+                    reader_bytes,
+                    report=False,
+                )
                 stable_result = _compare_trees(first, second, "stability")
             pin_result: Optional[Tuple[int, int]] = None
             if compare_to is not None:
