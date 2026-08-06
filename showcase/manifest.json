@@ -131,6 +131,45 @@
         "program.lang": "4db3cbfff188a82944a8902803d1cd604f07b37a09d807010fa999d6e7e45fa9",
         "output.txt": "6a609aa9531837ec15777251653f2704e248d3ecd95af376a9c0b1ae98a07712"
       }
+    },
+    {
+      "id": "moving_floor-source",
+      "type": "source",
+      "label": "measured",
+      "path": "traces/moving_floor/program.lang",
+      "desc": "Executed source for moving_floor.",
+      "schedule": "incremental_compact_3_1",
+      "sizes": {
+        "program.lang": 1862
+      },
+      "sha256": {
+        "program.lang": "ecf7cf4c2ab80226f33590fd3b0d60b002bace9129f10f600de6de74e0f4aeed"
+      }
+    },
+    {
+      "id": "moving_floor",
+      "type": "trace-bundle",
+      "label": "measured",
+      "path": "traces/moving_floor",
+      "desc": "Incremental marking and stepwise survivor movement interleaved with mutator updates.",
+      "schedule": "incremental_compact_3_1",
+      "verify_events": "sampled",
+      "sizes": {
+        "events.jsonl": 1679076,
+        "snapshots.jsonl": 34548,
+        "stats.json": 608,
+        "positions.json": 7379,
+        "program.lang": 1862,
+        "output.txt": 36
+      },
+      "sha256": {
+        "events.jsonl": "0d90351a47376cd161aa7f05736c6a5532130b6d59f04441d773e08b04e40af0",
+        "snapshots.jsonl": "a9d175d6a80344d78185960e2a6fb329f48648074d7ffaef2f124c0f0cf64fdb",
+        "stats.json": "f85afe9447abd1c08ced34873c8826cebd636eb760788a7d2dcd2cb868f2d852",
+        "positions.json": "33cad105a3ba3170ef1475928c229427dcfd9e1b12588967b86d7f66a72bef70",
+        "program.lang": "ecf7cf4c2ab80226f33590fd3b0d60b002bace9129f10f600de6de74e0f4aeed",
+        "output.txt": "7df225d9986346a9fcd1e7fd032c740a656ef9eb16388ebe952b2c61c072e4c5"
+      }
     }
   ]
 }

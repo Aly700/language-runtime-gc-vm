@@ -84,7 +84,9 @@ CTest runs three corpora, each across these schedules:
 - `incremental_1`, `incremental_3_1`
 - `combined` (`before_every_alloc`, `after_every_alloc`, `major_every_7`,
   `minor_every_4`, `minor_after_every_barrier`, and incremental marking)
-- `incremental_compact_1`, `incremental_compact_3_1`
+- `incremental_compact_1` (atomic liveness followed by compaction-only budget `{1}`)
+- `incremental_compact_3_1` (incremental marking budgets `{3, 1}` followed sequentially by
+  incremental compaction budgets `{3, 1}`; the phases never run concurrently)
 - `combined_mark_compact` (the existing combined configuration plus compaction budgets
   `{1, 2}`)
 

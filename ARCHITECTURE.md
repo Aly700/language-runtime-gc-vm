@@ -525,12 +525,15 @@ guard traps before attempting to negate `INT64_MIN`.
   threads, or host addresses.
 - Incremental stress adds cyclic positive object-scan and survivor-relocation budgets.
   `incremental_1` and `incremental_3_1` preserve the marking-only paths;
-  `incremental_compact_1` and `incremental_compact_3_1` establish liveness atomically and
-  move incrementally. `combined_mark_compact` transfers the final marking remark into
-  compaction. Map growth, Builder width growth, and allocation finish compaction before
-  changing layout. Builder growth temporarily roots both receiver and appended `Str`;
-  fixed-width append/clear instead update the active compaction shadow in place. VM
-  execution finishes either active phase before returning or propagating a trap.
+  `incremental_compact_1` establishes liveness atomically and then moves incrementally with
+  budget `{1}`. `incremental_compact_3_1` runs incremental marking with budgets `{3, 1}`
+  through final remark, transfers that live set into compaction, and then moves with budgets
+  `{3, 1}`. Those phases are sequential and never concurrent. `combined_mark_compact` also
+  transfers the final marking remark into compaction. Map growth, Builder width growth, and
+  allocation finish compaction before changing layout. Builder growth temporarily roots
+  both receiver and appended `Str`; fixed-width append/clear instead update the active
+  compaction shadow in place. VM execution finishes either active phase before returning or
+  propagating a trap.
 - Differential fuzz outcomes retain both the canonical return value/heap graph and the
   exact output bytes. Every schedule comparison checks both fields. Iteration 29 owns a
   separate pinned `output` grammar so the eleven legacy generators and corpus dumps remain

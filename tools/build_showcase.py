@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -29,6 +29,10 @@ SCHEMA_SOURCE = REPOSITORY_ROOT / "SCHEMA.md"
 MANIFEST_NOTE = (
     "Measured by the deterministic lang_trace emitter; every trace byte comes "
     "from real program execution."
+)
+LEGACY_MANIFEST_NOTE_PREFIX = "Measured by the lang_trace emitter at commit "
+LEGACY_MANIFEST_NOTE_SUFFIX = (
+    "; every trace byte comes from real program execution."
 )
 SNAPSHOT_INTERVAL = 256
 MAX_EVENTS_BYTES = 2_000_000
@@ -90,6 +94,12 @@ DEMOS = (
         "full",
         "Conditional-value survival followed by same-collection key/value death.",
     ),
+    Demo(
+        "moving_floor",
+        "incremental_compact_3_1",
+        "sampled",
+        "Incremental marking and stepwise survivor movement interleaved with mutator updates.",
+    ),
 )
 
 PROTECTED_REPOSITORY_PATHS = tuple(
@@ -111,6 +121,16 @@ MANAGED_ARTIFACT_IDS = {
     *(f"{demo.id}-source" for demo in DEMOS),
     *(demo.id for demo in DEMOS),
 }
+FORMER_T4_DEMO_IDS = (
+    "tree_churn",
+    "intern_pressure",
+    "ephemeron_lifecycle",
+)
+FORMER_T4_MANAGED_ARTIFACT_IDS = {
+    "schema",
+    *(f"{demo_id}-source" for demo_id in FORMER_T4_DEMO_IDS),
+    *FORMER_T4_DEMO_IDS,
+}
 
 
 @dataclass(frozen=True)
@@ -127,6 +147,27 @@ class CollectionEnd:
     end_seq: int
     live: frozenset[int]
     ephemeron_refs: Tuple[int, ...]
+
+
+@dataclass
+class MovingFloorMove:
+    transaction_id: int
+    parent_transaction_id: Optional[int]
+    depth: int
+    cause: str
+    collection_id: Optional[int]
+    begin_tick: int
+    compaction_relocations: int = 0
+
+
+@dataclass
+class MovingFloorCollection:
+    collection_id: int
+    collection_kind: str
+    positive_mark_ticks: Set[int] = field(default_factory=set)
+    mutator_events: List[Tuple[str, int, int]] = field(default_factory=list)
+    qualifying_moves: List[MovingFloorMove] = field(default_factory=list)
+    deaths: int = 0
 
 
 class UnionFind:
@@ -247,6 +288,349 @@ def _intern_watchability(
         f"{demo.id}: chosen schedule produced no incremental mark slices",
     )
     return f"intern_hit={hits} intern_miss={misses} evict={counts['evict']}"
+
+
+def _moving_floor_watchability(
+    demo: Demo, events: List[Dict[str, Any]], counts: Dict[str, int]
+) -> str:
+    collections: List[MovingFloorCollection] = []
+    collection_ids: Set[int] = set()
+    active_collection: Optional[MovingFloorCollection] = None
+    move_stack: List[MovingFloorMove] = []
+    transaction_ids: Set[int] = set()
+
+    for event in events:
+        kind = event.get("kind")
+        seq = event.get("seq")
+        tick = event.get("tick")
+        if kind == "gc" and event.get("op") == "collection_begin":
+            _require(
+                active_collection is None,
+                f"{demo.id}: nested logical collection at seq {seq}",
+            )
+            _require(
+                not move_stack,
+                f"{demo.id}: logical collection began inside a move at seq {seq}",
+            )
+            collection_id = event.get("collection_id")
+            collection_kind = event.get("collection_kind")
+            _require(
+                type(collection_id) is int
+                and collection_id not in collection_ids
+                and isinstance(collection_kind, str),
+                f"{demo.id}: malformed logical collection begin at seq {seq}: "
+                f"id={collection_id!r} kind={collection_kind!r}",
+            )
+            active_collection = MovingFloorCollection(
+                collection_id, collection_kind
+            )
+            collection_ids.add(collection_id)
+            collections.append(active_collection)
+        elif kind == "gc" and event.get("op") == "collection_end":
+            collection_id = event.get("collection_id")
+            collection_kind = event.get("collection_kind")
+            _require(
+                active_collection is not None
+                and active_collection.collection_id == collection_id
+                and active_collection.collection_kind == collection_kind,
+                f"{demo.id}: unbalanced logical collection end at seq {seq}: "
+                f"active={getattr(active_collection, 'collection_id', None)!r} "
+                f"end={collection_id!r}",
+            )
+            active_transaction_id = (
+                move_stack[-1].transaction_id if move_stack else None
+            )
+            _require(
+                not move_stack,
+                f"{demo.id}: logical collection ended inside move transaction "
+                f"{active_transaction_id} at seq {seq}",
+            )
+            active_collection = None
+        elif kind == "gc" and event.get("op") == "move_begin":
+            transaction_id = event.get("transaction_id")
+            parent_transaction_id = event.get("parent_transaction_id")
+            depth = event.get("depth")
+            cause = event.get("cause")
+            collection_id = event.get("collection_id")
+            expected_parent = (
+                move_stack[-1].transaction_id if move_stack else None
+            )
+            expected_collection = (
+                active_collection.collection_id
+                if active_collection is not None
+                else None
+            )
+            _require(
+                type(transaction_id) is int
+                and transaction_id not in transaction_ids
+                and parent_transaction_id == expected_parent
+                and depth == len(move_stack) + 1
+                and isinstance(cause, str)
+                and collection_id == expected_collection
+                and type(tick) is int
+                and type(seq) is int,
+                f"{demo.id}: malformed move_begin nesting at seq {seq}: "
+                f"transaction={transaction_id!r} parent={parent_transaction_id!r} "
+                f"expected_parent={expected_parent!r} depth={depth!r} "
+                f"collection={collection_id!r} "
+                f"expected_collection={expected_collection!r}",
+            )
+            _require(
+                cause != "incremental_compaction_step"
+                or (
+                    active_collection is not None
+                    and active_collection.collection_kind == "major"
+                ),
+                f"{demo.id}: incremental compaction step outside a major "
+                f"collection at seq {seq}",
+            )
+            move = MovingFloorMove(
+                transaction_id,
+                parent_transaction_id,
+                depth,
+                cause,
+                collection_id,
+                tick,
+            )
+            transaction_ids.add(transaction_id)
+            move_stack.append(move)
+        elif kind == "gc" and event.get("op") == "move_end":
+            _require(
+                bool(move_stack),
+                f"{demo.id}: move_end without move_begin at seq {seq}",
+            )
+            move = move_stack[-1]
+            expected_collection = (
+                active_collection.collection_id
+                if active_collection is not None
+                else None
+            )
+            _require(
+                event.get("transaction_id") == move.transaction_id
+                and event.get("parent_transaction_id")
+                == move.parent_transaction_id
+                and event.get("depth") == move.depth
+                and event.get("cause") == move.cause
+                and event.get("collection_id") == move.collection_id
+                and move.collection_id == expected_collection,
+                f"{demo.id}: unbalanced move_end at seq {seq}: "
+                f"active_transaction={move.transaction_id} "
+                f"end_transaction={event.get('transaction_id')!r}",
+            )
+            move_stack.pop()
+            if (
+                move.cause == "incremental_compaction_step"
+                and move.compaction_relocations > 0
+            ):
+                _require(
+                    active_collection is not None
+                    and active_collection.collection_kind == "major",
+                    f"{demo.id}: qualifying movement closed outside a major "
+                    f"collection at seq {seq}",
+                )
+                active_collection.qualifying_moves.append(move)
+        elif kind == "relocate":
+            _require(
+                bool(move_stack),
+                f"{demo.id}: relocate outside a move transaction at seq {seq}",
+            )
+            if event.get("move_kind") == "compaction":
+                move_stack[-1].compaction_relocations += 1
+        elif kind == "mark_slice":
+            _require(
+                active_collection is not None,
+                f"{demo.id}: mark_slice outside a logical collection at seq {seq}",
+            )
+            if (
+                active_collection.collection_kind == "major"
+                and type(event.get("size")) is int
+                and event["size"] > 0
+            ):
+                _require(
+                    type(tick) is int,
+                    f"{demo.id}: positive mark_slice has malformed tick at seq {seq}",
+                )
+                active_collection.positive_mark_ticks.add(tick)
+        elif kind == "die":
+            _require(
+                active_collection is not None,
+                f"{demo.id}: die event outside a logical collection at seq {seq}",
+            )
+            active_collection.deaths += 1
+
+        if (
+            kind in {"alloc", "update"}
+            and active_collection is not None
+            and active_collection.collection_kind == "major"
+            and isinstance(event.get("src_pos"), dict)
+        ):
+            _require(
+                type(tick) is int and type(seq) is int,
+                f"{demo.id}: source-positioned {kind} has malformed position "
+                f"at seq {seq}",
+            )
+            active_collection.mutator_events.append((kind, tick, seq))
+
+    _require(
+        active_collection is None,
+        f"{demo.id}: unclosed logical collection "
+        f"{getattr(active_collection, 'collection_id', None)!r}",
+    )
+    _require(
+        not move_stack,
+        f"{demo.id}: unclosed move transaction "
+        f"{move_stack[-1].transaction_id if move_stack else None!r}",
+    )
+
+    promotions = counts["promote"]
+    death_sizes = sorted(
+        (
+            collection.deaths
+            for collection in collections
+            if collection.collection_kind == "major" and collection.deaths >= 3
+        ),
+        reverse=True,
+    )
+    candidates: List[
+        Tuple[
+            MovingFloorCollection,
+            List[int],
+            List[Tuple[str, int, int]],
+            List[int],
+            List[Tuple[str, int, int]],
+        ]
+    ] = []
+    ranked_summaries: List[Tuple[Tuple[int, ...], str]] = []
+    mark_tick_counts: List[int] = []
+    marking_mutator_counts: List[int] = []
+    move_transaction_counts: List[int] = []
+    move_tick_counts: List[int] = []
+    movement_update_counts: List[int] = []
+    ordered_values: List[int] = []
+    for collection in collections:
+        if collection.collection_kind != "major":
+            continue
+        mark_ticks = sorted(collection.positive_mark_ticks)
+        marking_mutators = (
+            [
+                event
+                for event in collection.mutator_events
+                if mark_ticks[0] < event[1] < mark_ticks[-1]
+            ]
+            if mark_ticks
+            else []
+        )
+        move_ticks = sorted(
+            {move.begin_tick for move in collection.qualifying_moves}
+        )
+        movement_updates = (
+            [
+                event
+                for event in collection.mutator_events
+                if event[0] == "update"
+                and move_ticks[0] < event[1] < move_ticks[-1]
+            ]
+            if move_ticks
+            else []
+        )
+        mark_span = (
+            f"{mark_ticks[0]}..{mark_ticks[-1]}" if mark_ticks else "none"
+        )
+        move_span = (
+            f"{move_ticks[0]}..{move_ticks[-1]}" if move_ticks else "none"
+        )
+        ordered = bool(
+            mark_ticks and move_ticks and mark_ticks[-1] < move_ticks[0]
+        )
+        summary = (
+            f"id={collection.collection_id} mark_ticks={len(mark_ticks)} "
+            f"mark_span={mark_span} marking_mutators={len(marking_mutators)} "
+            f"move_transactions={len(collection.qualifying_moves)} "
+            f"move_ticks={len(move_ticks)} move_span={move_span} "
+            f"movement_updates={len(movement_updates)} ordered={int(ordered)} "
+            f"deaths={collection.deaths}"
+        )
+        predicate_score = sum(
+            (
+                len(mark_ticks) >= 4,
+                len(collection.qualifying_moves) >= 3,
+                len(move_ticks) >= 3,
+                bool(marking_mutators),
+                bool(movement_updates),
+                ordered,
+            )
+        )
+        ranked_summaries.append(
+            (
+                (
+                    predicate_score,
+                    len(collection.qualifying_moves),
+                    len(move_ticks),
+                    len(mark_ticks),
+                    len(marking_mutators),
+                    len(movement_updates),
+                    int(ordered),
+                ),
+                summary,
+            )
+        )
+        mark_tick_counts.append(len(mark_ticks))
+        marking_mutator_counts.append(len(marking_mutators))
+        move_transaction_counts.append(len(collection.qualifying_moves))
+        move_tick_counts.append(len(move_ticks))
+        movement_update_counts.append(len(movement_updates))
+        ordered_values.append(int(ordered))
+        if (
+            len(mark_ticks) >= 4
+            and len(collection.qualifying_moves) >= 3
+            and len(move_ticks) >= 3
+            and marking_mutators
+            and movement_updates
+            and ordered
+        ):
+            candidates.append(
+                (
+                    collection,
+                    mark_ticks,
+                    marking_mutators,
+                    move_ticks,
+                    movement_updates,
+                )
+            )
+
+    closest = [
+        summary
+        for _score, summary in sorted(ranked_summaries, reverse=True)[:3]
+    ]
+    _require(
+        promotions >= 8 and len(death_sizes) >= 2 and bool(candidates),
+        f"{demo.id}: hero watchability failed: promotions={promotions} "
+        f"required>=8 death_waves={len(death_sizes)} required>=2 "
+        f"death_sizes={death_sizes} max_mark_ticks="
+        f"{max(mark_tick_counts, default=0)} max_marking_mutators="
+        f"{max(marking_mutator_counts, default=0)} "
+        f"max_move_transactions={max(move_transaction_counts, default=0)} "
+        f"max_move_ticks={max(move_tick_counts, default=0)} "
+        f"max_movement_updates={max(movement_update_counts, default=0)} "
+        f"max_ordered={max(ordered_values, default=0)} "
+        f"closest=[{'; '.join(closest)}]",
+    )
+    collection, mark_ticks, marking_mutators, move_ticks, movement_updates = (
+        candidates[0]
+    )
+    marking_mutator = marking_mutators[0]
+    movement_update = movement_updates[0]
+    return (
+        f"hero_collection={collection.collection_id} "
+        f"mark_ticks={len(mark_ticks)} mark_span={mark_ticks[0]}..{mark_ticks[-1]} "
+        f"mark_mutator={marking_mutator[0]}@{marking_mutator[1]}/"
+        f"{marking_mutator[2]} move_transactions="
+        f"{len(collection.qualifying_moves)} move_ticks={len(move_ticks)} "
+        f"move_span={move_ticks[0]}..{move_ticks[-1]} "
+        f"move_update=update@{movement_update[1]}/{movement_update[2]} "
+        f"ordered=1 promotions={promotions} death_waves={len(death_sizes)} "
+        f"death_sizes={death_sizes}"
+    )
 
 
 def _ephemeron_watchability(
@@ -461,6 +845,8 @@ def _assert_watchability(
         return _intern_watchability(demo, events, counts)
     if demo.id == "ephemeron_lifecycle":
         return _ephemeron_watchability(demo, events, counts)
+    if demo.id == "moving_floor":
+        return _moving_floor_watchability(demo, events, counts)
     raise AssertionError(f"unhandled demo {demo.id}")
 
 
@@ -780,48 +1166,183 @@ def _resolve_user_path(path: Path, option: str) -> Path:
     return lexical.resolve()
 
 
-def _managed_inventory() -> Dict[str, str]:
+def _managed_inventory(
+    demo_ids: Sequence[str] = tuple(demo.id for demo in DEMOS),
+) -> Dict[str, str]:
     inventory = {
         "SCHEMA.md": "file",
         "manifest.json": "file",
         "traces": "directory",
     }
-    for demo in DEMOS:
-        directory = f"traces/{demo.id}"
+    for demo_id in demo_ids:
+        directory = f"traces/{demo_id}"
         inventory[directory] = "directory"
         for name in BUNDLE_FILES:
             inventory[f"{directory}/{name}"] = "file"
     return inventory
 
 
-def _is_managed_showcase(path: Path) -> bool:
-    """Recognize only a complete tree produced by this packager."""
-    try:
-        if _inventory(path) != _managed_inventory():
-            return False
-        manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, ShowcaseError):
+def _managed_artifact_profile(
+    demos: Sequence[Demo], include_verify_events: bool = True
+) -> List[Tuple[Dict[str, Any], Tuple[str, ...]]]:
+    profile: List[Tuple[Dict[str, Any], Tuple[str, ...]]] = [
+        (
+            {
+                "id": "schema",
+                "type": "schema",
+                "label": "measured",
+                "path": "SCHEMA.md",
+                "desc": "Authoritative deterministic trace-bundle and manifest schema.",
+                "schedule": None,
+            },
+            ("SCHEMA.md",),
+        )
+    ]
+    for demo in demos:
+        profile.extend(
+            (
+                (
+                    {
+                        "id": f"{demo.id}-source",
+                        "type": "source",
+                        "label": "measured",
+                        "path": f"traces/{demo.id}/program.lang",
+                        "desc": f"Executed source for {demo.id}.",
+                        "schedule": demo.schedule,
+                    },
+                    ("program.lang",),
+                ),
+                (
+                    {
+                        "id": demo.id,
+                        "type": "trace-bundle",
+                        "label": "measured",
+                        "path": f"traces/{demo.id}",
+                        "desc": demo.desc,
+                        "schedule": demo.schedule,
+                        **(
+                            {"verify_events": demo.verify_events}
+                            if include_verify_events
+                            else {}
+                        ),
+                    },
+                    BUNDLE_FILES,
+                ),
+            )
+        )
+    return profile
+
+
+def _has_managed_metadata_shape(
+    artifact: Dict[str, Any], expected_names: Tuple[str, ...]
+) -> bool:
+    sizes = artifact.get("sizes")
+    digests = artifact.get("sha256")
+    expected_keys = set(expected_names)
+    return (
+        isinstance(sizes, dict)
+        and set(sizes) == expected_keys
+        and all(type(value) is int and value >= 0 for value in sizes.values())
+        and isinstance(digests, dict)
+        and set(digests) == expected_keys
+        and all(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+            for value in digests.values()
+        )
+    )
+
+
+def _is_exact_legacy_manifest_note(note: str) -> bool:
+    if not note.startswith(LEGACY_MANIFEST_NOTE_PREFIX) or not note.endswith(
+        LEGACY_MANIFEST_NOTE_SUFFIX
+    ):
         return False
-    if not isinstance(manifest, dict):
+    commit = note[
+        len(LEGACY_MANIFEST_NOTE_PREFIX) : -len(LEGACY_MANIFEST_NOTE_SUFFIX)
+    ]
+    return len(commit) == 40 and all(
+        character in "0123456789abcdef" for character in commit
+    )
+
+
+def _matches_managed_showcase_profile(
+    actual_inventory: Dict[str, str], manifest: object
+) -> bool:
+    """Match only the exact current or former-T4 managed metadata profile."""
+    former_demos = tuple(
+        demo for demo in DEMOS if demo.id in FORMER_T4_DEMO_IDS
+    )
+    managed_profiles = (
+        (_managed_inventory(), DEMOS, MANAGED_ARTIFACT_IDS, False),
+        (
+            _managed_inventory(FORMER_T4_DEMO_IDS),
+            former_demos,
+            FORMER_T4_MANAGED_ARTIFACT_IDS,
+            True,
+        ),
+    )
+    matched_profile = next(
+        (
+            (demos, artifact_ids, allow_legacy_note)
+            for inventory, demos, artifact_ids, allow_legacy_note in managed_profiles
+            if actual_inventory == inventory
+        ),
+        None,
+    )
+    if matched_profile is None:
+        return False
+    demos, expected_artifact_ids, allow_legacy_note = matched_profile
+    if not isinstance(manifest, dict) or set(manifest) != {"note", "artifacts"}:
         return False
     note = manifest.get("note")
     artifacts = manifest.get("artifacts")
-    legacy_note_prefix = "Measured by the lang_trace emitter at commit "
     if not isinstance(note, str) or (
-        note != MANIFEST_NOTE and not note.startswith(legacy_note_prefix)
+        note != MANIFEST_NOTE
+        and not (allow_legacy_note and _is_exact_legacy_manifest_note(note))
     ):
         return False
-    if not isinstance(artifacts, list) or len(artifacts) != len(MANAGED_ARTIFACT_IDS):
+    artifact_profile = _managed_artifact_profile(
+        demos, include_verify_events=note == MANIFEST_NOTE
+    )
+    if not isinstance(artifacts, list) or len(artifacts) != len(artifact_profile):
         return False
     ids: Set[str] = set()
-    for artifact in artifacts:
+    for artifact, (expected_fields, expected_names) in zip(
+        artifacts, artifact_profile
+    ):
         if not isinstance(artifact, dict):
             return False
-        artifact_id = artifact.get("id")
-        if not isinstance(artifact_id, str) or artifact.get("label") != "measured":
+        if set(artifact) != {*expected_fields, "sizes", "sha256"}:
             return False
-        ids.add(artifact_id)
-    return ids == MANAGED_ARTIFACT_IDS
+        if any(
+            artifact.get(field) != value
+            for field, value in expected_fields.items()
+        ):
+            return False
+        if not _has_managed_metadata_shape(artifact, expected_names):
+            return False
+        ids.add(artifact["id"])
+    return ids == expected_artifact_ids
+
+
+def _decode_managed_manifest(encoded: str) -> Optional[object]:
+    try:
+        return json.loads(encoded)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+
+
+def _is_managed_showcase(path: Path) -> bool:
+    """Recognize only a complete tree produced by this packager."""
+    try:
+        actual_inventory = _inventory(path)
+        encoded_manifest = (path / "manifest.json").read_text(encoding="utf-8")
+        manifest = _decode_managed_manifest(encoded_manifest)
+    except (OSError, UnicodeError, RecursionError, ShowcaseError):
+        return False
+    return _matches_managed_showcase_profile(actual_inventory, manifest)
 
 
 def _is_replaceable_output(path: Path) -> bool:
