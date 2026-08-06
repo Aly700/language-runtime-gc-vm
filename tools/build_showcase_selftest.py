@@ -8,8 +8,11 @@ this self-test are ordinary marker files for path/publication tests, never trace
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 from typing import Any, Callable, Optional
@@ -44,6 +47,7 @@ def _in_memory_managed_manifest(
     demos: tuple[showcase.Demo, ...],
     note: str = showcase.MANIFEST_NOTE,
     include_verify_events: bool = True,
+    include_reader: bool = False,
 ) -> dict[str, Any]:
     digest = "0" * 64
     artifacts: list[dict[str, Any]] = [
@@ -58,6 +62,22 @@ def _in_memory_managed_manifest(
             "sha256": {"SCHEMA.md": digest},
         }
     ]
+    if include_reader:
+        artifacts.append(
+            {
+                "id": "reader",
+                "type": "tool",
+                "label": "synthetic",
+                "path": "reader.py",
+                "desc": (
+                    "Semantic reference implementation of snapshot seeking and "
+                    "replay; not product code."
+                ),
+                "schedule": None,
+                "sizes": {"reader.py": 1},
+                "sha256": {"reader.py": digest},
+            }
+        )
     for demo in demos:
         artifacts.extend(
             (
@@ -91,6 +111,17 @@ def _in_memory_managed_manifest(
             )
         )
     return {"note": note, "artifacts": artifacts}
+
+
+def _in_memory_managed_inventory(
+    demo_ids: tuple[str, ...], include_reader: bool
+) -> dict[str, str]:
+    inventory = showcase._managed_inventory(demo_ids)
+    if include_reader:
+        inventory["reader.py"] = "file"
+    else:
+        inventory.pop("reader.py", None)
+    return inventory
 
 
 def protected_repository_paths_are_rejected() -> None:
@@ -188,7 +219,9 @@ def empty_and_managed_outputs_are_allowed() -> None:
         tuple(demo.id for demo in former_demos) == showcase.FORMER_T4_DEMO_IDS,
         "former-T4 in-memory demo profile drifted",
     )
-    former_inventory = showcase._managed_inventory(showcase.FORMER_T4_DEMO_IDS)
+    former_inventory = _in_memory_managed_inventory(
+        showcase.FORMER_T4_DEMO_IDS, include_reader=False
+    )
     former_manifest = _in_memory_managed_manifest(former_demos)
     require(
         showcase._matches_managed_showcase_profile(
@@ -197,11 +230,63 @@ def empty_and_managed_outputs_are_allowed() -> None:
         "exact former-T4 managed profile was rejected",
     )
     require(
-        showcase._matches_managed_showcase_profile(
-            showcase._managed_inventory(),
-            _in_memory_managed_manifest(showcase.DEMOS),
+        type(showcase.FORMER_T5_DEMO_IDS) is tuple
+        and showcase.FORMER_T5_DEMO_IDS
+        == (
+            "tree_churn",
+            "intern_pressure",
+            "ephemeron_lifecycle",
+            "moving_floor",
         ),
-        "exact current managed profile was rejected",
+        "former-T5 managed demo IDs drifted",
+    )
+    former_t5_demos = tuple(
+        demo
+        for demo in showcase.DEMOS
+        if demo.id in showcase.FORMER_T5_DEMO_IDS
+    )
+    require(
+        tuple(demo.id for demo in former_t5_demos)
+        == showcase.FORMER_T5_DEMO_IDS,
+        "former-T5 in-memory demo profile drifted",
+    )
+    former_t5_inventory = _in_memory_managed_inventory(
+        showcase.FORMER_T5_DEMO_IDS, include_reader=False
+    )
+    former_t5_manifest = _in_memory_managed_manifest(
+        former_t5_demos, include_reader=False
+    )
+    require(
+        showcase._matches_managed_showcase_profile(
+            former_t5_inventory,
+            former_t5_manifest,
+        ),
+        "exact former-T5 managed profile was rejected",
+    )
+    current_inventory = _in_memory_managed_inventory(
+        tuple(demo.id for demo in showcase.DEMOS), include_reader=True
+    )
+    current_manifest = _in_memory_managed_manifest(
+        showcase.DEMOS, include_reader=True
+    )
+    require(
+        showcase._matches_managed_showcase_profile(
+            current_inventory,
+            current_manifest,
+        ),
+        "exact current T6 managed profile was rejected",
+    )
+    require(
+        not showcase._matches_managed_showcase_profile(
+            current_inventory, former_t5_manifest
+        ),
+        "current T6 inventory accepted a former-T5 no-reader manifest",
+    )
+    require(
+        not showcase._matches_managed_showcase_profile(
+            former_t5_inventory, current_manifest
+        ),
+        "former-T5 no-reader inventory accepted a current reader manifest",
     )
 
     legacy_note = (
@@ -239,10 +324,12 @@ def empty_and_managed_outputs_are_allowed() -> None:
         )
     require(
         not showcase._matches_managed_showcase_profile(
-            showcase._managed_inventory(),
-            _in_memory_managed_manifest(showcase.DEMOS, legacy_note),
+            current_inventory,
+            _in_memory_managed_manifest(
+                showcase.DEMOS, legacy_note, include_reader=True
+            ),
         ),
-        "current profile accepted a historical three-demo note",
+        "current T6 profile accepted a historical three-demo note",
     )
 
     missing_inventory = dict(former_inventory)
@@ -382,6 +469,13 @@ def complete_tree_comparison_rejects_drift() -> None:
             showcase._compare_trees(left, right, "selftest") == (1, 3),
             "equal tree comparison returned wrong totals",
         )
+        (left / "nested" / "marker.txt").chmod(0o644)
+        (right / "nested" / "marker.txt").chmod(0o600)
+        expect_showcase_error(
+            lambda: showcase._compare_trees(left, right, "selftest"),
+            "mode drift",
+        )
+        (right / "nested" / "marker.txt").chmod(0o644)
         showcase._validate_paths(
             executable(), (root / "fresh-output").resolve(), right.resolve()
         )
@@ -389,6 +483,45 @@ def complete_tree_comparison_rejects_drift() -> None:
         expect_showcase_error(
             lambda: showcase._compare_trees(left, right, "selftest"),
             "file-set drift",
+        )
+
+
+def restrictive_umask_bundle_modes_are_normalized() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        previous_umask = os.umask(0o077)
+        try:
+            trace_directory = root / "traces" / "demo"
+            trace_directory.mkdir(parents=True)
+            ordinary_files = (
+                root / "SCHEMA.md",
+                root / "manifest.json",
+                trace_directory / "events.jsonl",
+            )
+            reader = root / "reader.py"
+            for path in (*ordinary_files, reader):
+                path.write_bytes(b"fixture\n")
+            require(
+                all(
+                    stat.S_IMODE(path.stat().st_mode) == 0o600
+                    for path in (*ordinary_files, reader)
+                ),
+                "restrictive-umask fixture files did not start at 0600",
+            )
+
+            normalizer = getattr(showcase, "_normalize_bundle_modes", None)
+            require(callable(normalizer), "bundle mode normalizer is missing")
+            normalizer(root)
+        finally:
+            os.umask(previous_umask)
+
+        require(
+            all(stat.S_IMODE(path.stat().st_mode) == 0o644 for path in ordinary_files),
+            "ordinary generated bundle files were not normalized to 0644",
+        )
+        require(
+            stat.S_IMODE(reader.stat().st_mode) == 0o755,
+            "generated reader was not normalized to 0755",
         )
 
 
@@ -1153,8 +1286,19 @@ def verify_event_policy_is_explicit_and_manifested() -> None:
         "manifest contains stale or ambiguous emitter provenance",
     )
     require(
-        all(artifact["label"] == "measured" for artifact in manifest["artifacts"]),
-        "manifest contains an artifact not labeled measured",
+        all(
+            (
+                artifact["type"] == "tool"
+                and artifact["id"] == "reader"
+                and artifact["label"] == "synthetic"
+            )
+            or (
+                artifact["type"] != "tool"
+                and artifact["label"] == "measured"
+            )
+            for artifact in manifest["artifacts"]
+        ),
+        "manifest measured/synthetic label policy drifted",
     )
     bundle_modes = {
         artifact["id"]: artifact.get("verify_events")
@@ -1176,6 +1320,65 @@ def verify_event_policy_is_explicit_and_manifested() -> None:
     )
 
 
+def reference_reader_is_reproducible_and_manifested() -> None:
+    reader_source = showcase.READER_SOURCE
+    packaged_reader = showcase.REPOSITORY_ROOT / "showcase" / "reader.py"
+    source_bytes = reader_source.read_bytes()
+    packaged_bytes = packaged_reader.read_bytes()
+    require(
+        source_bytes == packaged_bytes,
+        "packaged reader bytes differ from canonical source",
+    )
+    require(
+        packaged_reader.is_file()
+        and not packaged_reader.is_symlink(),
+        "packaged reader is not a regular file",
+    )
+    require(
+        stat.S_IMODE(packaged_reader.stat().st_mode) == 0o755,
+        "packaged reader mode is not exactly 0755",
+    )
+
+    manifest = json.loads(
+        (showcase.REPOSITORY_ROOT / "showcase" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    reader_artifacts = [
+        artifact for artifact in manifest["artifacts"] if artifact.get("id") == "reader"
+    ]
+    require(
+        len(reader_artifacts) == 1,
+        "manifest must contain exactly one reader artifact",
+    )
+    require(
+        reader_artifacts[0]
+        == {
+            "id": "reader",
+            "type": "tool",
+            "label": "synthetic",
+            "path": "reader.py",
+            "desc": (
+                "Semantic reference implementation of snapshot seeking and replay; "
+                "not product code."
+            ),
+            "schedule": None,
+            "sizes": {"reader.py": len(source_bytes)},
+            "sha256": {"reader.py": hashlib.sha256(source_bytes).hexdigest()},
+        },
+        "reader manifest metadata does not match the canonical bytes",
+    )
+    require(
+        {
+            artifact["id"]
+            for artifact in manifest["artifacts"]
+            if artifact.get("label") == "synthetic"
+        }
+        == {"reader"},
+        "reader must be the only synthetic manifest artifact",
+    )
+
+
 def main() -> int:
     tests = (
         protected_repository_paths_are_rejected,
@@ -1184,11 +1387,13 @@ def main() -> int:
         unmanaged_existing_output_is_preserved,
         empty_and_managed_outputs_are_allowed,
         complete_tree_comparison_rejects_drift,
+        restrictive_umask_bundle_modes_are_normalized,
         failed_publication_restores_previous_output,
         captured_output_is_revalidated_before_replacement,
         reappearing_output_preserves_previous_backup,
         watchability_predicates_reject_dull_real_event_subsets,
         verify_event_policy_is_explicit_and_manifested,
+        reference_reader_is_reproducible_and_manifested,
     )
     for test in tests:
         test()

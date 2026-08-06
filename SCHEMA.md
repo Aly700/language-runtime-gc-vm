@@ -29,12 +29,14 @@ copy at `showcase/SCHEMA.md`. Each measured workload lives at
 `positions.json` are unmodified `lang_trace` outputs; `program.lang` is the exact source
 passed to the emitter; and `output.txt` is the VM stdout captured as raw bytes.
 
-The manifest has a top-level `note` stating its measured-execution provenance and an
-ordered `artifacts` array. Every artifact records `id`, `type` (`trace-bundle`, `schema`,
-or `source`), the
-fixed `label` `measured`, its showcase-relative `path`, `desc`, executed `schedule`
-(`null` for the schema), and per-file byte `sizes` and lowercase hexadecimal `sha256`
-maps. Each trace-bundle artifact also records `verify_events` as `full` or `sampled`,
+The manifest has a top-level `note` stating its provenance and an ordered `artifacts`
+array. Every artifact records `id`, `type` (`trace-bundle`, `schema`, `source`, or
+`tool`), `label` (`measured` or `synthetic`), its showcase-relative `path`, `desc`,
+executed `schedule` (`null` for schema and tool artifacts), and per-file byte `sizes`
+and lowercase hexadecimal `sha256` maps. Schema, source, and trace execution evidence
+remain `measured`; the reference-reader tool alone is `synthetic`. Its artifact covers
+only `reader.py` and describes it as a semantic reference implementation, not product
+code. Each trace-bundle artifact also records `verify_events` as `full` or `sampled`,
 matching the emitter mode declared by that bundle's `stats.json`. A trace-bundle entry
 covers all six files in its demo directory. The manifest does not hash itself;
 `showcase_pin` regenerates and byte-compares the entire tree, including the manifest,
@@ -311,6 +313,18 @@ To render event `S`:
 
 Following `to_id` chains is sufficient to preserve logical identity through repeated
 movement. Renderers must not infer identity from a base slot alone.
+
+### Reference reader
+
+`showcase/reader.py` is the semantic reference implementation for seeking and replay,
+not product code. Invoke it as `reader.py <trace-dir> <tick>`. For requested tick `T`, it
+chooses the greatest `(tick, seq)` among snapshots with `tick <= T`; the last JSONL line
+wins an exact tie. With no eligible snapshot it starts from an empty graph. An exact-tick
+request returns the chosen snapshot's `seq` boundary unchanged, even when later events
+share that tick. Otherwise it applies events in `seq` order through `event.tick <= T`.
+It follows complete full-ID forwarding chains and sorts displayed objects by base slot.
+Full and sampled `verify_step` events are heap-neutral. The conservation checker remains
+the validation authority.
 
 ## Statistics
 
