@@ -59,10 +59,14 @@ test-only scalar corruption that passes ordinary structural validation proves th
 is non-vacuous.
 
 The new schedules are append-only: `incremental_compact_1`,
-`incremental_compact_3_1`, and `combined_mark_compact`. Empty compaction budgets keep all
-legacy paths unchanged. Scheduling uses only instruction counts, positive integer object
-budgets, ordered vectors, and descriptor order; there is no clock, thread, randomness, or
-unordered iteration.
+`incremental_compact_3_1`, and `combined_mark_compact`. `incremental_compact_1` remains a
+compaction-only schedule: it establishes liveness atomically, then relocates survivors with
+the cyclic budget `{1}`. `incremental_compact_3_1` instead runs incremental marking with
+cyclic budgets `{3, 1}` through final remark, transfers that live set into compaction, and
+then relocates with cyclic budgets `{3, 1}`. Marking and compaction are sequential, never
+concurrent. Empty compaction budgets keep all legacy paths unchanged. Scheduling uses only
+instruction counts, positive integer object budgets, ordered vectors, and descriptor order;
+there is no clock, thread, randomness, or unordered iteration.
 
 ## Rejected alternatives
 

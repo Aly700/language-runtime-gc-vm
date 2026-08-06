@@ -1,0 +1,73 @@
+// Watch marking slices and stepwise survivor movement alternate with mutator updates
+// while the two-list floor keeps its checksum correct.
+type List = pair<i64, List>;
+type Floor = pair<List, List>;
+
+fn sum(xs: List) -> i64 {
+  let total: i64 = 0;
+  if is_nil(xs) {
+    total = 0;
+  } else {
+    total = xs.left + sum(xs.right);
+  }
+  total
+}
+
+let garbage_a: List = nil;
+let garbage_a_value: i64 = 0;
+while garbage_a_value < 6 {
+  garbage_a = pair(garbage_a_value, garbage_a);
+  garbage_a_value = garbage_a_value + 1;
+}
+
+let survivors_a: List = nil;
+let survivor_a_value: i64 = 1;
+while survivor_a_value < 9 {
+  survivors_a = pair(survivor_a_value, survivors_a);
+  survivor_a_value = survivor_a_value + 1;
+}
+
+let garbage_b: List = nil;
+let garbage_b_value: i64 = 0;
+while garbage_b_value < 6 {
+  garbage_b = pair(garbage_b_value + 1000, garbage_b);
+  garbage_b_value = garbage_b_value + 1;
+}
+
+let survivors_b: List = nil;
+let survivor_b_value: i64 = 101;
+while survivor_b_value < 109 {
+  survivors_b = pair(survivor_b_value, survivors_b);
+  survivor_b_value = survivor_b_value + 1;
+}
+
+let floor: Floor = pair(survivors_a, survivors_b);
+garbage_a = nil;
+let progress: i64 = 0;
+let first_pulse: i64 = 0;
+while first_pulse < 8 {
+  floor.right = floor.left;
+  floor.right = survivors_b;
+  progress = progress + 1;
+  floor.right = floor.left;
+  floor.right = survivors_b;
+  progress = progress + 1;
+  first_pulse = first_pulse + 1;
+}
+
+garbage_b = nil;
+let second_pulse: i64 = 0;
+while second_pulse < 8 {
+  floor.right = floor.left;
+  floor.right = survivors_b;
+  progress = progress + 1;
+  floor.right = floor.left;
+  floor.right = survivors_b;
+  progress = progress + 1;
+  second_pulse = second_pulse + 1;
+}
+
+let checksum: i64 = sum(floor.left) + sum(floor.right);
+print("floor-checksum=" + to_str(checksum));
+print("mutator-steps=" + to_str(progress));
+checksum

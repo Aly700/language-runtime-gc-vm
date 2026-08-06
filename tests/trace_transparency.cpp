@@ -204,6 +204,22 @@ int main() {
             throw std::runtime_error(
                 "trace schedule catalog is not exactly the shared 15");
         }
+        const auto& incremental_compact_mixed = fuzz::find_schedule(
+            all_schedules, "incremental_compact_3_1");
+        const auto& incremental_compact_stress =
+            incremental_compact_mixed.stress;
+        if (incremental_compact_stress.collect_before_every_allocation ||
+            incremental_compact_stress.collect_after_every_allocation ||
+            incremental_compact_stress.collect_minor_after_every_write_barrier ||
+            incremental_compact_stress.collect_every_n_instructions != 0 ||
+            incremental_compact_stress.collect_minor_every_n_instructions != 0 ||
+            incremental_compact_stress.incremental_mark_step_budgets !=
+                std::vector<std::size_t>{3, 1} ||
+            incremental_compact_stress.incremental_compact_step_budgets !=
+                std::vector<std::size_t>{3, 1}) {
+            throw std::runtime_error(
+                "incremental_compact_3_1 fuzz schedule contract drifted");
+        }
         for (const auto& schedule : all_schedules) {
             lang::gc::StressConfig traced_schedule;
             if (!lang::configure_trace_schedule(schedule.name,

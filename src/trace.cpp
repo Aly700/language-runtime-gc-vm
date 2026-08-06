@@ -1121,6 +1121,7 @@ bool configure_trace_schedule(std::string_view name,
         return true;
     }
     if (name == "incremental_compact_3_1") {
+        config.incremental_mark_step_budgets = {3, 1};
         config.incremental_compact_step_budgets = {3, 1};
         return true;
     }

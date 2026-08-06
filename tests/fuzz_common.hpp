@@ -100,6 +100,7 @@ inline std::vector<Schedule> schedules() {
     result.push_back({"incremental_compact_1", incremental_compact_one});
 
     lang::gc::StressConfig incremental_compact_mixed;
+    incremental_compact_mixed.incremental_mark_step_budgets = {3, 1};
     incremental_compact_mixed.incremental_compact_step_budgets = {3, 1};
     result.push_back(
         {"incremental_compact_3_1", incremental_compact_mixed});
