@@ -346,14 +346,18 @@ GeneratedProgram generate_source_program(std::uint64_t seed) {
     }
 
     Env env;
+    const auto atom_left = int_literal(rng.small_i64());
+    const auto atom_right = int_literal(rng.small_i64());
     emit_let(out, env, "atom", bare_pair_type(),
-             pair_expr(int_literal(rng.small_i64()), int_literal(rng.small_i64())));
+             pair_expr(atom_left, atom_right));
     emit_let(out, env, "seed", bare_pair_type(),
              pair_expr(env.variable("atom"), env.variable("atom")));
     emit_let(out, env, "current", pair_pair_type,
              pair_expr(env.variable("seed"), env.variable("seed")));
+    const auto flag_left = int_literal(rng.small_i64());
+    const auto flag_right = int_literal(rng.small_i64());
     emit_let(out, env, "flag", bool_type(),
-             less_expr(int_literal(rng.small_i64()), int_literal(rng.small_i64())));
+             less_expr(flag_left, flag_right));
     emit_let(out, env, "leaf", leaf_type,
              call_expr(make_leaf, {int_literal(rng.small_i64()), env.variable("flag")}));
     emit_let(out, env, "nested", nested_type,
@@ -608,7 +612,7 @@ GeneratedProgram generate_array_source_program(std::uint64_t seed) {
     const auto list_array = array_type(list_type);
 
     const auto length = static_cast<std::int64_t>(3);
-    const auto base = static_cast<std::int64_t>((seed % 13) - 6);
+    const auto base = static_cast<std::int64_t>(seed % 13) - 6;
     const auto bias = static_cast<std::int64_t>((seed % 5) + 1);
     const auto replacement = static_cast<std::int64_t>(20 + (seed % 17));
     const auto flag0 = (seed % 2) == 0;
