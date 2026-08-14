@@ -2,29 +2,18 @@
 
 [![CI](https://github.com/Aly700/language-runtime-gc-vm/actions/workflows/ci.yml/badge.svg)](https://github.com/Aly700/language-runtime-gc-vm/actions/workflows/ci.yml)
 
-Wave 3 is complete, and source-level generic functions plus generic named aliases,
-records, and variants now monomorphize entirely in the frontend. Every used concrete tuple
-becomes ordinary verifier-checked bytecode and ordinary exact layouts, so explicit
-tail-call frame reuse, records, sum types and match, exceptions, ephemerons, deterministic
-incremental marking, and deterministic incremental compaction all retain the same precise
-moving-collector contract.
-
-Iteration 44 adds explicit `intern(str) -> str`. A collector-owned weak table returns one
-canonical immutable string while that object is live, forwards it across every movement
-path, and evicts it without extending liveness.
-
-Iteration 45 adds deterministic runtime diagnostics without changing failure text. Every
-terminal trap or uncaught typed exception leaves an embedder-readable, source-positioned
-innermost-to-outermost frame trace whose plain copied data is not a GC root.
-
-Iteration 46 adds callable-local labeled loops plus `abs`, `min`, `max`, and four
-byte-string search methods. Multi-level control remains ordinary verifier-checked jumps;
-all built-ins except checked scalar `I64Abs` are pure frontend lowering.
-
-This repository is a correctness-first implementation of a small statically typed
-language. Source passes through a lexer, recursive-descent parser, flow-sensitive type
-checker, bytecode compiler, verifier, and stack VM. The runtime uses a precise moving,
+A correctness-first implementation of a small statically typed language. Source
+passes through a lexer, recursive-descent parser, flow-sensitive type checker,
+bytecode compiler, verifier, and stack VM. The runtime uses a precise moving,
 two-generation mark-compact collector with deterministic stress scheduling.
+
+The language covers records, sum types and match, exceptions, closures, generics
+monomorphized entirely in the frontend, explicit tail-call frame reuse, string
+interning through a collector-owned weak table, ephemerons, and deterministic
+runtime diagnostics: every terminal trap or uncaught typed exception leaves a
+source-positioned frame trace whose copied data is not a GC root. Incremental
+marking and incremental compaction are both deterministic under the stress
+scheduler.
 
 The public source entry point, `lang::frontend::compile_program`, returns executable code
 only as an immutable `lang::VerifiedModule`. The verifier has already proved stack depth,
@@ -337,7 +326,7 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 
 ## Fuzzing and invariant protection
 
-The suite has 24 isolated deterministic positive corpora. Iteration 47 adds only the
+The suite has 24 isolated deterministic positive corpora, including the
 `builder` stream; all 23 pre-Iteration-47 streams retain their exact generators, pins, and
 bytes. The additive `ergonomics`
 stream is isolated, and all 22 pre-iteration-46 source/bytecode streams remain
@@ -361,7 +350,7 @@ execution adds its complete optional runtime trace as a third equality oracle ac
 schedules. The weak grammar additionally uses schedule-specific liveness expectations
 because clearing is intentionally observable. Generated source and bytecode are
 constructive and deterministic; each grammar has its own corpus dump and an embedded
-pinned representative snapshot. Iteration 47 changes no existing grammar, seed, dump, or
+pinned representative snapshot. The newest corpus changes no existing grammar, seed, dump, or
 outcome pin.
 
 Negative testing applies 115 positioned mutation forms across fixed seed sets, for 2,806
@@ -530,7 +519,7 @@ context, and before/after tables are in
 [docs/perf-baseline.md](docs/perf-baseline.md) and
 [ADR 0006](adr/0006-performance-capstone.md).
 
-Iteration 40 added `map_lookup_heavy` only after the existing workloads were shown to
+`map_lookup_heavy` was added only after the existing workloads were shown to
 under-measure steady lookup. The isolated workload measured linear scanning at
 58.1%–65.7% of total time. The deterministic content-hash index reduced candidate
 comparisons from 982,336 to 8,069 (99.2%) and its seven-run median from 278.967 ms to
@@ -539,7 +528,7 @@ comparisons from 982,336 to 8,069 (99.2%) and its seven-run median from 278.967 
 Timings remain informational; the exact counters, host context, and corpus proof are in
 [docs/perf-baseline.md](docs/perf-baseline.md).
 
-Iteration 47 appends a paired 8 KiB construction workload after every established
+A paired 8 KiB construction workload runs after every established
 benchmark. Both paths print and return byte-identical output from 64 fixed 128-byte
 chunks. On the assertions-enabled host, `strconcat_loop` used 66 allocations, 33,362
 peak slots, 567,995,444 occupancy-header examinations, and a 1,861.537 ms seven-run
