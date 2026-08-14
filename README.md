@@ -1,5 +1,7 @@
 # Language Runtime: Verified Bytecode and Precise Moving GC
 
+[![CI](https://github.com/Aly700/language-runtime-gc-vm/actions/workflows/ci.yml/badge.svg)](https://github.com/Aly700/language-runtime-gc-vm/actions/workflows/ci.yml)
+
 Wave 3 is complete, and source-level generic functions plus generic named aliases,
 records, and variants now monomorphize entirely in the frontend. Every used concrete tuple
 becomes ordinary verifier-checked bytecode and ordinary exact layouts, so explicit
