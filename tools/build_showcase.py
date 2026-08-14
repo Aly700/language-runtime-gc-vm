@@ -43,6 +43,7 @@ LEGACY_MANIFEST_NOTE_SUFFIX = (
 SNAPSHOT_INTERVAL = 256
 MAX_EVENTS_BYTES = 2_000_000
 PROCESS_TIMEOUT_SECONDS = 120
+MAX_MANIFEST_NESTING_DEPTH = 64
 NATIVE_TRACE_FILES = (
     "events.jsonl",
     "snapshots.jsonl",
@@ -1418,6 +1419,25 @@ def _matches_managed_showcase_profile(
 
 
 def _decode_managed_manifest(encoded: str) -> Optional[object]:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in encoded:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_MANIFEST_NESTING_DEPTH:
+                return None
+        elif character in "]}":
+            depth -= 1
     try:
         return json.loads(encoded)
     except (json.JSONDecodeError, RecursionError):

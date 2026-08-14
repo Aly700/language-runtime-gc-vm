@@ -448,7 +448,16 @@ def empty_and_managed_outputs_are_allowed() -> None:
         "former-T4 profile accepted extra manifest metadata",
     )
 
-    nesting_depth = max(10_000, sys.getrecursionlimit() * 10)
+    at_limit_json = (
+        "[" * showcase.MAX_MANIFEST_NESTING_DEPTH
+        + "0"
+        + "]" * showcase.MAX_MANIFEST_NESTING_DEPTH
+    )
+    require(
+        showcase._decode_managed_manifest(at_limit_json) is not None,
+        "manifest JSON at the nesting limit was rejected",
+    )
+    nesting_depth = showcase.MAX_MANIFEST_NESTING_DEPTH + 1
     deeply_nested_json = "[" * nesting_depth + "0" + "]" * nesting_depth
     require(
         showcase._decode_managed_manifest(deeply_nested_json) is None,
