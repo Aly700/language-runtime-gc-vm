@@ -327,11 +327,8 @@ text through `compile_program` and execute the returned `VerifiedModule`.
 ## Fuzzing and invariant protection
 
 The suite has 24 isolated deterministic positive corpora, including the
-`builder` stream; all 23 pre-Iteration-47 streams retain their exact generators, pins, and
-bytes. The additive `ergonomics`
-stream is isolated, and all 22 pre-iteration-46 source/bytecode streams remain
-byte-identical. Shared
-source grammars run under the same 15 schedules:
+`builder` stream; every earlier stream retains its exact generators, pins, and
+bytes. Shared source grammars run under the same 15 schedules:
 
 - `no_stress`
 - `before_every_alloc`
