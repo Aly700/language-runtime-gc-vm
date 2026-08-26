@@ -818,6 +818,19 @@ private:
     }
 
     std::optional<Statement> parse_statement() {
+        if (recursion_depth_ >= kMaxRecursionDepth) {
+            add_diagnostic(diagnostics_, peek().position,
+                           "block nesting exceeds the maximum supported depth");
+            if (!at_end()) {
+                ++current_;
+            }
+            return std::nullopt;
+        }
+        ++recursion_depth_;
+        struct DepthGuard {
+            std::size_t& depth;
+            ~DepthGuard() { --depth; }
+        } guard{recursion_depth_};
         if (label_prefix_ahead()) {
             const auto label = peek();
             ++current_;
@@ -966,6 +979,19 @@ private:
     }
 
     TypeSpec parse_type() {
+        if (recursion_depth_ >= kMaxRecursionDepth) {
+            add_diagnostic(diagnostics_, peek().position,
+                           "type nesting exceeds the maximum supported depth");
+            if (!at_end()) {
+                ++current_;
+            }
+            return invalid_type();
+        }
+        ++recursion_depth_;
+        struct DepthGuard {
+            std::size_t& depth;
+            ~DepthGuard() { --depth; }
+        } guard{recursion_depth_};
         if (match(TokenKind::LBracket)) {
             const auto position = previous().position;
             auto element = parse_type();
@@ -1293,7 +1319,30 @@ private:
         return value;
     }
 
-    std::unique_ptr<Expr> parse_expression() { return parse_equality(); }
+    // Bound parser recursion so deeply nested expressions, types, or blocks report a
+    // diagnostic instead of exhausting the stack. Shared by every recursive parse entry.
+    static constexpr std::size_t kMaxRecursionDepth = 256;
+
+    std::unique_ptr<Expr> parse_expression() {
+        if (recursion_depth_ >= kMaxRecursionDepth) {
+            add_diagnostic(diagnostics_, peek().position,
+                           "expression nesting exceeds the maximum supported depth");
+            auto node = std::make_unique<Expr>();
+            node->kind = Expr::Kind::IntLiteral;
+            node->position = peek().position;
+            node->inferred_type = invalid_type();
+            if (!at_end()) {
+                ++current_;
+            }
+            return node;
+        }
+        ++recursion_depth_;
+        struct DepthGuard {
+            std::size_t& depth;
+            ~DepthGuard() { --depth; }
+        } guard{recursion_depth_};
+        return parse_equality();
+    }
 
     std::unique_ptr<Expr> parse_equality() {
         auto expression = parse_comparison();
@@ -1865,6 +1914,7 @@ private:
 
     std::vector<Token> tokens_;
     std::size_t current_{0};
+    std::size_t recursion_depth_{0};
     std::size_t next_pair_site_{0};
     std::size_t next_function_declaration_order_{0};
     std::size_t next_type_declaration_order_{0};
