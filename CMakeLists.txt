@@ -493,3 +493,14 @@ set_tests_properties(
         RUN_SERIAL TRUE
         TIMEOUT 300)
 endif()
+
+# Fuzz target for the compile-and-verify frontend. Off by default so ordinary
+# builds are unaffected; enabled with -DLANG_BUILD_FUZZERS=ON under a compiler
+# that provides libFuzzer (Clang). The corpus under fuzz/corpus seeds the run.
+option(LANG_BUILD_FUZZERS "Build the libFuzzer harnesses" OFF)
+if(LANG_BUILD_FUZZERS)
+    add_executable(verify_fuzz fuzz/verify_fuzz.cpp)
+    target_link_libraries(verify_fuzz PRIVATE lang_runtime)
+    target_compile_options(verify_fuzz PRIVATE -fsanitize=fuzzer)
+    target_link_options(verify_fuzz PRIVATE -fsanitize=fuzzer)
+endif()

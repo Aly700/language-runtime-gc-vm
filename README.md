@@ -324,6 +324,13 @@ ctest --test-dir build -R '^lang_examples$' --output-on-failure
 The project has no standalone source interpreter or REPL. Tests and embedders load source
 text through `compile_program` and execute the returned `VerifiedModule`.
 
+Continuous integration also builds the suite under AddressSanitizer and
+UndefinedBehaviorSanitizer, and runs a libFuzzer harness that feeds arbitrary
+bytes as source text through the lexer, parser, type checker, and bytecode
+verifier. The harness asserts that no input can crash that path or produce an
+inconsistent result: malformed input is always a diagnostic, never a memory
+error. The harness lives in `fuzz/` and builds with `-DLANG_BUILD_FUZZERS=ON`.
+
 ## Fuzzing and invariant protection
 
 The suite has 24 isolated deterministic positive corpora, including the
