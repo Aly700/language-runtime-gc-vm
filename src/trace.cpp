@@ -183,12 +183,6 @@ struct EventFields {
 
 struct JsonlTraceWriter::Impl {
     struct ActiveCollection {
-        // Declared so std::optional::emplace() default-constructs through a real
-        // constructor. Without it the struct is an aggregate, and older Clang
-        // rejects the no-argument emplace() because it cannot value-initialize an
-        // aggregate with parentheses.
-        ActiveCollection() = default;
-
         std::uint64_t id{0};
         TraceCollectionKind kind{TraceCollectionKind::Major};
         std::uint64_t verify_true_count{0};
@@ -918,7 +912,9 @@ void JsonlTraceWriter::on_logical_collection_begin(
             output << ",\"live_bytes\":" << bytes
                    << ",\"live_objects\":" << objects;
         });
-    impl_->active_collection.emplace();
+    // Brace-initialize rather than emplace() so every standard library accepts
+    // the default construction of this aggregate.
+    impl_->active_collection = Impl::ActiveCollection{};
     impl_->active_collection->id = collection_id;
     impl_->active_collection->kind = kind;
     ++impl_->next_collection_id;
