@@ -1,0 +1,1 @@
+let p: pair = pair(1, 2); p.left = true; p
