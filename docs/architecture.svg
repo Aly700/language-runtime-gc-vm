@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="605" viewBox="0 0 1060 605" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="12" fill="#1d2430">
+<title>Language runtime architecture</title>
+<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1d2430"/></marker></defs>
+<rect width="1060" height="605" fill="#ffffff"/>
+<rect x="200" y="40" width="850" height="520" rx="2" fill="none" stroke="#1d2430" stroke-width="1.4"/>
+<rect x="208" y="48" width="22" height="22" fill="#1d2430"/><g transform="translate(211.0,51.0) scale(0.667)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1.5"/><rect x="9.5" y="9.5" width="5" height="5"/><path d="M9 2.5v3.5M15 2.5v3.5M9 18v3.5M15 18v3.5M2.5 9h3.5M2.5 15h3.5M18 9h3.5M18 15h3.5"/></g>
+<text x="236" y="64" font-size="13" font-weight="600" fill="#1d2430">lang_runtime static library · C++</text>
+<rect x="220" y="90" width="645" height="128" rx="2" fill="none" stroke="#2a9d8f" stroke-width="1.4" stroke-dasharray="6 4"/>
+<rect x="228" y="98" width="22" height="22" fill="#2a9d8f"/><g transform="translate(231.0,101.0) scale(0.667)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/></g>
+<text x="256" y="114" font-size="13" font-weight="600" fill="#1d2430">Front end · compile_program(source)</text>
+<rect x="220" y="250" width="825" height="285" rx="2" fill="none" stroke="#5b4bb7" stroke-width="1.4" stroke-dasharray="6 4"/>
+<rect x="228" y="258" width="22" height="22" fill="#5b4bb7"/><g transform="translate(231.0,261.0) scale(0.667)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></g>
+<text x="256" y="274" font-size="13" font-weight="600" fill="#1d2430">Runtime</text>
+<path d="M185.0 158.0 L235.0 163.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="210.0" cy="160.5" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="210.0" y="164.5" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">1</text>
+<path d="M371.0 163.0 L395.0 163.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="383.0" cy="163.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="383.0" y="167.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">2</text>
+<path d="M531.0 163.0 L555.0 163.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="543.0" cy="163.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="543.0" y="167.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">3</text>
+<path d="M691.0 163.0 L715.0 163.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="703.0" cy="163.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="703.0" y="167.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">4</text>
+<path d="M851.0 163.0 L880.0 163.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="865.5" cy="163.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="865.5" y="167.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">5</text>
+<text x="866.0" y="112.0" font-size="10.5" fill="#6b7280" text-anchor="middle">round-trip re-verified</text>
+<path d="M948.0 206.0 L948.0 234.0 L330.0 234.0 L330.0 300.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="584.4" cy="234.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="584.4" y="238.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">6</text>
+<text x="640.0" y="228.0" font-size="10.5" fill="#6b7280" text-anchor="middle">the proof travels with the code</text>
+<path d="M185.0 346.0 L235.0 352.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="210.0" cy="349.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="210.0" y="353.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">7</text>
+<path d="M425.0 352.0 L445.0 352.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-start="url(#arr)" marker-end="url(#arr)"/>
+<circle cx="435.0" cy="352.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="435.0" y="356.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">8</text>
+<text x="435.0" y="290.0" font-size="10.5" fill="#6b7280" text-anchor="middle">allocate · load · store funnels</text>
+<path d="M645.0 352.0 L665.0 343.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="655.0" cy="347.5" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="655.0" y="351.5" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">9</text>
+<path d="M330.0 404.0 L330.0 468.0 L445.0 468.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="355.5" cy="468.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="355.5" y="472.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">10</text>
+<text x="330.0" y="428.0" font-size="10.5" fill="#6b7280" text-anchor="middle">roots: frames · pending exception · Handles</text>
+<path d="M760.0 386.0 L760.0 468.0 L775.0 468.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle cx="760.0" cy="434.5" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="760.0" y="438.5" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">11</text>
+<text x="760.0" y="410.0" font-size="10.5" fill="#6b7280" text-anchor="middle">remembered targets root a minor GC</text>
+<path d="M545.0 404.0 L610.0 440.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-start="url(#arr)" marker-end="url(#arr)"/>
+<text x="630.0" y="428.0" font-size="10.5" fill="#6b7280" text-anchor="middle">slide live · forward · promote</text>
+<path d="M880.0 368.8 L868.0 369.0 L868.0 520.0 L610.0 520.0 L610.0 496.0" fill="none" stroke="#1d2430" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+<path d="M775.0 473.6 L880.0 471.6" fill="none" stroke="#1d2430" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+<circle cx="827.5" cy="472.6" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text x="827.5" y="476.6" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">12</text>
+<text x="828.0" y="458.0" font-size="10.5" fill="#6b7280" text-anchor="middle">events · snapshots</text>
+<rect x="10" y="130" width="175" height="56" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(20.0,146.0) scale(1.000)" fill="none" stroke="#1d2430" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5M9 12h7M9 16h7"/></g>
+<text x="52.0" y="155.0" font-size="12" font-weight="600">Program source</text>
+<text x="52.0" y="169.0" font-size="12" font-weight="400">.lang text</text>
+<rect x="10" y="300" width="175" height="92" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(82.5,308.0) scale(1.250)" fill="none" stroke="#1d2430" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></g>
+<text x="97.5" y="353.0" text-anchor="middle" font-size="12" font-weight="600">Embedder</text>
+<text x="97.5" y="367.0" text-anchor="middle" font-size="12" font-weight="400">lang_trace · bench · tests</text>
+<text x="97.5" y="382.0" text-anchor="middle" font-size="10.5" fill="#6b7280">holds Handles across a GC</text>
+<rect x="235" y="120" width="136" height="86" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(288.0,128.0) scale(1.250)" fill="none" stroke="#2a9d8f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="4" height="16"/><rect x="10" y="4" width="4" height="16"/><rect x="17" y="4" width="4" height="16"/></g>
+<text x="303.0" y="173.0" text-anchor="middle" font-size="12" font-weight="600">Lexer</text>
+<text x="303.0" y="187.0" text-anchor="middle" font-size="12" font-weight="400">Tokens</text>
+<text x="303.0" y="202.0" text-anchor="middle" font-size="10.5" fill="#6b7280">lex_source</text>
+<rect x="395" y="120" width="136" height="86" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(448.0,128.0) scale(1.250)" fill="none" stroke="#2a9d8f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.2"/><circle cx="6" cy="13" r="2.2"/><circle cx="18" cy="13" r="2.2"/><circle cx="9" cy="20" r="1.8"/><circle cx="15" cy="20" r="1.8"/><path d="M10.5 6.8 7.4 11M13.5 6.8l3.1 4.2M6.8 15l1.6 3.2M17.2 15l-1.6 3.2"/></g>
+<text x="463.0" y="173.0" text-anchor="middle" font-size="12" font-weight="600">Parser</text>
+<text x="463.0" y="187.0" text-anchor="middle" font-size="12" font-weight="400">Program AST</text>
+<text x="463.0" y="202.0" text-anchor="middle" font-size="10.5" fill="#6b7280">parse_tokens</text>
+<rect x="555" y="120" width="136" height="86" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(608.0,128.0) scale(1.250)" fill="none" stroke="#2a9d8f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M7.5 12.5l3 3 6-7"/></g>
+<text x="623.0" y="173.0" text-anchor="middle" font-size="12" font-weight="600">Type checker</text>
+<text x="623.0" y="187.0" text-anchor="middle" font-size="12" font-weight="400">flow-sensitive, generics</text>
+<text x="623.0" y="202.0" text-anchor="middle" font-size="10.5" fill="#6b7280">check_program</text>
+<rect x="715" y="120" width="136" height="86" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(768.0,128.0) scale(1.250)" fill="none" stroke="#2a9d8f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h18l-7 8v7l-4 2v-9z"/></g>
+<text x="783.0" y="173.0" text-anchor="middle" font-size="12" font-weight="600">Compiler</text>
+<text x="783.0" y="187.0" text-anchor="middle" font-size="12" font-weight="400">Module bytecode</text>
+<text x="783.0" y="202.0" text-anchor="middle" font-size="10.5" fill="#6b7280">68 opcodes · string pool</text>
+<rect x="880" y="120" width="136" height="86" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(933.0,128.0) scale(1.250)" fill="none" stroke="#c2255c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5l8 3v6.5c0 5-3.4 8.3-8 9.5-4.6-1.2-8-4.5-8-9.5V5.5z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></g>
+<text x="948.0" y="173.0" text-anchor="middle" font-size="12" font-weight="600">Verifier</text>
+<text x="948.0" y="187.0" text-anchor="middle" font-size="12" font-weight="400">VerifiedModule</text>
+<text x="948.0" y="202.0" text-anchor="middle" font-size="10.5" fill="#6b7280">stack map per pc · reasons</text>
+<rect x="235" y="300" width="190" height="104" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(315.0,308.0) scale(1.250)" fill="none" stroke="#5b4bb7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1.5"/><rect x="9.5" y="9.5" width="5" height="5"/><path d="M9 2.5v3.5M15 2.5v3.5M9 18v3.5M15 18v3.5M2.5 9h3.5M2.5 15h3.5M18 9h3.5M18 15h3.5"/></g>
+<text x="330.0" y="353.0" text-anchor="middle" font-size="12" font-weight="600">Stack VM</text>
+<text x="330.0" y="367.0" text-anchor="middle" font-size="12" font-weight="400">VM::execute(VerifiedModule)</text>
+<text x="330.0" y="382.0" text-anchor="middle" font-size="10.5" fill="#6b7280">asserts the stack map at every pc</text>
+<rect x="445" y="300" width="200" height="104" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(530.0,308.0) scale(1.250)" fill="none" stroke="#5b4bb7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="12" width="8" height="8" rx="1"/><rect x="13" y="12" width="8" height="8" rx="1"/><rect x="8" y="3" width="8" height="7" rx="1"/><path d="M12 10v2M7 12V10h10v2"/></g>
+<text x="545.0" y="353.0" text-anchor="middle" font-size="12" font-weight="600">Heap · one slot vector</text>
+<text x="545.0" y="367.0" text-anchor="middle" font-size="12" font-weight="400">ObjectId = slot | reuse generation</text>
+<text x="545.0" y="382.0" text-anchor="middle" font-size="10.5" fill="#6b7280">Young / Old is a per-object tag</text>
+<rect x="665" y="300" width="190" height="86" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(745.0,308.0) scale(1.250)" fill="none" stroke="#5b4bb7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12c2-5 4-5 6 0s4 5 6 0 4-5 6 0"/></g>
+<text x="760.0" y="353.0" text-anchor="middle" font-size="12" font-weight="600">Write barrier</text>
+<text x="760.0" y="367.0" text-anchor="middle" font-size="12" font-weight="400">old → young stores</text>
+<text x="760.0" y="382.0" text-anchor="middle" font-size="10.5" fill="#6b7280">ordered remembered set</text>
+<rect x="880" y="300" width="136" height="86" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(933.0,308.0) scale(1.250)" fill="none" stroke="#5b4bb7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></g>
+<text x="948.0" y="353.0" text-anchor="middle" font-size="12" font-weight="600">Stress scheduler</text>
+<text x="948.0" y="367.0" text-anchor="middle" font-size="12" font-weight="400">15 named schedules</text>
+<text x="948.0" y="382.0" text-anchor="middle" font-size="10.5" fill="#6b7280">instruction boundaries</text>
+<rect x="445" y="440" width="330" height="56" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g transform="translate(455.0,456.0) scale(1.000)" fill="none" stroke="#5b4bb7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 12a7.5 7.5 0 0 1-13 5.1M4.5 12a7.5 7.5 0 0 1 13-5.1"/><path d="M17.5 3v4h-4M6.5 21v-4h4"/></g>
+<text x="487.0" y="465.0" font-size="12" font-weight="600">Collector · minor, major, incremental</text>
+<text x="487.0" y="479.0" font-size="12" font-weight="400">mark → forward → rewrite → install → validate</text>
+<rect x="880" y="420" width="136" height="86" rx="2" fill="#ffffff" stroke="#6b7280" stroke-width="1.2"/>
+<g transform="translate(933.0,428.0) scale(1.250)" fill="none" stroke="#6b7280" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5"/></g>
+<text x="948.0" y="473.0" text-anchor="middle" font-size="12" font-weight="600">Trace emitter</text>
+<text x="948.0" y="487.0" text-anchor="middle" font-size="12" font-weight="400">JSONL bundles</text>
+<text x="948.0" y="502.0" text-anchor="middle" font-size="10.5" fill="#6b7280">observer only</text>
+<text x="893" y="404" font-size="10.5" fill="#6b7280" font-style="italic">triggers collections</text>
+<text x="235" y="552" font-size="10.5" fill="#6b7280" font-style="italic">a rejected module is a compiler bug; the VM never runs unverified bytecode</text>
+<text x="10" y="590" font-size="10.5" fill="#6b7280" font-style="italic">no allocation-failure trigger: the heap grows; collections come from the stress scheduler, the Collect opcode or the embedder</text>
+</svg>

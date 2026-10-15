@@ -22,6 +22,12 @@ maps before the VM accepts that product. The complete pipeline and object model 
 [ARCHITECTURE.md](ARCHITECTURE.md); the properties that changes must preserve are in
 [INVARIANTS.md](INVARIANTS.md).
 
+## Architecture
+
+![Language runtime architecture: a five-stage front end ending in the verifier, and a runtime of VM, heap, write barrier, collector and stress scheduler](docs/architecture.svg)
+
+The numbered arrows are walked one by one in [docs/architecture.md](docs/architecture.md), with the component table, the trust and data boundaries, and where each guarantee is proven.
+
 ## Architectural crux
 
 ### Verified-module discipline
