@@ -484,7 +484,7 @@ counters were unchanged by instrumentation, and no timing code remains.
 
 **Decision: GO.** Linear lookup is a dominant measured cost center on a workload that
 isolates repeated lookup from allocation and collection. Phase B may add the deterministic
-content-hash entry-index side table described in the iteration-40 plan. Final before/after
+content-hash entry-index side table described in ADR 0017. Final before/after
 counters and timings are appended after implementation.
 
 ## Iteration 40 Phase B: Deterministic Content-Hash Index (2026-07-25)
@@ -577,7 +577,7 @@ All 19 Phase-B corpus dumps were compared with `cmp` against the clean `9223111`
 captures. `single`, `calls`, `arrays`, `legacy`, `recursive`, `array`, `strings`,
 `closures`, `maps`, `weak`, `loops`, `output`, `strings2`, `records`, `variants`,
 `exceptions`, `ephemerons`, `incremental_compaction`, and `tailcalls` are 19/19
-byte-identical, and every SHA-256 remains the value pinned in the iteration-40 plan.
+byte-identical, and every SHA-256 remains the recorded baseline value.
 
 ### Final verification
 
@@ -596,7 +596,7 @@ again compared with the clean captures: 19/19 were byte-identical with the pinne
 ## Iteration 43 Phase A: Large-Object-Space Gate (2026-07-25)
 
 Iteration 43 tests whether repeatedly copying wide survivors justifies a separate
-non-moving large-object space. The input revision is `ecbb2d1`; the lead-verified
+non-moving large-object space. The input revision is `ecbb2d1`; the verified
 baseline is 46/46 with zero warnings and was not rerun merely to establish green.
 Phase A adds only passive copy-width counters, one focused counter test, and one additive
 benchmark workload. It makes no allocation, marking, movement, or representation
@@ -783,7 +783,7 @@ correctness threshold.
 The two workloads are strictly additive and remain last in workload order so the complete
 pre-Iteration-47 benchmark counter stream can be filtered and compared byte for byte.
 After the zero-warning all-target rebuild, removing only lines whose bench is
-`strconcat_loop` or `builder_loop` reproduced the exact lead-captured SHA-256:
+`strconcat_loop` or `builder_loop` reproduced the exact recorded SHA-256:
 
 ```text
 fc9d553d51cbbdb5e735e454984264d49add07b0b47223b92deb41b0faf59377
